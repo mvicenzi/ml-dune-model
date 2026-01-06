@@ -1,3 +1,4 @@
+# loader/dataset.py
 import zlib
 import numpy as np
 from dataclasses import dataclass
@@ -48,6 +49,10 @@ class DUNEImageDataset(Dataset):
         self.samples: List[SampleIndex] = self._scan()
         if not self.samples:
             raise RuntimeError(f"No samples found under {self.rootdir} with extensions {self.allowed_ext}")
+        
+        self.labels = torch.empty(len(self.samples), dtype=torch.long)
+        for i, sample in enumerate(self.samples):
+            self.labels[i] = sample.label 
 
     def _save_index_pt(self, cache_file, samples):
         data = [(str(s.path), int(s.label)) for s in samples]
@@ -65,7 +70,7 @@ class DUNEImageDataset(Dataset):
 
         if self.use_cache and self.cache_file.exists():
             print(f"Loading dataset index from cache: {self.cache_file}")
-            samples =self._load_index_pt(self.cache_file)
+            samples = self._load_index_pt(self.cache_file)
         else:
             # Find .gz files that live under any prodgenie* directory
             for fp in self.rootdir.glob("prodgenie*/**/*.gz"):
