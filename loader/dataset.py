@@ -17,13 +17,13 @@ class DUNEImageDataset(Dataset):
     """
     Dataset that:
       - scans recursively for .gz files
-      - assigns neutrinos label based on top-level directory
+      - assigns neutrinos label based on .info file
       - loads 3 views per file, returns only one view (img_index)
     """
     def __init__(
         self,
         rootdir: Union[str, Path],
-        class_names: Sequence[str] = [ "nu", "nue", "nutau" ],
+        class_names: Sequence[str] = [ "numu", "nue", "nutau", "NC" ],
         view_index: int = 0,
         allowed_ext: Tuple[str, ...] = (".gz",),
         use_cache: bool = True,
@@ -62,6 +62,35 @@ class DUNEImageDataset(Dataset):
         data = torch.load(cache_file, map_location="cpu")
         return [SampleIndex(path=Path(p), label=l) for p, l in data]
 
+    def _assign_label(self, fp: Path) -> int:
+        """
+        Assigns label based on .info file associated with .gz file.
+        The .info file is expected to be in the same directory as the .gz file.
+        """
+        filename = fp.stem # without .gz
+        info_file = fp.parent / f"{filename}.info"
+        if not info_file.exists():
+            raise RuntimeError(f"Missing .info file for {fp} at {info_file}")
+        
+        nupdg = None
+        with open(info_file, "r") as f:
+            info = f.readlines()
+            nupdg = int(info[7].strip())
+        
+        label = None
+        if nupdg == 1:
+            label = self.class_to_idx.get("NC")
+        elif nupdg == 12 or nupdg == -12:
+            label = self.class_to_idx.get("nue")
+        elif nupdg == 14 or nupdg == -14:
+            label = self.class_to_idx.get("numu")
+        elif nupdg == 16 or nupdg == -16:
+            label = self.class_to_idx.get("nutau")
+        else:
+            print(f"Warning: unexpected nupdg {nupdg} in {info_file}")
+            
+        return label
+
     def _scan(self) -> List[SampleIndex]:
         """
         Scans recursively for .gz files + assign labels based on top-level directory.
@@ -79,16 +108,7 @@ class DUNEImageDataset(Dataset):
                 if fp.suffix not in self.allowed_ext:
                     continue
 
-                rel = fp.relative_to(self.rootdir)
-
-                # rel.parts[0] should be prodgenie_dunevd_..._<classname>
-                prodgenie_dir = rel.parts[0]
-                classname = prodgenie_dir.split("_")[-1]
-
-                if classname not in self.class_to_idx:
-                    raise RuntimeError(f"Unknown classname '{classname}' from {prodgenie_dir} (file={fp})")
-
-                label = self.class_to_idx[classname]
+                label = self._assign_label(fp)
                 samples.append(SampleIndex(path=fp, label=label))
 
         samples.sort(key=lambda s: str(s.path))
