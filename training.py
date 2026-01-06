@@ -57,9 +57,9 @@ def test(model, device, test_loader):
 
 def main(
     model_name="attn_base",
-    batch_size=120,
-    test_batch_size=1000,
-    epochs=5,
+    batch_size=20,
+    test_batch_size=20,
+    epochs=10,
     lr=1e-3,
     scheduler_step_size=10,
     gamma=0.7,
@@ -84,14 +84,14 @@ def main(
     dataset = DUNEImageDataset(rootdir=rootdir, class_names=label_tokens, view_index=2, use_cache=True)
 
     ### for testing: small subset
-    n_subset = 1000
+    n_subset = 50000
     subset_indices = torch.randperm(len(dataset))[:n_subset]
     subset_ds = Subset(dataset, subset_indices)
 
     train_ds, val_ds = None, None
     if test_mode:
-        print("Running in test mode with small subset of data.")
-        train_ds, val_ds, _, _ = train_val_split(subset_ds, val_fraction=0.2, use_cache=True)
+        print(f"Running in TEST_MODE with small subset of data {n_subset}.")
+        train_ds, val_ds, _, _ = train_val_split(subset_ds, val_fraction=0.2, use_cache=False)
     else:
         train_ds, val_ds, _, _ = train_val_split(dataset, val_fraction=0.2, use_cache=True)
 
