@@ -56,7 +56,7 @@ def test(model, device, test_loader):
 
 
 def main(
-    model_name="base",
+    model_name="attn_base",
     batch_size=120,
     test_batch_size=1000,
     epochs=5,
@@ -80,7 +80,7 @@ def main(
     # load DUNE CVN dataset from directories
     # currently only 3 classes: nu (NC), nue, nutau (actually numu)
     rootdir = "/nfs/data/1/rrazakami/work/data_cvn/data/dune/2023_trainings/latest/dunevd"
-    label_tokens = [ "nu", "nue", "nutau" ]
+    label_tokens = [ "numu", "nue", "nutau", "NC" ]
     dataset = DUNEImageDataset(rootdir=rootdir, class_names=label_tokens, view_index=2, use_cache=True)
 
     ### for testing: small subset
@@ -90,9 +90,10 @@ def main(
 
     train_ds, val_ds = None, None
     if test_mode:
-        train_ds, val_ds = train_val_split(subset_ds, val_fraction=0.2, use_cache=True)
+        print("Running in test mode with small subset of data.")
+        train_ds, val_ds, _, _ = train_val_split(subset_ds, val_fraction=0.2, use_cache=True)
     else:
-        train_ds, val_ds = train_val_split(dataset, val_fraction=0.2, use_cache=True)
+        train_ds, val_ds, _, _ = train_val_split(dataset, val_fraction=0.2, use_cache=True)
 
     train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     test_loader = torch.utils.data.DataLoader(val_ds, batch_size=test_batch_size, shuffle=True)

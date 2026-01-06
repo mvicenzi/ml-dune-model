@@ -88,7 +88,7 @@ class DUNEImageDataset(Dataset):
             label = self.class_to_idx.get("nutau")
         else:
             print(f"Warning: unexpected nupdg {nupdg} in {info_file}")
-            
+
         return label
 
     def _scan(self) -> List[SampleIndex]:
@@ -101,6 +101,7 @@ class DUNEImageDataset(Dataset):
             print(f"Loading dataset index from cache: {self.cache_file}")
             samples = self._load_index_pt(self.cache_file)
         else:
+            print(f"Cache does not exist: {self.cache_file} -- generating new one!")
             # Find .gz files that live under any prodgenie* directory
             for fp in self.rootdir.glob("prodgenie*/**/*.gz"):
                 if not fp.is_file():
