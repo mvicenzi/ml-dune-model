@@ -17,23 +17,22 @@ from warpconvnet.nn.modules.sparse_conv import SparseConv2d             # 2D spa
 from .blocks import (
     ConvBlock2D, ConvTrBlock2D, 
     ResidualSparseBlock2D, 
-    BottleneckSparseAttention2D
     )
 
 # ---------------------------------------------------------------------------
 # Full network: Sparse encoder + dense attention bottleneck + sparse decoder
 # ---------------------------------------------------------------------------
 
-class MinkUNetSparseAttention(nn.Module):
+class MinkUNetSparse(nn.Module):
     """
     U-ResNet-style sparse model following MinkUNet18 architecture.
     - Initial conv at full resolution
     - Encoder: strided convolutions + residual blocks (2 stages)
-    - Bottleneck: sparse attention at smallest resolution
+    - Bottleneck: sparse residual block at smallest resolution
     - Decoder: transposed convolutions + skip connections + residual blocks (2 stages)
     - Head: dense classification layer (4 classes)
     """
-    def __init__(self, *, spatial_encoding: bool = True, flash_attention: bool = True, **kwargs,):
+    def __init__(self):
         super().__init__()
 
         # ---- Initial convolution (full resolution feature extraction) ----
@@ -48,10 +47,8 @@ class MinkUNetSparseAttention(nn.Module):
         self.conv2 = ConvBlock2D(32, 32, kernel_size=2, stride=2)  # Spatial downsample
         self.block2 = ResidualSparseBlock2D(32, 64)                # Channel projection 32 to 64
 
-        # ---- Bottleneck (attention at 125×125) ----
-        # Global context at 125×125 resolution (15625 spatial tokens)
-        self.bottleneck = BottleneckSparseAttention2D(channels=64, attn_channels=128, heads=4, 
-                                                      encoding=spatial_encoding, flash=flash_attention)
+        # ---- Bottleneck (residual block at 125×125) ----
+        self.bottleneck = ResidualSparseBlock2D(64, 64)  # [B,64,125,125] -> [B,64,125,125]
 
         # ---- Decoder (2 stages, symmetric to encoder) ----
         # Stage 1: 125×125 to 250×250
@@ -95,8 +92,8 @@ class MinkUNetSparseAttention(nn.Module):
         out = self.block2(out)                  # Residual + channel projection 32 to 64
                                                 # Result: [B,64,125,125] 
 
-        # ============ BOTTLENECK (Sparse Attention at 125×125) ============
-        out = self.bottleneck(out)              # [B,64,125,125] -> [B,128,125,125] (attention) -> [B,64,125,125]
+        # ============ BOTTLENECK (Sparse Residual Block at 125×125) ============
+        out = self.bottleneck(out)              # [B,64,125,125] -> [B,64,125,125] (residual block)
         # ============ DECODER ============
         
         # Stage 1: 125×125 to 250×250
@@ -116,16 +113,3 @@ class MinkUNetSparseAttention(nn.Module):
         out_dense = out.to_dense(channel_dim=1, spatial_shape=(500, 500))  # [B,64,500,500] dense tensor
         logits = self.head(out_dense)           # Global pool + classify
         return F.log_softmax(logits, dim=1)     # Log-probabilities for 10 digits
-    
-
-class MinkUNetSparseAttentionNoEnc(MinkUNetSparseAttention):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, spatial_encoding=False, flash_attention=True, **kwargs)
-
-class MinkUNetSparseAttentionNoFlash(MinkUNetSparseAttention):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, spatial_encoding=True, flash_attention=False, **kwargs)
-
-class MinkUNetSparseAttentionNoFlashEnc(MinkUNetSparseAttention):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, spatial_encoding=False, flash_attention=False, **kwargs)

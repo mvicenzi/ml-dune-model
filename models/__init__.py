@@ -1,5 +1,6 @@
 # models/__init__.py
 
+from .minkunet import MinkUNetSparse
 from .minkunet_attention import MinkUNetSparseAttention
 from .minkunet_attention import MinkUNetSparseAttentionNoEnc, MinkUNetSparseAttentionNoFlash, MinkUNetSparseAttentionNoFlashEnc
 
@@ -12,5 +13,6 @@ MODEL_REGISTRY = {
     "attn_noenc" : MinkUNetSparseAttentionNoEnc,
     "attn_noflash":  MinkUNetSparseAttentionNoFlash,
     "attn_noflashenc": MinkUNetSparseAttentionNoFlashEnc,
-    
+
+    "base" : MinkUNetSparse,
 }
