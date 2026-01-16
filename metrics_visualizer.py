@@ -155,7 +155,7 @@ class MetricsVisualizer:
         
         return ax
     
-    def plot_gpu_memory_peaks_by_epoch(self, model_names=None, ax=None, save_path=None):
+    def plot_gpu_memory_peaks_by_epoch(self, model_names=None, show_val=False, ax=None, save_path=None):
         """
         GPU peak memory per epoch:
         - training peak
@@ -212,7 +212,7 @@ class MetricsVisualizer:
                     linestyle="-",
                     color=color,
                 )
-            if val_peak is not None:
+            if val_peak is not None and show_val:
                 ax.plot(
                     epochs,
                     val_peak,
@@ -233,12 +233,20 @@ class MetricsVisualizer:
             )
 
         # Marker legend (black markers)
+
         marker_handles = [
             plt.Line2D([0], [0], color="black", marker=marker_map["train"],
-                    linestyle="None", label="Train epoch peak"),
-            plt.Line2D([0], [0], color="black", marker=marker_map["val"],
-                    linestyle="None", label="Validation peak"),
-        ]
+                        linestyle="None", label="Train epoch peak"),
+        ] 
+
+        if show_val:
+            marker_handles = [
+                plt.Line2D([0], [0], color="black", marker=marker_map["train"],
+                        linestyle="None", label="Train epoch peak"),
+                plt.Line2D([0], [0], color="black", marker=marker_map["val"],
+                        linestyle="None", label="Validation peak"),
+            ]
+      
 
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Peak GPU Memory [MB]")
@@ -509,7 +517,7 @@ class MetricsVisualizer:
 
     # ------------------ Combined comparison figure ------------------
 
-    def plot_comparison(self, save_path="model_comparison.png", model_names=None):
+    def plot_comparison(self, save_path="model_comparison.pdf", model_names=None):
         """
         2x3 grid:
           (1) train loss
@@ -522,7 +530,7 @@ class MetricsVisualizer:
         if not self._ensure_loaded():
             return
 
-        fig = plt.figure(figsize=(16, 10), dpi=200)
+        fig = plt.figure(figsize=(20, 10), dpi=600)
 
         ax1 = plt.subplot(2, 3, 1)
         self.plot_training_loss(model_names=model_names, ax=ax1)
@@ -543,7 +551,7 @@ class MetricsVisualizer:
         self.plot_training_time(model_names=model_names, ax=ax6)
 
         plt.tight_layout()
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.savefig(save_path, dpi=600, bbox_inches="tight")
         print(f"Comparison plot saved to {save_path}")
         plt.show()
         plt.close()
