@@ -57,8 +57,8 @@ def test(model, device, test_loader):
 
 def main(
     model_name="attn_base",
-    batch_size=20,
-    test_batch_size=20,
+    batch_size=30,
+    test_batch_size=30,
     epochs=10,
     lr=1e-3,
     scheduler_step_size=10,
@@ -108,7 +108,15 @@ def main(
     ModelCls = MODEL_REGISTRY[model_name]
     model = ModelCls().to(device)
 
-    monitor.on_train_begin(model)
+    monitor.on_train_begin(
+        model,
+        batch_size=batch_size,
+        test_batch_size=test_batch_size,
+        epochs=epochs,
+        lr=lr,
+        scheduler_step_size=scheduler_step_size,
+        gamma=gamma
+    )
 
     optimizer = optim.AdamW(model.parameters(), lr=lr)
     scheduler = StepLR(optimizer, step_size=scheduler_step_size, gamma=gamma)

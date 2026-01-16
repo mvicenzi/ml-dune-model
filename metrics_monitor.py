@@ -34,9 +34,8 @@ class MetricsMonitor:
         self._epoch_batch_start_idx = 0
 
         # ---------------------------
-        # Peak tracking (what you asked for)
+        # Peak tracking
         # ---------------------------
-        self._overall_gpu_peak_mb = 0.0            # peak GPU usage overall (training+validation)
         self._epoch_train_gpu_peak_mb = 0.0        # peak GPU usage during training within current epoch
         self._epoch_val_gpu_peak_mb = 0.0          # peak GPU usage during validation within current epoch
 
@@ -55,14 +54,11 @@ class MetricsMonitor:
             return 0.0
         return float(torch.cuda.max_memory_allocated(self.device) / (1024**2))
 
-    def _update_overall_peak(self, peak_mb: float):
-        if peak_mb > self._overall_gpu_peak_mb:
-            self._overall_gpu_peak_mb = peak_mb
-
     # ------------------ lifecycle ------------------
 
-    def on_train_begin(self, model):
-        """Call at training start to capture model info."""
+    def on_train_begin(self, model, batch_size=None, test_batch_size=None, epochs=None, 
+                       lr=None, scheduler_step_size=None, gamma=None):
+        """Call at training start to capture model info and hyperparameters."""
         self.metrics["model_name"] = self.model_name
         self.metrics["total_params"] = sum(p.numel() for p in model.parameters())
         self.metrics["trainable_params"] = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -70,19 +66,30 @@ class MetricsMonitor:
             sum(p.numel() * p.element_size() for p in model.parameters()) / (1024**2)
         )
 
+        # Store training hyperparameters
+        self.metrics["batch_size"] = batch_size
+        self.metrics["test_batch_size"] = test_batch_size
+        self.metrics["epochs"] = epochs
+        self.metrics["learning_rate"] = lr
+        self.metrics["scheduler_step_size"] = scheduler_step_size
+        self.metrics["scheduler_gamma"] = gamma
+
         print(f"\n{'='*60}")
         print(f"Model: {self.model_name}")
         print(f"Total params: {self.metrics['total_params']:,}")
         print(f"Trainable params: {self.metrics['trainable_params']:,}")
         print(f"Model size: {self.metrics['model_size_mb']:.2f} MB")
+        if batch_size is not None:
+            print(f"Batch size: {batch_size}")
+        if lr is not None:
+            print(f"Learning rate: {lr}")
+        if epochs is not None:
+            print(f"Epochs: {epochs}")
         print(f"{'='*60}\n")
 
         # Reset CUDA peak stats for a clean baseline
         if self.device is not None:
             torch.cuda.reset_peak_memory_stats(self.device)
-
-        # Reset overall peak tracker too
-        self._overall_gpu_peak_mb = 0.0
 
     def on_epoch_begin(self, epoch):
         """Call at start of each epoch."""
@@ -138,10 +145,9 @@ class MetricsMonitor:
             # NEW: peak GPU per training batch
             self.metrics["gpu_memory_peak_batch_mb"].append(batch_gpu_peak_mb)
 
-            # Track epoch training peak + overall peak
+            # Track epoch training peak
             if batch_gpu_peak_mb > self._epoch_train_gpu_peak_mb:
                 self._epoch_train_gpu_peak_mb = batch_gpu_peak_mb
-            self._update_overall_peak(batch_gpu_peak_mb)
 
         # CPU memory (RSS)
         cpu_mem_mb = self.process.memory_info().rss / (1024**2)
@@ -175,7 +181,6 @@ class MetricsMonitor:
             # Update trackers
             if val_peak_mb > self._epoch_val_gpu_peak_mb:
                 self._epoch_val_gpu_peak_mb = val_peak_mb
-            self._update_overall_peak(val_peak_mb)
         else:
             # Keep list lengths consistent if running on CPU
             self.epoch_metrics["gpu_memory_peak_validation_mb"].append(0.0)
@@ -202,9 +207,6 @@ class MetricsMonitor:
 
         # NEW: peak GPU during training in this epoch
         self.epoch_metrics["gpu_memory_peak_train_epoch_mb"].append(float(self._epoch_train_gpu_peak_mb))
-
-        # NEW: peak GPU overall so far (training + validation)
-        self.epoch_metrics["gpu_memory_peak_overall_mb"].append(float(self._overall_gpu_peak_mb))
 
         # Back-compat / additional GPU aggregates (optional but useful)
         if self.device is not None and epoch_end > epoch_start:
@@ -247,7 +249,6 @@ class MetricsMonitor:
             )
             if val_peak is not None:
                 msg += f" | val {val_peak:.1f} MB"
-            msg += f" | overall {self.epoch_metrics['gpu_memory_peak_overall_mb'][-1]:.1f} MB"
             msg += f" | Throughput: {self.epoch_metrics['throughput_mean'][-1]:.1f} samples/sec"
             print(msg)
 
@@ -262,10 +263,20 @@ class MetricsMonitor:
                 "trainable_params": self.metrics["trainable_params"],
                 "model_size_mb": self.metrics["model_size_mb"],
             },
+            "training_config": {
+                "batch_size": self.metrics.get("batch_size"),
+                "test_batch_size": self.metrics.get("test_batch_size"),
+                "epochs": self.metrics.get("epochs"),
+                "learning_rate": self.metrics.get("learning_rate"),
+                "scheduler_step_size": self.metrics.get("scheduler_step_size"),
+                "scheduler_gamma": self.metrics.get("scheduler_gamma"),
+            },
             "batch_metrics": {
                 k: v
                 for k, v in self.metrics.items()
-                if k not in ["model_name", "total_params", "trainable_params", "model_size_mb"]
+                if k not in ["model_name", "total_params", "trainable_params", "model_size_mb",
+                            "batch_size", "test_batch_size", "epochs", "learning_rate", 
+                            "scheduler_step_size", "scheduler_gamma"]
             },
             "epoch_metrics": dict(self.epoch_metrics),
         }
@@ -292,13 +303,6 @@ class MetricsMonitor:
         )
 
         if self.device is not None:
-            overall = (
-                self._overall_gpu_peak_mb
-                if len(self.epoch_metrics.get("gpu_memory_peak_overall_mb", [])) == 0
-                else max(self.epoch_metrics["gpu_memory_peak_overall_mb"])
-            )
-            print(f"Peak GPU memory overall: {overall:.1f} MB")
-
             if self.epoch_metrics.get("gpu_memory_peak_train_epoch_mb"):
                 print(
                     f"Peak GPU memory (train epoch): "

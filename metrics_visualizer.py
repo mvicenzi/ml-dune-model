@@ -64,13 +64,15 @@ class MetricsVisualizer:
 
     # ------------------ Individual plot functions ------------------
 
-    def plot_training_loss(self, model_names=None, ax=None):
+    def plot_training_loss(self, model_names=None, ax=None, save_path=None):
         """Training Loss Evolution."""
         if not self._ensure_loaded():
             return
 
         if ax is None:
             fig, ax = plt.subplots(figsize=(6, 4), dpi=200)
+        else:
+            fig = None
 
         for name, data in self._iter_selected_models(model_names):
             losses = data["batch_metrics"]["batch_losses"]
@@ -83,15 +85,22 @@ class MetricsVisualizer:
         ax.set_title("Training Loss Evolution")
         ax.legend()
         ax.grid(True, alpha=0.3)
+        
+        if save_path is not None and fig is not None:
+            fig.savefig(save_path, dpi=250, bbox_inches="tight")
+            print(f"Training loss plot saved to {save_path}")
+        
         return ax
 
-    def plot_test_accuracy(self, model_names=None, ax=None):
+    def plot_test_accuracy(self, model_names=None, ax=None, save_path=None):
         """Test Accuracy by Epoch."""
         if not self._ensure_loaded():
             return
 
         if ax is None:
             fig, ax = plt.subplots(figsize=(6, 4), dpi=200)
+        else:
+            fig = None
 
         for name, data in self._iter_selected_models(model_names):
             epochs = data["epoch_metrics"]["epoch"]
@@ -103,9 +112,14 @@ class MetricsVisualizer:
         ax.set_title("Test Accuracy Progress")
         ax.legend()
         ax.grid(True, alpha=0.3)
+        
+        if save_path is not None and fig is not None:
+            fig.savefig(save_path, dpi=250, bbox_inches="tight")
+            print(f"Test accuracy plot saved to {save_path}")
+        
         return ax
 
-    def plot_gpu_memory_peak_per_batch(self, model_names=None, ax=None):
+    def plot_gpu_memory_peak_per_batch(self, model_names=None, ax=None, save_path=None):
         """
         GPU peak memory per TRAINING batch.
         New monitor key: batch_metrics['gpu_memory_peak_batch_mb']
@@ -116,6 +130,8 @@ class MetricsVisualizer:
 
         if ax is None:
             fig, ax = plt.subplots(figsize=(7, 4), dpi=200)
+        else:
+            fig = None
 
         any_plotted = False
         for name, data in self._iter_selected_models(model_names):
@@ -123,7 +139,7 @@ class MetricsVisualizer:
             mem = self._first_present(bm, ["gpu_memory_peak_batch_mb", "gpu_memory_peak_mb"], default=None)
             if mem is None:
                 continue
-            ax.plot(mem, label=name, alpha=0.8)
+            ax.plot(mem, label=name, alpha=0.5)
             any_plotted = True
 
         ax.set_xlabel("Batch")
@@ -132,18 +148,22 @@ class MetricsVisualizer:
         if any_plotted:
             ax.legend()
         ax.grid(True, alpha=0.3)
+        
+        if save_path is not None and fig is not None:
+            fig.savefig(save_path, dpi=250, bbox_inches="tight")
+            print(f"GPU memory per batch plot saved to {save_path}")
+        
         return ax
     
-    def plot_gpu_memory_peaks_by_epoch(self, model_names=None, ax=None):
+    def plot_gpu_memory_peaks_by_epoch(self, model_names=None, ax=None, save_path=None):
         """
         GPU peak memory per epoch:
         - training peak
         - validation peak
-        - overall running peak
 
         Styling:
         - Same color per model
-        - Different markers for train / val / overall
+        - Different markers for train / val
         - Legend:
             * one entry per model (color only)
             * one entry per marker meaning (black markers)
@@ -153,12 +173,13 @@ class MetricsVisualizer:
 
         if ax is None:
             fig, ax = plt.subplots(figsize=(7, 4), dpi=200)
+        else:
+            fig = None
 
         # Marker convention
         marker_map = {
             "train": "o",
             "val": "^",
-            "overall": "s",
         }
 
         # Keep handles to build two separate legends
@@ -181,7 +202,6 @@ class MetricsVisualizer:
                 default=None,
             )
             val_peak = em.get("gpu_memory_peak_validation_mb", None)
-            overall_peak = em.get("gpu_memory_peak_overall_mb", None)
 
             # Plot data
             if train_peak is not None:
@@ -198,14 +218,6 @@ class MetricsVisualizer:
                     val_peak,
                     marker=marker_map["val"],
                     linestyle="--",
-                    color=color,
-                )
-            if overall_peak is not None:
-                ax.plot(
-                    epochs,
-                    overall_peak,
-                    marker=marker_map["overall"],
-                    linestyle=":",
                     color=color,
                 )
 
@@ -226,8 +238,6 @@ class MetricsVisualizer:
                     linestyle="None", label="Train epoch peak"),
             plt.Line2D([0], [0], color="black", marker=marker_map["val"],
                     linestyle="None", label="Validation peak"),
-            plt.Line2D([0], [0], color="black", marker=marker_map["overall"],
-                    linestyle="None", label="Overall peak"),
         ]
 
         ax.set_xlabel("Epoch")
@@ -254,17 +264,23 @@ class MetricsVisualizer:
 
         # Add first legend back explicitly
         ax.add_artist(legend_models)
+        
+        if save_path is not None and fig is not None:
+            fig.savefig(save_path, dpi=250, bbox_inches="tight")
+            print(f"GPU memory by epoch plot saved to {save_path}")
 
         return ax
 
 
-    def plot_throughput(self, model_names=None, ax=None):
+    def plot_throughput(self, model_names=None, ax=None, save_path=None):
         """Average throughput per model."""
         if not self._ensure_loaded():
             return
 
         if ax is None:
             fig, ax = plt.subplots(figsize=(6, 4), dpi=200)
+        else:
+            fig = None
 
         names_list = []
         throughputs = []
@@ -278,15 +294,22 @@ class MetricsVisualizer:
         ax.set_title("Average Throughput")
         ax.tick_params(axis="x", rotation=45)
         ax.grid(True, alpha=0.3, axis="y")
+        
+        if save_path is not None and fig is not None:
+            fig.savefig(save_path, dpi=250, bbox_inches="tight")
+            print(f"Throughput plot saved to {save_path}")
+        
         return ax
 
-    def plot_model_size_vs_accuracy(self, model_names=None, ax=None):
+    def plot_model_size_vs_accuracy(self, model_names=None, ax=None, save_path=None):
         """Model Size vs Final Accuracy."""
         if not self._ensure_loaded():
             return
 
         if ax is None:
             fig, ax = plt.subplots(figsize=(6, 4), dpi=200)
+        else:
+            fig = None
 
         for name, data in self._iter_selected_models(model_names):
             params = data["model_info"]["total_params"] / 1e6
@@ -298,15 +321,22 @@ class MetricsVisualizer:
         ax.set_ylabel("Final Test Accuracy [%]")
         ax.set_title("Model Size vs Performance")
         ax.grid(True, alpha=0.3)
+        
+        if save_path is not None and fig is not None:
+            fig.savefig(save_path, dpi=250, bbox_inches="tight")
+            print(f"Model size vs accuracy plot saved to {save_path}")
+        
         return ax
 
-    def plot_training_time(self, model_names=None, ax=None):
+    def plot_training_time(self, model_names=None, ax=None, save_path=None):
         """Total training time per model."""
         if not self._ensure_loaded():
             return
 
         if ax is None:
             fig, ax = plt.subplots(figsize=(6, 4), dpi=200)
+        else:
+            fig = None
 
         names_list = []
         total_times = []
@@ -320,6 +350,11 @@ class MetricsVisualizer:
         ax.set_title("Total Training Time")
         ax.tick_params(axis="x", rotation=45)
         ax.grid(True, alpha=0.3, axis="y")
+        
+        if save_path is not None and fig is not None:
+            fig.savefig(save_path, dpi=250, bbox_inches="tight")
+            print(f"Training time plot saved to {save_path}")
+        
         return ax
 
     # ------------------ NEW: Memory-focused combined plots ------------------
@@ -349,28 +384,28 @@ class MetricsVisualizer:
 
         plt.tight_layout()
         if save_path is not None:
-            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+            plt.savefig(save_path, dpi=250, bbox_inches="tight")
             print(f"GPU memory stack plot saved to {save_path}")
         plt.show()
         plt.close()
 
-    def plot_gpu_memory_epoch_peak_summary(self, model_names=None, ax=None):
+    def plot_gpu_memory_epoch_peak_summary(self, model_names=None, ax=None, save_path=None):
         """
         Bar summary: for each model, plot max-over-epochs for:
           - train epoch peak
           - val peak
-          - overall running peak
         """
         if not self._ensure_loaded():
             return
 
         if ax is None:
             fig, ax = plt.subplots(figsize=(10, 4), dpi=200)
+        else:
+            fig = None
 
         names = []
         train_max = []
         val_max = []
-        overall_max = []
 
         for name, data in self._iter_selected_models(model_names):
             em = data.get("epoch_metrics", {})
@@ -382,18 +417,15 @@ class MetricsVisualizer:
                 default=None,
             )
             val = em.get("gpu_memory_peak_validation_mb", None)
-            overall = em.get("gpu_memory_peak_overall_mb", None)
 
             train_max.append(float(np.max(train)) if train is not None and len(train) else np.nan)
             val_max.append(float(np.max(val)) if val is not None and len(val) else np.nan)
-            overall_max.append(float(np.max(overall)) if overall is not None and len(overall) else np.nan)
 
         x = np.arange(len(names))
-        width = 0.25
+        width = 0.35
 
-        ax.bar(x - width, train_max, width, label="Train epoch peak")
-        ax.bar(x, val_max, width, label="Val peak")
-        ax.bar(x + width, overall_max, width, label="Overall peak")
+        ax.bar(x - width/2, train_max, width, label="Train epoch peak")
+        ax.bar(x + width/2, val_max, width, label="Val peak")
 
         ax.set_xticks(x)
         ax.set_xticklabels(names, rotation=45, ha="right")
@@ -401,9 +433,14 @@ class MetricsVisualizer:
         ax.set_title("Peak GPU Memory Summary (max over epochs)")
         ax.legend()
         ax.grid(True, alpha=0.3, axis="y")
+        
+        if save_path is not None and fig is not None:
+            fig.savefig(save_path, dpi=250, bbox_inches="tight")
+            print(f"GPU memory peak summary plot saved to {save_path}")
+        
         return ax
 
-    def plot_all_memory_metrics(self, model_names=None, ax=None):
+    def plot_all_memory_metrics(self, model_names=None, ax=None, save_path=None):
         """
         NEW: combines *all* memory metrics (GPU + CPU) into one plot.
 
@@ -422,6 +459,8 @@ class MetricsVisualizer:
 
         if ax is None:
             fig, ax = plt.subplots(figsize=(12, 5), dpi=200)
+        else:
+            fig = None
 
         ax_cpu = ax.twinx()
         any_gpu = False
@@ -461,6 +500,11 @@ class MetricsVisualizer:
             ax.legend(handles1 + handles2, labels1 + labels2, loc="best")
 
         ax.grid(True, alpha=0.3)
+        
+        if save_path is not None and fig is not None:
+            fig.savefig(save_path, dpi=250, bbox_inches="tight")
+            print(f"All memory metrics plot saved to {save_path}")
+        
         return ax
 
     # ------------------ Combined comparison figure ------------------
@@ -511,12 +555,12 @@ class MetricsVisualizer:
         if not self.models_data:
             self.load_all_metrics()
 
-        print("\n" + "=" * 140)
+        print("\n" + "=" * 110)
         print(
             f"{'Model':<15} {'Params [M]':<12} {'Final Acc %':<12} {'Best Acc %':<12} "
-            f"{'Time (s)':<12} {'Peak GPU TrainEp [MB]':<20} {'Peak GPU Val [MB]':<16} {'Peak GPU Overall [MB]':<20}"
+            f"{'Time (s)':<12} {'Peak GPU TrainEp [MB]':<20} {'Peak GPU Val [MB]':<16}"
         )
-        print("=" * 140)
+        print("=" * 110)
 
         for model_name, data in self.models_data.items():
             params = data["model_info"]["total_params"] / 1e6
@@ -532,18 +576,16 @@ class MetricsVisualizer:
                 default=None,
             )
             peak_val = self._first_present(em, ["gpu_memory_peak_validation_mb"], default=None)
-            peak_overall = self._first_present(em, ["gpu_memory_peak_overall_mb"], default=None)
 
             train_str = f"{max(peak_train):.1f}" if peak_train is not None else "N/A"
             val_str = f"{max(peak_val):.1f}" if peak_val is not None else "N/A"
-            overall_str = f"{max(peak_overall):.1f}" if peak_overall is not None else "N/A"
 
             print(
                 f"{model_name:<15} {params:<12.2f} {final_acc:<12.2f} {best_acc:<12.2f} "
-                f"{total_time:<12.1f} {train_str:<20} {val_str:<16} {overall_str:<20}"
+                f"{total_time:<12.1f} {train_str:<20} {val_str:<16}"
             )
 
-        print("=" * 140 + "\n")
+        print("=" * 110 + "\n")
 
 
 if __name__ == "__main__":
