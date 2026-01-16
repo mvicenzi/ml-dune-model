@@ -41,24 +41,24 @@ class MinkUNetSparse(nn.Module):
         # ---- Encoder (2 stages) ----
         # Stage 1: 500×500 to 250×250
         self.conv1 = ConvBlock2D(32, 32, kernel_size=2, stride=2)  # Spatial downsample
-        self.block1 = ResidualSparseBlock2D(32, 32)                # Channel stays 32
+        self.block1 = ResidualSparseBlock2D(32, 32, kernel_size=3) # Channel stays 32
         
         # Stage 2: 250×250 to 125×125
         self.conv2 = ConvBlock2D(32, 32, kernel_size=2, stride=2)  # Spatial downsample
-        self.block2 = ResidualSparseBlock2D(32, 64)                # Channel projection 32 to 64
+        self.block2 = ResidualSparseBlock2D(32, 64, kernel_size=3) # Channel projection 32 to 64
 
         # ---- Bottleneck (residual block at 125×125) ----
-        self.bottleneck = ResidualSparseBlock2D(64, 64)  # [B,64,125,125] -> [B,64,125,125]
+        self.bottleneck = ResidualSparseBlock2D(64, 64, kernel_size=3)  # [B,64,125,125] -> [B,64,125,125]
 
         # ---- Decoder (2 stages, symmetric to encoder) ----
         # Stage 1: 125×125 to 250×250
-        self.convtr5 = ConvTrBlock2D(64, 64, kernel_size=2, stride=2)  # Upsample
-        self.block6 = ResidualSparseBlock2D(64 + 32, 64)               # Merge skip1, process
+        self.convtr5 = ConvTrBlock2D(64, 64, kernel_size=2, stride=2)   # Upsample
+        self.block6 = ResidualSparseBlock2D(64 + 32, 64, kernel_size=3) # Merge skip1, process
         
         # Stage 2: 250×250 to 500×500 (full resolution)
-        self.convtr7 = ConvTrBlock2D(64, 64, kernel_size=2, stride=2)  # Upsample
-        self.block8 = ResidualSparseBlock2D(64 + 32, 64)               # Merge skip0, process
-
+        self.convtr7 = ConvTrBlock2D(64, 64, kernel_size=2, stride=2)   # Upsample
+        self.block8 = ResidualSparseBlock2D(64 + 32, 64, kernel_size=3) # Merge skip0, process
+        
         # ---- Final projection + classification head ----
         self.final = SparseConv2d(64, 64, kernel_size=1, bias=True)  # Feature refinement
         self.head = nn.Sequential(

@@ -74,7 +74,7 @@ class ResidualSparseBlock2D(nn.Module):
     - Skip connection: adds input ('identity') to output ('out')
     - Preserves sparse coordinate structure (no densification)
     """
-    def __init__(self, in_ch, out_ch, stride=1):
+    def __init__(self, in_ch, out_ch, kernel_size=3, stride=1):
         super().__init__()
 
         # if you downsample or add feature dimensions to pixels
@@ -85,10 +85,11 @@ class ResidualSparseBlock2D(nn.Module):
             self.downsample = ConvBlock2D(in_ch, out_ch, kernel_size=1, stride=stride, relu=False)
 
         # First convolution: SparseConv2d + BatchNorm1d + ReLU
-        self.conv1 = ConvBlock2D(in_ch, out_ch, kernel_size=3, stride=stride)
+        # if downsampling, it happens here
+        self.conv1 = ConvBlock2D(in_ch, out_ch, kernel_size=kernel_size, stride=stride)
 
         # Second convolution: SparseConv2d + BatchNorm1d
-        self.conv2 = ConvBlock2D(out_ch, out_ch, kernel_size=3, stride=1, relu=False)
+        self.conv2 = ConvBlock2D(out_ch, out_ch, kernel_size=kernel_size, stride=1, relu=False)
 
         # Final activation (after skip addition)
         self.act = ReLU(inplace=True)
@@ -110,69 +111,6 @@ class ResidualSparseBlock2D(nn.Module):
         return out
     
 # ---------------------------------------------------------------------------
-# Bottleneck Attention block (dense)
-# ---------------------------------------------------------------------------
-
-class BottleneckDenseAttention2D(nn.Module):
-    """
-    Dense multi-head self-attention at the bottleneck.
-    Operates on small 7×7 dense maps → global receptive field.
-    Flow:
-        x -> LayerNorm -> MHSA -> +skip
-        -> LayerNorm -> MLP -> +skip
-    """
-    def __init__(self, channels: int, heads: int = 4, mlp_ratio: float = 2.0, dropout: float = 0.0):
-        super().__init__()
-
-        # Pre-attention layernorm
-        self.norm1 = nn.LayerNorm(channels)
-
-        # Dense Multi-Head Self-Attention
-        self.mha = nn.MultiheadAttention(
-            embed_dim=channels,
-            num_heads=heads,
-            batch_first=True,
-            dropout=dropout,
-        )
-
-        # Pre-MLP layernorm
-        self.norm2 = nn.LayerNorm(channels)
-
-        # 1×1 Conv MLP
-        hidden = int(channels * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Conv2d(channels, hidden, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(hidden, channels, kernel_size=1),
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        b, c, h, w = x.shape
-
-        # ---- PRE-ATTENTION NORMALIZATION ----
-        tokens = x.flatten(2).transpose(1, 2)        # [B, HW, C]
-        tokens = self.norm1(tokens)
-
-        # ---- MHSA ----
-        attn_out, _ = self.mha(tokens, tokens, tokens)
-        tokens = tokens + attn_out                   # Skip 1
-
-        # ---- RESTRUCTURE BACK TO MAP ----
-        x = tokens.transpose(1, 2).reshape(b, c, h, w)
-
-        # ---- PRE-MLP NORMALIZATION ----
-        x_norm = x.flatten(2).transpose(1, 2)
-        x_norm = self.norm2(x_norm)
-        x_norm = x_norm.transpose(1, 2).reshape(b, c, h, w)
-
-        # ---- MLP + SKIP ----
-        x = x + self.mlp(x_norm)
-
-        return x
-
-
-
-# ---------------------------------------------------------------------------
 # Bottleneck Attention block (sparse)
 # ---------------------------------------------------------------------------
 
@@ -182,12 +120,15 @@ class BottleneckSparseAttention2D(nn.Module):
     Operates directly on Geometry (e.g. Voxels), so we never densify.
     Flow: norm -> PathAttention -> residual -> MLP -> residual.
     """
-    def __init__(self, channels: int, attn_channels: int, heads: int = 4, patch_size: int = 64, 
+    def __init__(self, channels: int, attn_channels: int, heads: int = 4, 
                  attn_drop: float = 0.0, proj_drop: float = 0.0, mlp_ratio: float = 2.0,
-                 encoding: bool = True, flash: bool = True ):
+                 encoding: bool = True, encoding_range: float = 1.0, encoding_channels: int = 32,
+                 flash: bool = True ):
         super().__init__()
 
         print(f"[BottleneckSparseAttention2D] encoding={encoding}, flash={flash}")
+        if encoding:
+            print(f"   encoding_channels={encoding_channels}, encoding_range={encoding_range}")
 
         # project before attention (sparse 1x1 conv)
         self.pre_proj = SparseConv2d(channels, attn_channels, kernel_size=1)
@@ -204,9 +145,9 @@ class BottleneckSparseAttention2D(nn.Module):
                                               qk_scale=None,
                                               attn_drop=attn_drop, 
                                               proj_drop=proj_drop,
-                                              num_encoding_channels=32, 
-                                              encoding_range=1.0,
                                               use_encoding=encoding,
+                                              num_encoding_channels=encoding_channels, 
+                                              encoding_range=encoding_range,
                                               enable_flash=flash, 
                                               use_batched_qkv=True)
 
