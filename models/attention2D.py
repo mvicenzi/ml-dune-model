@@ -48,6 +48,11 @@ class ToAttentionSmart(BaseSpatialModule):
                 num_spatial_features if concat_input else 0
             )
 
+            print("SinusouidalEncoding settings:")
+            print(f"  num_channels={num_encoding_channels}")
+            print(f"  data_range={encoding_range}")
+            print(f"  concat_input={concat_input}")
+
             self.encoding = nn.Sequential(
                 SinusoidalEncoding(
                     num_channels=num_encoding_channels,

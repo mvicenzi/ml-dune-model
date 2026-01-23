@@ -70,7 +70,7 @@ def main(
 ):
     """Main training driver."""
     wp.init()  # Initialize Warp backend
-    device = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
+    device = torch.device(device if torch.cuda.is_available() else "cpu")
     torch.manual_seed(1)
 
     # Initialize metrics monitor

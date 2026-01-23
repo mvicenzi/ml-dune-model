@@ -33,7 +33,12 @@ class MinkUNetSparseAttention(nn.Module):
     - Decoder: transposed convolutions + skip connections + residual blocks (2 stages)
     - Head: dense classification layer (4 classes)
     """
-    def __init__(self, *, spatial_encoding: bool = True, flash_attention: bool = True, **kwargs,):
+    def __init__(self, *, 
+                 spatial_encoding: bool = True, 
+                 flash_attention: bool = True, 
+                 encoding_dim: int = 32,
+                 encoding_range: float = 1.0,
+                 **kwargs,):
         super().__init__()
 
         # ---- Initial convolution (full resolution feature extraction) ----
@@ -51,7 +56,8 @@ class MinkUNetSparseAttention(nn.Module):
         # ---- Bottleneck (attention at 125×125) ----
         # Global context at 125×125 resolution (15625 spatial tokens)
         self.bottleneck = BottleneckSparseAttention2D(channels=64, attn_channels=128, heads=4, 
-                                                      encoding=spatial_encoding, flash=flash_attention)
+                                                      encoding=spatial_encoding, flash=flash_attention,
+                                                      encoding_range=encoding_range, encoding_channels=encoding_dim)
 
         # ---- Decoder (2 stages, symmetric to encoder) ----
         # Stage 1: 125×125 to 250×250
@@ -118,6 +124,10 @@ class MinkUNetSparseAttention(nn.Module):
         return F.log_softmax(logits, dim=1)     # Log-probabilities for 10 digits
     
 
+class MinkUNetSparseAttention125(MinkUNetSparseAttention):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, spatial_encoding=True, flash_attention=True, encoding_range=125.0, **kwargs)
+
 class MinkUNetSparseAttentionNoEnc(MinkUNetSparseAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, spatial_encoding=False, flash_attention=True, **kwargs)
@@ -125,6 +135,10 @@ class MinkUNetSparseAttentionNoEnc(MinkUNetSparseAttention):
 class MinkUNetSparseAttentionNoFlash(MinkUNetSparseAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, spatial_encoding=True, flash_attention=False, **kwargs)
+
+class MinkUNetSparseAttentionNoFlash125(MinkUNetSparseAttention):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, spatial_encoding=True, flash_attention=False, encoding_range=125.0, **kwargs)
 
 class MinkUNetSparseAttentionNoFlashEnc(MinkUNetSparseAttention):
     def __init__(self, *args, **kwargs):
