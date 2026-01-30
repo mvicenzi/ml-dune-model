@@ -22,7 +22,9 @@ from warpconvnet.geometry.features.cat import CatFeatures
 
 ROOTDIR = "/nfs/data/1/mvicenzi/apa-test-data/gzip2"       # change this to your HDF5 folder
 OUTDIR  = "/nfs/data/1/mvicenzi/apa-test-data/pickle"      # folder to save .pt files
-FRAME_NAME = "frame_rebinned_reco"
+FRAMES_2D = ["frame_rebinned_reco", "frame_trackid_1st", "frame_pid_1st", "frame_trackid_2nd", "frame_pid_2nd"]
+ARRAYS_1D = ["channels_rebinned_reco", "channels_trackid_1st", "channels_pid_1st", "channels_trackid_2nd", "channels_pid_2nd",
+             "tickinfo_rebinned_reco", "tickinfo_trackid_1st", "tickinfo_pid_1st", "tickinfo_trackid_2nd", "tickinfo_pid_2nd"]
 PICKLE_PROTOCOL = 5
 
 # -------------------------------
@@ -37,20 +39,39 @@ def process_h5_file(h5_path: Path):
 
     with h5py.File(h5_path, "r") as f:
         for group in f.keys():
-            if FRAME_NAME not in f[group]:
-                continue
 
-            #print(f"Processing {h5_path.name} - group {group}")
-            frame = f[group][FRAME_NAME][()]  # dense numpy (channels, ticks)
+            group_dict = {}
+            for name, ds in f[group].items():
+                
+                # if tagged for saving as a 2D frame:
+                if name in FRAMES_2D:
 
-            x = torch.from_numpy(frame).float().unsqueeze(0).unsqueeze(0)  # (B=1,C=1,H,W)
-            vox = Voxels.from_dense(x)
+                    frame = ds[()] # dense (H=hannels, W=ticks)
 
-            sparse_groups[group] = {
-                "coords": vox.coordinate_tensor.cpu(),
-                "features": vox.feature_tensor.cpu(),
-                "offsets": vox.offsets.cpu()
-            }
+                    # reshape into (B=1, C=1, H, W)
+                    x = torch.from_numpy(frame).float().unsqueeze(0).unsqueeze(0) 
+
+                    # use WarpConvNet to convert dense to sparse
+                    # NOTE: this ignores "zeros", possible problem if trackid=0 is valid?
+                    vox = Voxels.from_dense(x)
+
+                    group_dict[name] = {
+                        "coords": vox.coordinate_tensor.cpu(),
+                        "features": vox.feature_tensor.cpu(),
+                        "offsets": vox.offsets.cpu(),
+                    }
+
+                #if tagged for saving as 1D array:
+                elif name in ARRAYS_1D:
+
+                    arr = ds[()]  # dense 1D array
+                    group_dict[name] = torch.from_numpy(arr)
+
+                else:
+                    print(f"Skipping {h5_path.name}:{group}/{name}")
+
+            if group_dict:
+                sparse_groups[group] = group_dict
 
     return sparse_groups
 
