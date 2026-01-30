@@ -3,13 +3,16 @@
 import h5py
 from pathlib import Path
 import numpy as np  
+import hdf5plugin
 
 # -------------------------------
 # Configuration
 # -------------------------------
 
 ROOTDIR = "/nfs/data/1/mvicenzi/apa-test-data/gzip2"          # change this to your HDF5 folder
-OUTDIR  = "/nfs/data/1/mvicenzi/apa-test-data/sparse_gzip2"   # folder to save new sparse HDF5 files
+#OUTDIR  = "/nfs/data/1/mvicenzi/apa-test-data/sparse_gzip2"   # folder to save new sparse HDF5 files
+OUTDIR  = "/nfs/data/1/mvicenzi/apa-test-data/sparse_zstd5"   # folder to save new sparse HDF5 files
+
 
 # names of datasets to convert to sparse 2D frames or save as 1D arrays
 FRAMES_2D = ["frame_rebinned_reco", "frame_trackid_1st", "frame_pid_1st", "frame_trackid_2nd", "frame_pid_2nd"]
@@ -19,6 +22,9 @@ ARRAYS_1D = ["channels_rebinned_reco", "channels_trackid_1st", "channels_pid_1st
 # compression configuration
 COMPRESSION_TYPE = "gzip"
 COMPRESSION_LEVEL = 2
+#COMPRESSION_TYPE = hdf5plugin.Zstd(clevel=5)
+#COMPRESSION_LEVEL = None
+
 
 # -------------------------------
 # Utilities
@@ -62,7 +68,7 @@ def process_h5_file(inpath: Path, outpath: Path):
                 elif name in ARRAYS_1D:
 
                     arr = ds[()]  # dense 1D array
-                    image_out_group.create_dataset(name=name, data=arr, compression="gzip", compression_opts=GZIP_COMPRESSION)
+                    image_out_group.create_dataset(name=name, data=arr, compression=COMPRESSION_TYPE, compression_opts=COMPRESSION_LEVEL)
 
                 else:
                     print(f"Skipping {inpath.name}:{group}/{name}")
