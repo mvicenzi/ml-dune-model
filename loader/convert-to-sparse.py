@@ -10,8 +10,8 @@ import hdf5plugin
 # -------------------------------
 
 ROOTDIR = "/nfs/data/1/mvicenzi/apa-test-data/gzip2"          # change this to your HDF5 folder
-#OUTDIR  = "/nfs/data/1/mvicenzi/apa-test-data/sparse_gzip2"   # folder to save new sparse HDF5 files
-OUTDIR  = "/nfs/data/1/mvicenzi/apa-test-data/sparse_zstd5"   # folder to save new sparse HDF5 files
+OUTDIR  = "/nfs/data/1/mvicenzi/apa-test-data/sparse_gzip2"   # folder to save new sparse HDF5 files
+#OUTDIR  = "/nfs/data/1/mvicenzi/apa-test-data/sparse_zstd5"   # folder to save new sparse HDF5 files
 
 
 # names of datasets to convert to sparse 2D frames or save as 1D arrays
