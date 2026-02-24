@@ -10,7 +10,7 @@ import hdf5plugin
 # -------------------------------
 
 ROOTDIR = "/nfs/data/1/mvicenzi/apa-test-data/gzip2"          # change this to your HDF5 folder
-OUTDIR  = "/nfs/data/1/mvicenzi/apa-test-data/sparse_gzip2"   # folder to save new sparse HDF5 files
+OUTDIR  = "/nfs/data/1/mvicenzi/apa-test-data/sparse_gzip6"   # folder to save new sparse HDF5 files
 #OUTDIR  = "/nfs/data/1/mvicenzi/apa-test-data/sparse_zstd5"   # folder to save new sparse HDF5 files
 
 
@@ -21,7 +21,7 @@ ARRAYS_1D = ["channels_rebinned_reco", "channels_trackid_1st", "channels_pid_1st
 
 # compression configuration
 COMPRESSION_TYPE = "gzip"
-COMPRESSION_LEVEL = 2
+COMPRESSION_LEVEL = 6
 #COMPRESSION_TYPE = hdf5plugin.Zstd(clevel=5)
 #COMPRESSION_LEVEL = None
 

@@ -57,8 +57,8 @@ def test(model, device, test_loader):
 
 def main(
     model_name="attn_base",
-    batch_size=30,
-    test_batch_size=30,
+    batch_size=200,
+    test_batch_size=200,
     epochs=10,
     lr=1e-3,
     scheduler_step_size=10,
@@ -84,7 +84,7 @@ def main(
     dataset = DUNEImageDataset(rootdir=rootdir, class_names=label_tokens, view_index=2, use_cache=True)
 
     ### for testing: small subset
-    n_subset = 50000
+    n_subset = 500000
     subset_indices = torch.randperm(len(dataset))[:n_subset]
     subset_ds = Subset(dataset, subset_indices)
 
@@ -107,6 +107,15 @@ def main(
 
     ModelCls = MODEL_REGISTRY[model_name]
     model = ModelCls().to(device)
+
+    # Move to GPU(s)
+    if torch.cuda.is_available():
+        if torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs")
+            model = torch.nn.DataParallel(model)
+        model = model.to(device)
+    else:
+        model = model.to(device)
 
     monitor.on_train_begin(
         model,
@@ -136,7 +145,13 @@ def main(
     checkpoints_dir = Path(checkpoints_dir)
     checkpoints_dir.mkdir(exist_ok=True)
     ckpt_path = checkpoints_dir / f"{model_name}_final.pt"
-    torch.save(model.state_dict(), ckpt_path)
+
+
+    if isinstance(model, torch.nn.DataParallel):
+        torch.save(model.module.state_dict(), ckpt_path)
+    else:
+        torch.save(model.state_dict(), ckpt_path)
+
     print(f"Saved final model checkpoint to: {ckpt_path}")
 
     # Final summary and save
