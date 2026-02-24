@@ -66,6 +66,7 @@ def main(
     device="cuda",
     metrics_dir="./metrics",
     checkpoints_dir="./checkpoints",
+    save_every=10,
     test_mode=True
 ):
     """Main training driver."""
@@ -131,6 +132,9 @@ def main(
     scheduler = StepLR(optimizer, step_size=scheduler_step_size, gamma=gamma)
 
     # --- Training loop ---
+    checkpoints_dir = Path(checkpoints_dir)
+    checkpoints_dir.mkdir(exist_ok=True)
+
     for epoch in range(1, epochs + 1):
         train(model, device, train_loader, optimizer, epoch, monitor)
 
@@ -141,18 +145,12 @@ def main(
         monitor.on_epoch_end(epoch, test_loss, acc)
         scheduler.step()
 
-    # Save final model checkpoint
-    checkpoints_dir = Path(checkpoints_dir)
-    checkpoints_dir.mkdir(exist_ok=True)
-    ckpt_path = checkpoints_dir / f"{model_name}_final.pt"
-
-
-    if isinstance(model, torch.nn.DataParallel):
-        torch.save(model.module.state_dict(), ckpt_path)
-    else:
-        torch.save(model.state_dict(), ckpt_path)
-
-    print(f"Saved final model checkpoint to: {ckpt_path}")
+        if epoch % save_every == 0 or epoch == epochs:
+            state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+            ckpt_path = checkpoints_dir / f"{model_name}_epoch{epoch}.pt"
+            torch.save(state, ckpt_path)
+            monitor.save()
+            print(f"Checkpoint saved: {ckpt_path}")
 
     # Final summary and save
     monitor.print_summary()
