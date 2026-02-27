@@ -57,8 +57,8 @@ def test(model, device, test_loader):
 
 def main(
     model_name="attn_base",
-    batch_size=200,
-    test_batch_size=200,
+    batch_size=100,
+    test_batch_size=100,
     epochs=10,
     lr=1e-3,
     scheduler_step_size=10,
