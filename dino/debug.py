@@ -123,9 +123,10 @@ class DINODebugger:
 
         try:
             # Visualize masks
-            self._save_mask_viz(iteration, x, x_student, mask)
+            if iteration < 10:
+                self._save_mask_viz(iteration, x, x_student, mask)
             # Visualize features
-            self._save_feature_viz(iteration, s_feats, t_feats)
+            self._save_feature_viz(iteration, x, s_feats, t_feats)
             # Update loss curve
             self._save_loss_curve(iteration)
         except Exception as e:
@@ -134,54 +135,83 @@ class DINODebugger:
 
     def _save_mask_viz(self, iteration: int, x: Tensor, x_student: Tensor, mask: Tensor):
         """Save 3-panel visualization: original | masked | binary mask."""
-        fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-        # Sample from batch (index 0)
-        x_np = x[0, 0].cpu().detach().numpy()  # [H, W]
-        x_student_np = x_student[0, 0].cpu().detach().numpy()  # [H, W]
-        mask_np = mask[0].cpu().detach().numpy()  # [H, W]
+        # Sample from batch (index 0); transpose so wire=x, time tick=y
+        x_np = x[0, 0].cpu().detach().numpy().T          # [W, H]
+        x_student_np = x_student[0, 0].cpu().detach().numpy().T  # [W, H]
+        mask_np = mask[0].cpu().detach().numpy().T        # [W, H]
 
-        axes[0].imshow(x_np, cmap="gray")
+        im0 = axes[0].imshow(x_np, interpolation="none", cmap="twilight")
         axes[0].set_title("Original Image")
-        axes[0].axis("off")
+        axes[0].set_xlabel("Wire")
+        axes[0].set_ylabel("Time tick")
+        fig.colorbar(im0, ax=axes[0], label="ADC")
 
-        axes[1].imshow(x_student_np, cmap="gray")
+        im1 = axes[1].imshow(x_student_np, interpolation="none", cmap="twilight")
         axes[1].set_title("Masked Image (Student Input)")
-        axes[1].axis("off")
+        axes[1].set_xlabel("Wire")
+        axes[1].set_ylabel("Time tick")
+        fig.colorbar(im1, ax=axes[1], label="ADC")
 
-        axes[2].imshow(mask_np, cmap="binary")
+        im2 = axes[2].imshow(mask_np, interpolation="none", cmap="binary")
         axes[2].set_title("Mask (True = Masked)")
-        axes[2].axis("off")
+        axes[2].set_xlabel("Wire")
+        axes[2].set_ylabel("Time tick")
+        fig.colorbar(im2, ax=axes[2], label="Masked")
 
         plt.tight_layout()
         save_path = self.debug_dir / f"mask_sample_iter{iteration:06d}.png"
         plt.savefig(save_path, dpi=100, bbox_inches="tight")
         plt.close()
 
-    def _save_feature_viz(self, iteration: int, s_feats: Tensor, t_feats: Tensor):
-        """Save 2×4 grid: first 4 teacher channels (top) vs first 4 student channels (bottom)."""
-        fig, axes = plt.subplots(2, 4, figsize=(12, 6))
+    def _save_feature_viz(self, iteration: int, x: Tensor, s_feats: Tensor, t_feats: Tensor):
+        """Save 2×4 grid: first 4 teacher channels (top) vs first 4 student channels (bottom).
 
-        s_np = s_feats[0].cpu().detach()  # [D, H, W]
-        t_np = t_feats[0].cpu().detach()  # [D, H, W]
+        Inactive pixel positions (where original image is zero) are shown as NaN,
+        so only active detector pixels are colored — matches post_training_visualize.py style.
+        One shared colorbar per row.
+        """
+        n_ch = 4
+        fig, axes = plt.subplots(2, n_ch, figsize=(n_ch * 4, 10), constrained_layout=True)
 
-        for i in range(4):
+        # Active pixel mask from original image: inactive → NaN (batch index 0)
+        active = (x[0, 0].cpu().detach().numpy() != 0)  # [H, W]
+
+        s_np = s_feats[0].cpu().detach().numpy()  # [D, H, W]
+        t_np = t_feats[0].cpu().detach().numpy()  # [D, H, W]
+
+        last_t = last_s = None
+
+        for i in range(n_ch):
             # Teacher channels (top row)
-            ch_t = t_np[i % t_np.shape[0]].numpy()
-            axes[0, i].imshow(ch_t, cmap="viridis")
+            ch_t = t_np[i % t_np.shape[0]]
+            img_t = np.full_like(ch_t, np.nan, dtype=float)
+            img_t[active] = ch_t[active]
+            last_t = axes[0, i].imshow(img_t.T, interpolation="none", cmap="viridis")
             axes[0, i].set_title(f"Teacher Ch{i}")
-            axes[0, i].axis("off")
+            axes[0, i].set_xlabel("Wire")
+            axes[0, i].set_ylabel("Time tick")
 
             # Student channels (bottom row)
-            ch_s = s_np[i % s_np.shape[0]].numpy()
-            axes[1, i].imshow(ch_s, cmap="viridis")
+            ch_s = s_np[i % s_np.shape[0]]
+            img_s = np.full_like(ch_s, np.nan, dtype=float)
+            img_s[active] = ch_s[active]
+            last_s = axes[1, i].imshow(img_s.T, interpolation="none", cmap="viridis")
             axes[1, i].set_title(f"Student Ch{i}")
-            axes[1, i].axis("off")
+            axes[1, i].set_xlabel("Wire")
+            axes[1, i].set_ylabel("Time tick")
 
-        plt.tight_layout()
+        # One shared colorbar per row
+        if last_t is not None:
+            fig.colorbar(last_t, ax=axes[0, :], label="Activation", fraction=0.02, pad=0.02)
+        if last_s is not None:
+            fig.colorbar(last_s, ax=axes[1, :], label="Activation", fraction=0.02, pad=0.02)
+
+        fig.suptitle(f"Feature Maps — iter {iteration}", fontsize=14)
         save_path = self.debug_dir / f"features_iter{iteration:06d}.png"
-        plt.savefig(save_path, dpi=100, bbox_inches="tight")
-        plt.close()
+        fig.savefig(save_path, dpi=100, bbox_inches="tight")
+        plt.close(fig)
 
     def _save_loss_curve(self, iteration: int):
         """Update and save running loss curve."""
