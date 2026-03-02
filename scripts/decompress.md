@@ -6,12 +6,19 @@ python scripts/decompress.py \
     --input_root /nfs/data/1/jjo/data/fdhd_sparse_training \
     --output_root /nfs/data/1/yuhw/cffm-data/prod-jay-1M-2026-02-27-sample \
     --max_files 20
+python scripts/decompress.py \
+    --input_root /nfs/data/1/jjo/data/fdhd_sparse_truthlabel \
+    --output_root /nfs/data/1/yuhw/cffm-data/prod-jay-100k-truth-2026-02-27-sample \
+    --max_files 10
 ```
 ## Process all files
 ```bash
 python scripts/decompress.py \
     --input_root /nfs/data/1/jjo/data/fdhd_sparse_training \
     --output_root /nfs/data/1/yuhw/cffm-data/prod-jay-1M-2026-02-27
+python scripts/decompress.py \
+    --input_root /nfs/data/1/jjo/data/fdhd_sparse_truthlabel \
+    --output_root /nfs/data/1/yuhw/cffm-data/prod-jay-100k-truth-2026-02-27
 ```
 
 # Task: write python script in "scripts/decompress.py" to decompress data to be training ready maintaining the original folder structure.
