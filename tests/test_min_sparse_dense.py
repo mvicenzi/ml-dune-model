@@ -41,6 +41,7 @@ def main() -> None:
     print(f"  coordinate shape:    {tuple(vox.coordinate_tensor.shape)}")
     print(f"  feature shape:       {tuple(vox.feature_tensor.shape)}")
     print(f"  offsets shape:       {tuple(vox.offsets.shape)}")
+    print(f"  offsets:             {vox.offsets}")
 
     # Sparse -> dense
     dense_back = vox.to_dense(channel_dim=1, spatial_shape=(dense.shape[2], dense.shape[3]))
