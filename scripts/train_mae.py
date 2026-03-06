@@ -120,6 +120,10 @@ def _train_epoch(
                 )
                 opt_ssl.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(model.backbone.parameters()) + list(model.charge_head.parameters()),
+                    max_norm=1.0,
+                )
                 opt_ssl.step()
                 ssl_losses.append(loss.item())
                 monitor.on_batch_end(global_step, loss.item(), int(mask_bool.sum()))
