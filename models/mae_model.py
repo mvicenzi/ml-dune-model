@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from warpconvnet.geometry.types.voxels import Voxels
@@ -64,6 +65,54 @@ def sparse_global_avg_pool(vox: Voxels) -> Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Feature replacement helper
+# ---------------------------------------------------------------------------
+
+def _replace_features(vox: Voxels, new_feats: Tensor) -> Voxels:
+    """Return a new Voxels with the same coords/offsets but replaced features."""
+    offsets = vox.offsets  # keep on CPU
+    return Voxels(
+        batched_coordinates=IntCoords(vox.coordinate_tensor, offsets=offsets),
+        batched_features=CatFeatures(new_feats, offsets=offsets),
+        offsets=offsets,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sparse CNN classification head
+# ---------------------------------------------------------------------------
+
+class SparseCNNHead(nn.Module):
+    """
+    Sparse CNN classification head.
+
+    Two 3x3 sparse conv layers (BN + ReLU) followed by sparse global
+    average pooling and a linear classifier.
+
+    Parameters
+    ----------
+    in_ch     : input feature channels (64 for backbone output, 1 for raw charge)
+    n_classes : number of output classes
+    """
+
+    def __init__(self, in_ch: int = 64, n_classes: int = 3):
+        super().__init__()
+        self.conv1 = SparseConv2d(in_ch, 128, kernel_size=3, bias=False)
+        self.bn1   = nn.BatchNorm1d(128)
+        self.conv2 = SparseConv2d(128, 128, kernel_size=3, bias=False)
+        self.bn2   = nn.BatchNorm1d(128)
+        self.fc    = nn.Linear(128, n_classes)
+
+    def forward(self, vox: Voxels) -> Tensor:
+        vox    = self.conv1(vox)
+        vox    = _replace_features(vox, F.relu(self.bn1(vox.feature_tensor)))
+        vox    = self.conv2(vox)
+        vox    = _replace_features(vox, F.relu(self.bn2(vox.feature_tensor)))
+        pooled = sparse_global_avg_pool(vox)   # [B, 128]
+        return self.fc(pooled)                  # [B, n_classes]
+
+
+# ---------------------------------------------------------------------------
 # MAE model
 # ---------------------------------------------------------------------------
 
@@ -73,9 +122,10 @@ class SparseMAEModel(nn.Module):
 
     Components
     ----------
-    backbone       : MinkUNetSparseAttentionCore  (Voxels[1 ch] → Voxels[64 ch])
-    charge_head    : 1×1 SparseConv2d(64→1)       SSL reconstruction head
-    nu_flavor_head : sparse global avg-pool → Linear(64, n_classes)  SFT head
+    backbone           : MinkUNetSparseAttentionCore  (Voxels[1 ch] → Voxels[64 ch])
+    charge_head        : 1×1 SparseConv2d(64→1)       SSL reconstruction head
+    nu_flavor_head     : SparseCNNHead(in_ch=64)       SFT head on backbone features
+    ref_nu_flavor_head : SparseCNNHead(in_ch=1)        SFT reference on raw charge
 
     Usage
     -----
@@ -86,7 +136,8 @@ class SparseMAEModel(nn.Module):
 
     SFT training (backbone frozen):
         model.freeze_backbone()
-        logits = model.forward_sft(voxels)
+        logits     = model.forward_sft(voxels)      # uses backbone features
+        logits_ref = model.forward_sft_ref(voxels)  # uses raw 1-ch charge
         loss   = F.cross_entropy(logits[valid], labels[valid])
         model.unfreeze_backbone()
     """
@@ -111,8 +162,11 @@ class SparseMAEModel(nn.Module):
         # SSL head: 64 → 1 feature channel (charge reconstruction)
         self.charge_head = SparseConv2d(64, 1, kernel_size=1, bias=True)
 
-        # SFT head: global pool → class logits
-        self.nu_flavor_head = nn.Linear(64, n_classes)
+        # SFT head on backbone features (64 ch)
+        self.nu_flavor_head = SparseCNNHead(in_ch=64, n_classes=n_classes)
+
+        # Reference SFT head on raw 1-ch charge (no backbone)
+        self.ref_nu_flavor_head = SparseCNNHead(in_ch=1, n_classes=n_classes)
 
     # ------------------------------------------------------------------ #
 
@@ -128,7 +182,7 @@ class SparseMAEModel(nn.Module):
 
     def forward_sft(self, voxels: Voxels) -> Tensor:
         """
-        Forward pass for SFT (supervised fine-tuning).
+        Forward pass for SFT using backbone features.
 
         Backbone runs under torch.no_grad() for memory efficiency.
         Call freeze_backbone() before this to also prevent grad accumulation.
@@ -137,9 +191,17 @@ class SparseMAEModel(nn.Module):
         Output : [B, n_classes] logits
         """
         with torch.no_grad():
-            feats = self.backbone(voxels)       # Voxels [64 ch]
-        pooled = sparse_global_avg_pool(feats)  # [B, 64]  (detached)
-        return self.nu_flavor_head(pooled)      # [B, n_classes]
+            feats = self.backbone(voxels)   # Voxels [64 ch]
+        return self.nu_flavor_head(feats)   # [B, n_classes]
+
+    def forward_sft_ref(self, voxels: Voxels) -> Tensor:
+        """
+        Forward pass for reference SFT using raw 1-ch charge (no backbone).
+
+        Input  : Voxels with 1 feature channel
+        Output : [B, n_classes] logits
+        """
+        return self.ref_nu_flavor_head(voxels)  # [B, n_classes]
 
     # ------------------------------------------------------------------ #
 
@@ -152,10 +214,15 @@ class SparseMAEModel(nn.Module):
         self.backbone.requires_grad_(True)
 
     def reset_sft_head(self):
-        """Re-initialize nu_flavor_head to random weights.
+        """Re-initialize both SFT heads to random weights.
 
-        Call at the start of each epoch so every SFT evaluation probes
-        the current backbone features from a clean slate, giving an
-        unbiased measure of feature quality at each SSL checkpoint.
+        Call at the start of each SFT evaluation so both heads probe
+        the current backbone features and raw charge from a clean slate,
+        giving an unbiased comparison at each SSL checkpoint.
         """
-        self.nu_flavor_head.reset_parameters()
+        for m in self.nu_flavor_head.modules():
+            if hasattr(m, 'reset_parameters'):
+                m.reset_parameters()
+        for m in self.ref_nu_flavor_head.modules():
+            if hasattr(m, 'reset_parameters'):
+                m.reset_parameters()

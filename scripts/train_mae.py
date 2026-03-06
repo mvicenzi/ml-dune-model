@@ -5,15 +5,18 @@ Architecture
 ------------
   Backbone  : MinkUNetSparseAttentionCore  (Voxels[1ch] → Voxels[64ch])
   SSL head  : SparseConv2d(64, 1)          charge reconstruction
-  SFT head  : Linear(64, n_classes)        neutrino-flavour classification
+  SFT head  : SparseCNNHead(in_ch=64)      neutrino-flavour classification on backbone features
+  Ref head  : SparseCNNHead(in_ch=1)       same architecture, applied to raw charge (no backbone)
 
 Training loop
 -------------
   For each SSL epoch:
     1. One full pass through ssl_dataset (backbone + SSL head updated).
-    2. n_sft_epochs_per_ssl_epoch full passes through sft_dataset
-       (SFT head only updated, backbone frozen).
-  The SFT head and its optimizer persist across SSL epochs.
+    2. Both SFT heads are reset to random weights.
+    3. n_sft_epochs_per_ssl_epoch full passes through sft_dataset,
+       training both heads in parallel (backbone frozen).
+  Both heads and their optimizers are recreated fresh each SSL epoch
+  for an unbiased comparison of SSL features vs. raw charge.
 
   After each SSL epoch a PNG is saved comparing:
     original (unmasked) | masked input | reconstructed output
@@ -249,53 +252,68 @@ def _train_ssl_epoch(
 
 
 # ---------------------------------------------------------------------------
-# One SFT epoch
+# One SFT epoch (trains both SSL-feature head and raw-charge reference head)
 # ---------------------------------------------------------------------------
 
 def _train_sft_epoch(
-    model, sft_loader, opt_sft,
+    model, sft_loader, opt_sft, opt_ref,
     device, n_classes, epoch, sft_epoch,
 ):
     model.freeze_backbone()
-    sft_losses = []
-    confusion  = torch.zeros(n_classes, n_classes, dtype=torch.long)
+    sft_losses, ref_losses = [], []
+    confusion_sft = torch.zeros(n_classes, n_classes, dtype=torch.long)
+    confusion_ref = torch.zeros(n_classes, n_classes, dtype=torch.long)
 
     for step, (vox_sft_cpu, labels) in enumerate(sft_loader):
         vox_sft = voxels_to_device(vox_sft_cpu, device)
         labels  = labels.to(device)
 
         valid = labels >= 0
-        if not valid.any():
-            continue
-        if vox_sft.feature_tensor.shape[0] == 0:
+        if not valid.any() or vox_sft.feature_tensor.shape[0] == 0:
             continue
 
+        trues = labels[valid].cpu()
+
+        # ── SSL feature head ──────────────────────────────────────────────
         logits   = model.forward_sft(vox_sft)
         sft_loss = F.cross_entropy(logits[valid], labels[valid])
         opt_sft.zero_grad()
         sft_loss.backward()
         opt_sft.step()
         sft_losses.append(sft_loss.item())
-
         preds = logits[valid].argmax(dim=1).cpu()
-        trues = labels[valid].cpu()
         for t, p in zip(trues.tolist(), preds.tolist()):
             if 0 <= t < n_classes and 0 <= p < n_classes:
-                confusion[t, p] += 1
+                confusion_sft[t, p] += 1
+
+        # ── Raw-charge reference head ─────────────────────────────────────
+        logits_ref = model.forward_sft_ref(vox_sft)
+        ref_loss   = F.cross_entropy(logits_ref[valid], labels[valid])
+        opt_ref.zero_grad()
+        ref_loss.backward()
+        opt_ref.step()
+        ref_losses.append(ref_loss.item())
+        preds_ref = logits_ref[valid].argmax(dim=1).cpu()
+        for t, p in zip(trues.tolist(), preds_ref.tolist()):
+            if 0 <= t < n_classes and 0 <= p < n_classes:
+                confusion_ref[t, p] += 1
 
         if (step + 1) % 50 == 0:
-            sft_mean = sum(sft_losses) / len(sft_losses) if sft_losses else float("nan")
-            total    = int(confusion.sum())
-            correct  = int(confusion.diagonal().sum())
-            acc      = 100.0 * correct / total if total > 0 else float("nan")
+            sft_mean  = sum(sft_losses) / len(sft_losses) if sft_losses else float("nan")
+            ref_mean  = sum(ref_losses)  / len(ref_losses)  if ref_losses  else float("nan")
+            total_s   = int(confusion_sft.sum())
+            acc_s     = 100.0 * int(confusion_sft.diagonal().sum()) / total_s if total_s > 0 else float("nan")
+            total_r   = int(confusion_ref.sum())
+            acc_r     = 100.0 * int(confusion_ref.diagonal().sum()) / total_r if total_r > 0 else float("nan")
             print(
                 f"  [SFT] SSL-epoch {epoch}  SFT-epoch {sft_epoch}"
                 f"  step [{step + 1}/{len(sft_loader)}]"
-                f"  loss={sft_mean:.4f}  acc={acc:.1f}%"
+                f"  SSL-feat: loss={sft_mean:.4f} acc={acc_s:.1f}%"
+                f"  | raw-charge: loss={ref_mean:.4f} acc={acc_r:.1f}%"
             )
 
     model.unfreeze_backbone()
-    return sft_losses, confusion
+    return sft_losses, confusion_sft, ref_losses, confusion_ref
 
 
 # ---------------------------------------------------------------------------
@@ -378,8 +396,8 @@ def main(
         list(model.backbone.parameters()) + list(model.charge_head.parameters()),
         lr=lr,
     )
-    opt_sft = optim.AdamW(model.nu_flavor_head.parameters(), lr=lr)
     sched_ssl = StepLR(opt_ssl, step_size=scheduler_step, gamma=gamma)
+    # opt_sft and opt_ref are recreated each SSL epoch after head reset (see loop below)
 
     # ── Metrics ───────────────────────────────────────────────────────────
     monitor = MetricsMonitor("sparse_mae", save_dir=metrics_dir)
@@ -414,36 +432,54 @@ def main(
         sched_ssl.step()
 
         # ── SFT epochs ────────────────────────────────────────────────────
-        all_sft_losses = []
-        confusion      = torch.zeros(n_classes, n_classes, dtype=torch.long)
+        # Reset both heads + recreate optimizers for a fair per-epoch comparison.
+        model.reset_sft_head()
+        opt_sft = optim.AdamW(model.nu_flavor_head.parameters(),     lr=lr)
+        opt_ref = optim.AdamW(model.ref_nu_flavor_head.parameters(), lr=lr)
+
+        all_sft_losses, all_ref_losses = [], []
+        confusion_sft = torch.zeros(n_classes, n_classes, dtype=torch.long)
+        confusion_ref = torch.zeros(n_classes, n_classes, dtype=torch.long)
 
         for sft_epoch in range(1, n_sft_epochs_per_ssl_epoch + 1):
-            sft_losses, conf_ep = _train_sft_epoch(
-                model, sft_loader, opt_sft,
+            sft_losses, conf_sft_ep, ref_losses, conf_ref_ep = _train_sft_epoch(
+                model, sft_loader, opt_sft, opt_ref,
                 device, n_classes, epoch, sft_epoch,
             )
             all_sft_losses.extend(sft_losses)
-            confusion += conf_ep
+            all_ref_losses.extend(ref_losses)
+            confusion_sft += conf_sft_ep
+            confusion_ref += conf_ref_ep
 
             sft_mean_ep = sum(sft_losses) / len(sft_losses) if sft_losses else float("nan")
-            total_ep    = int(conf_ep.sum())
-            correct_ep  = int(conf_ep.diagonal().sum())
-            acc_ep      = 100.0 * correct_ep / total_ep if total_ep > 0 else float("nan")
+            ref_mean_ep = sum(ref_losses)  / len(ref_losses)  if ref_losses  else float("nan")
+            total_s     = int(conf_sft_ep.sum())
+            acc_s       = 100.0 * int(conf_sft_ep.diagonal().sum()) / total_s if total_s > 0 else float("nan")
+            total_r     = int(conf_ref_ep.sum())
+            acc_r       = 100.0 * int(conf_ref_ep.diagonal().sum()) / total_r if total_r > 0 else float("nan")
             print(
                 f"  SFT epoch {sft_epoch}/{n_sft_epochs_per_ssl_epoch}"
-                f"  |  CE={sft_mean_ep:.4f}  |  acc={acc_ep:.1f}%"
+                f"  |  SSL-feat: CE={sft_mean_ep:.4f} acc={acc_s:.1f}%"
+                f"  |  raw-charge: CE={ref_mean_ep:.4f} acc={acc_r:.1f}%"
             )
 
-        sft_mean    = sum(all_sft_losses) / len(all_sft_losses) if all_sft_losses else float("nan")
-        total_sft   = int(confusion.sum())
-        sft_correct = int(confusion.diagonal().sum())
-        sft_acc     = 100.0 * sft_correct / total_sft if total_sft > 0 else 0.0
+        sft_mean  = sum(all_sft_losses) / len(all_sft_losses) if all_sft_losses else float("nan")
+        ref_mean  = sum(all_ref_losses)  / len(all_ref_losses)  if all_ref_losses  else float("nan")
+        total_sft = int(confusion_sft.sum())
+        sft_acc   = 100.0 * int(confusion_sft.diagonal().sum()) / total_sft if total_sft > 0 else 0.0
+        total_ref = int(confusion_ref.sum())
+        ref_acc   = 100.0 * int(confusion_ref.diagonal().sum()) / total_ref if total_ref > 0 else 0.0
 
         print(f"\n{'='*60}")
-        print(f"Epoch {epoch:3d}  |  SSL L1={ssl_mean:.4f}  |  "
-              f"SFT CE={sft_mean:.4f}  |  SFT acc={sft_acc:.1f}%")
-        _print_confusion(confusion, CLASS_NAMES)
-        _print_class_metrics(confusion, CLASS_NAMES)
+        print(f"Epoch {epoch:3d}  |  SSL L1={ssl_mean:.4f}")
+        print(f"  SSL features  :  CE={sft_mean:.4f}  acc={sft_acc:.1f}%")
+        print(f"  Raw charge ref:  CE={ref_mean:.4f}  acc={ref_acc:.1f}%")
+        print(f"\n  [SSL features]")
+        _print_confusion(confusion_sft, CLASS_NAMES)
+        _print_class_metrics(confusion_sft, CLASS_NAMES)
+        print(f"\n  [Raw charge reference]")
+        _print_confusion(confusion_ref, CLASS_NAMES)
+        _print_class_metrics(confusion_ref, CLASS_NAMES)
         print(f"{'='*60}\n")
 
         monitor.on_validation_begin(epoch)
