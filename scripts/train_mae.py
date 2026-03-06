@@ -344,7 +344,7 @@ def main(
     data_root                  = "/nfs/data/1/yuhw/cffm-data/prod-jay-1M-2026-02-27",
     apa                        = 0,
     view                       = "W",
-    batch_size                 = 16,
+    batch_size                 = 64,
     epochs                     = 2,
     lr                         = 1e-3,
     scheduler_step             = 10,
