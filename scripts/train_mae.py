@@ -44,6 +44,26 @@ import warp as wp
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import StepLR
 
+# ---------------------------------------------------------------------------
+# GPU selection helper
+# ---------------------------------------------------------------------------
+
+def _least_occupied_cuda_device() -> torch.device:
+    """Return the CUDA device with the most free VRAM, or CPU if none available."""
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    n = torch.cuda.device_count()
+    best_idx, best_free = 0, 0
+    for i in range(n):
+        free, _ = torch.cuda.mem_get_info(i)
+        if free > best_free:
+            best_free, best_idx = free, i
+    dev = torch.device(f"cuda:{best_idx}")
+    print(f"Selected {dev}  ({best_free / 2**30:.1f} GB free"
+          f" of {n} GPU{'s' if n > 1 else ''})")
+    return dev
+
+
 # ── project imports ────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -304,8 +324,16 @@ def main(
     viz_dir                    = "./viz",
 ):
     """Sparse MAE training: one SSL epoch → n_sft_epochs_per_ssl_epoch SFT epochs, repeated."""
+    # Resolve device BEFORE wp.init() so Warp/CuPy establish their CUDA context
+    # on the correct GPU.  torch.cuda.set_device() must be called first so that
+    # CuPy's raw-kernel compiler targets the same device as our tensors.
+    if device == "cuda":
+        device = _least_occupied_cuda_device()
+    else:
+        device = torch.device(device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     wp.init()
-    device = torch.device(device if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
 
     print(f"Device: {device}")
