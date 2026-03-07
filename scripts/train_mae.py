@@ -305,7 +305,11 @@ def _train_sft_epoch(
         trues = labels[valid].cpu()
 
         # ── SSL feature head ──────────────────────────────────────────────
-        logits   = model.forward_sft(vox_sft)
+        logits = model.forward_sft(vox_sft)
+        # Guard: strided sparse convs can drop empty batch items from offsets,
+        # making logits.shape[0] < labels.shape[0].  Skip the batch if so.
+        if logits.shape[0] != labels.shape[0]:
+            continue
         sft_loss = focal_loss(logits[valid], labels[valid], gamma=focal_gamma)
         opt_sft.zero_grad()
         sft_loss.backward()
@@ -318,7 +322,9 @@ def _train_sft_epoch(
 
         # ── Raw-charge reference head ─────────────────────────────────────
         logits_ref = model.forward_sft_ref(vox_sft)
-        ref_loss   = focal_loss(logits_ref[valid], labels[valid], gamma=focal_gamma)
+        if logits_ref.shape[0] != labels.shape[0]:
+            continue
+        ref_loss = focal_loss(logits_ref[valid], labels[valid], gamma=focal_gamma)
         opt_ref.zero_grad()
         ref_loss.backward()
         opt_ref.step()

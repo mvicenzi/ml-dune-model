@@ -105,8 +105,17 @@ class SparseCNNHead(nn.Module):
     """
     Sparse CNN classification head.
 
-    Two 3x3 sparse conv layers (BN + ReLU) followed by sparse global
-    average pooling and a linear classifier.
+    Three stride-2 3×3 sparse conv layers with expanding channels (64→128→256),
+    followed by a 1×1 conv at 256 ch, sparse global average pooling, and a
+    linear classifier.  Mirrors the standard CNN pattern of doubling channels
+    while halving spatial resolution at each stride-2 stage.
+
+    Each stride-2 conv halves the coordinate grid, so after three stages the
+    pooling operates over ~N/64 voxels — more spatially discriminative.
+
+    The architecture is identical for both use cases; only in_ch differs:
+      in_ch=64  — applied to backbone features
+      in_ch=1   — applied to raw charge directly
 
     Parameters
     ----------
@@ -116,18 +125,26 @@ class SparseCNNHead(nn.Module):
 
     def __init__(self, in_ch: int = 64, n_classes: int = 3):
         super().__init__()
-        self.conv1 = SparseConv2d(in_ch, 128, kernel_size=3, bias=False)
-        self.bn1   = nn.BatchNorm1d(128)
-        self.conv2 = SparseConv2d(128, 128, kernel_size=3, bias=False)
+        self.conv1 = SparseConv2d(in_ch,  64,  kernel_size=3, stride=2, bias=False)
+        self.bn1   = nn.BatchNorm1d(64)
+        self.conv2 = SparseConv2d(64,  128, kernel_size=3, stride=2, bias=False)
         self.bn2   = nn.BatchNorm1d(128)
-        self.fc    = nn.Linear(128, n_classes)
+        self.conv3 = SparseConv2d(128, 256, kernel_size=3, stride=2, bias=False)
+        self.bn3   = nn.BatchNorm1d(256)
+        self.conv4 = SparseConv2d(256, 256, kernel_size=1, stride=1, bias=False)
+        self.bn4   = nn.BatchNorm1d(256)
+        self.fc    = nn.Linear(256, n_classes)
 
     def forward(self, vox: Voxels) -> Tensor:
         vox    = self.conv1(vox)
         vox    = _replace_features(vox, F.relu(self.bn1(vox.feature_tensor)))
         vox    = self.conv2(vox)
         vox    = _replace_features(vox, F.relu(self.bn2(vox.feature_tensor)))
-        pooled = sparse_global_avg_pool(vox)   # [B, 128]
+        vox    = self.conv3(vox)
+        vox    = _replace_features(vox, F.relu(self.bn3(vox.feature_tensor)))
+        vox    = self.conv4(vox)
+        vox    = _replace_features(vox, F.relu(self.bn4(vox.feature_tensor)))
+        pooled = sparse_global_avg_pool(vox)   # [B, 256]
         return self.fc(pooled)                  # [B, n_classes]
 
 
