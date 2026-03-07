@@ -1,0 +1,13 @@
+implement scripts/eval_mae.py
+- it should read in a sparse dataset with metadata and send the data to several modules for evaluation. It should be expandable for more modules in the future
+  - the number of samples to evaluate should be configurable
+  - user should select which modules to run, default only run module 1 below
+- module 1: test the SSL model
+  - read in a traind model weights
+  - do forward_ssl
+  - print out the sparse data sizes for input, masked and inferenced output
+  - visulize the results: input, masked and inferenced output
+- module 2: test the SFT model
+  - read in a traind model weights
+  - do forward_sft on all the evaluation dataset
+  - summarize the results and print out the results: overall accuracy, average acuracy weighted by class fraction (rare class events weighted higher), confusion matrix, efficiency, purity, etc.
