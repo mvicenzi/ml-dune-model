@@ -223,7 +223,7 @@ def _module_ssl(model, dataset, device, cfg: dict) -> None:
                     break
                 if int(vox.offsets[evt + 1].item()) - int(vox.offsets[evt].item()) == 0:
                     continue
-                orig_evt   = expm1_voxels(_slice_single_event(vox_raw, evt))
+                orig_evt   = expm1_voxels(_slice_single_event(vox, evt))
                 masked_evt = expm1_voxels(_slice_single_event(masked,  evt))
                 pred_evt   = expm1_voxels(_slice_single_event(pred,    evt))
                 event_id   = batch_idx * batch_size + evt
