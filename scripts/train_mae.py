@@ -379,6 +379,7 @@ def main(
     checkpoints_dir            = "./checkpoints",
     save_every                 = 5,
     viz_dir                    = "./viz",
+    resume                     = None,   # path to checkpoint to resume from
 ):
     """Sparse MAE training: one SSL epoch → n_sft_epochs_per_ssl_epoch SFT epochs, repeated."""
     # Resolve device BEFORE wp.init() so Warp/CuPy establish their CUDA context
@@ -436,6 +437,18 @@ def main(
     sched_ssl = StepLR(opt_ssl, step_size=scheduler_step, gamma=gamma)
     # opt_sft and opt_ref are recreated each SSL epoch after head reset (see loop below)
 
+    # ── Resume from checkpoint ─────────────────────────────────────────────
+    start_epoch = 1
+    if resume is not None:
+        ckpt = torch.load(resume, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        if "opt_ssl" in ckpt:
+            opt_ssl.load_state_dict(ckpt["opt_ssl"])
+        if "sched_ssl" in ckpt:
+            sched_ssl.load_state_dict(ckpt["sched_ssl"])
+        start_epoch = ckpt.get("epoch", 0) + 1
+        print(f"Resumed from {resume}  (epoch {start_epoch - 1} → continuing from {start_epoch})")
+
     # ── Metrics ───────────────────────────────────────────────────────────
     monitor = MetricsMonitor("sparse_mae", save_dir=metrics_dir)
     monitor.on_train_begin(
@@ -452,7 +465,7 @@ def main(
     viz_dir = Path(viz_dir)
 
     # ── Training loop ─────────────────────────────────────────────────────
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         print(f"\n{'='*60}")
         print(f"SSL Epoch {epoch}/{epochs}")
 
@@ -526,7 +539,12 @@ def main(
 
         if epoch % save_every == 0 or epoch == epochs:
             ckpt = checkpoints_dir / f"mae_epoch{epoch}.pt"
-            torch.save({"epoch": epoch, "model": model.state_dict()}, ckpt)
+            torch.save({
+                "epoch":    epoch,
+                "model":    model.state_dict(),
+                "opt_ssl":  opt_ssl.state_dict(),
+                "sched_ssl": sched_ssl.state_dict(),
+            }, ckpt)
             monitor.save()
             print(f"Checkpoint saved: {ckpt}")
 
