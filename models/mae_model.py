@@ -242,12 +242,20 @@ class SparseMAEModel(nn.Module):
     # ------------------------------------------------------------------ #
 
     def freeze_backbone(self):
-        """Prevent backbone parameters from accumulating gradients."""
+        """Freeze backbone weights and BatchNorm running stats for SFT training.
+
+        requires_grad_(False) stops weight updates, but BatchNorm1d still
+        updates running_mean/running_var in train() mode regardless of grads.
+        Calling .eval() on the backbone prevents that stat drift, so the
+        saved checkpoint has running stats calibrated to SSL data, not SFT data.
+        """
         self.backbone.requires_grad_(False)
+        self.backbone.eval()
 
     def unfreeze_backbone(self):
-        """Re-enable gradient flow through backbone."""
+        """Re-enable gradient flow and restore BatchNorm to training mode."""
         self.backbone.requires_grad_(True)
+        self.backbone.train()
 
     def reset_sft_head(self):
         """Re-initialize both SFT heads to random weights.

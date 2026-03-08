@@ -2,7 +2,6 @@ __pycache__
 data
 checkpoints*
 metrics
-viz
-viz_eval
+viz*
 run_*
 *.swp
