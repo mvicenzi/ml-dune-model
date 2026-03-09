@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 from torch import Tensor
 
 
@@ -47,6 +48,8 @@ class DINODebugger:
         )
         # grad_history: module_group -> {"iter": [...], "norm": [...]}
         self.grad_history = {} if self.enabled else None
+        # cached norm-module prefixes, built once on first log_gradient_norms call
+        self._norm_prefixes: tuple | None = None
         # val_history: iteration index at end of each epoch -> val loss
         self.val_history = {"iter": [], "loss": []} if self.enabled else None
 
@@ -172,12 +175,6 @@ class DINODebugger:
         Valid pixels = active (non-zero in original image) AND unmasked
         (positions the student actually processed).
 
-        Metrics:
-        - Mean feature variance across channels: low → dimensional collapse
-        - Participation ratio (effective rank): low → few dominant channels, rest collapsed
-        - Mean |off-diagonal covariance|: high → redundant / correlated features
-        - Mean L2 feature norm: high → potential divergence
-
         Computed for both student and teacher. Runs every `debug_every` iterations.
         Full covariance matrices (64×64) are saved to history for offline heatmap plotting.
         """
@@ -239,9 +236,19 @@ class DINODebugger:
         if iteration % self.debug_every != 0:
             return
 
+        # Build norm-module prefix cache once (architecture is fixed after init)
+        if self._norm_prefixes is None:
+            self._norm_prefixes = tuple(
+                mod_name + "."
+                for mod_name, mod in student.named_modules()
+                if isinstance(mod, (nn.BatchNorm1d, nn.BatchNorm2d, nn.LayerNorm))
+            )
+
         has_grad = False
         for name, param in student.named_parameters():
-            if param.grad is None:
+            if param.grad is None or name.endswith("bias"):
+                continue
+            if name.startswith(self._norm_prefixes):
                 continue
             has_grad = True
             group = name.split(".")[0]

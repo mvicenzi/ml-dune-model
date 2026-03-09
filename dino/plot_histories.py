@@ -225,13 +225,49 @@ def plot_eigen(data: dict, out_dir: Path):
         print(f"  saved {fname}")
 
 
+def _expand_groups(grad: dict) -> list[tuple[str, dict]]:
+    """
+    Return (title, params_dict) pairs for each subplot in forward-pass execution order.
+
+    If the 'bottleneck' group contains attention layers it is split into two:
+      - 'bottleneck (attention)': pre_proj + attn.*   [attention path]
+      - 'bottleneck (MLP)':       mlp.* + post_proj   [feed-forward + output]
+    Otherwise 'bottleneck' (plain residual) stays as a single subplot.
+    Any groups not in the known order are appended at the end.
+    """
+    _EXEC_ORDER = [
+        "conv0", "conv1", "block1", "conv2", "block2",
+        "bottleneck",
+        "convtr5", "block6", "convtr7", "block8",
+        "final",
+    ]
+    _ATTN_PREFIXES = ("pre_proj.", "attn.")
+    _MLP_PREFIXES  = ("mlp.", "post_proj.")
+
+    ordered_keys = [k for k in _EXEC_ORDER if k in grad]
+    ordered_keys += [k for k in grad if k not in _EXEC_ORDER]
+
+    result = []
+    for group in ordered_keys:
+        params = grad[group]
+        if group == "bottleneck":
+            attn_params = {s: d for s, d in params.items() if s.startswith(_ATTN_PREFIXES)}
+            mlp_params  = {s: d for s, d in params.items() if s.startswith(_MLP_PREFIXES)}
+            if attn_params and mlp_params:
+                result.append(("bottleneck (attention)", attn_params))
+                result.append(("bottleneck (MLP)",       mlp_params))
+                continue
+        result.append((group, params))
+    return result
+
+
 def plot_grads(data: dict, out_dir: Path):
     grad = data.get("grad", {})
     if not grad:
         return
 
-    groups = sorted(grad.keys())
-    n = len(groups)
+    panels = _expand_groups(grad)
+    n = len(panels)
     n_cols = min(4, n)
     n_rows = (n + n_cols - 1) // n_cols
 
@@ -239,12 +275,12 @@ def plot_grads(data: dict, out_dir: Path):
                              sharex=False, sharey=False)
     axes_flat = np.array(axes).reshape(-1) if n > 1 else [axes]
 
-    for i, group in enumerate(groups):
+    for i, (title, params) in enumerate(panels):
         ax = axes_flat[i]
-        for suffix, d in grad[group].items():
+        for suffix, d in params.items():
             ax.plot(d["iter"], d["norm"], linewidth=1.5, label=suffix)
         ax.legend(fontsize=7)
-        ax.set_title(group, fontsize=10)
+        ax.set_title(title, fontsize=10)
         ax.set_ylabel("Grad L2 Norm")
         ax.set_yscale("log")
         ax.grid(True, alpha=0.3)
