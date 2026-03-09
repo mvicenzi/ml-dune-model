@@ -1,0 +1,291 @@
+"""
+Reproduce all debug plots from a saved histories.json.
+
+Usage:
+    python dino/plot_histories.py path/to/histories.json
+"""
+
+import json
+import sys
+from pathlib import Path
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+def compute_eigen(mats: list) -> list:
+    """Return [(eigenvalues, eigenvectors), ...] for each covariance matrix.
+    Uses eigh (symmetric), so eigenvalues are real and in ascending order.
+    """
+    return [np.linalg.eigh(m) for m in mats]
+
+
+def pr_from_eigen(vals: np.ndarray) -> float:
+    """Participation ratio from eigenvalues: (sum λ)² / sum λ².
+    Clips to zero to guard against tiny negative values from floating-point rounding.
+    """
+    v = vals.clip(0)
+    denom = float((v ** 2).sum())
+    return float(v.sum() ** 2 / denom) if denom > 0 else 1.0
+
+
+def plot_loss(data: dict, out_dir: Path):
+    loss = data.get("loss", [])
+    if not loss:
+        return
+    val = data.get("val", {})
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(loss, linewidth=1.0, alpha=0.8, label="Train (per batch)")
+    if val and val.get("iter"):
+        ax.plot(
+            val["iter"], val["loss"],
+            "o-", linewidth=2.0, markersize=5, label="Val (per epoch)",
+        )
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Loss")
+    ax.set_title("Training and Validation Loss")
+    ax.set_yscale("log")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_dir / "loss_curve.png", dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved loss_curve.png")
+
+
+def plot_stats(data: dict, out_dir: Path):
+    h = data.get("stats", {})
+    if not h or len(h.get("iter", [])) == 0:
+        return
+
+    iters = h["iter"]
+    s_mats = [np.array(m) for m in h["s_cov_mat"]]
+    t_mats = [np.array(m) for m in h["t_cov_mat"]]
+
+    s_eigen = compute_eigen(s_mats)
+    t_eigen = compute_eigen(t_mats)
+
+    s_pr = [pr_from_eigen(vals) for vals, _ in s_eigen]
+    t_pr = [pr_from_eigen(vals) for vals, _ in t_eigen]
+
+    fig, axes = plt.subplots(3, 2, figsize=(14, 12))
+    violin_width = max(iters) * 0.04 if len(iters) > 1 else 1
+
+    def draw_violin(ax, dataset, color, ylabel, title):
+        parts = ax.violinplot(dataset, positions=iters, widths=violin_width,
+                              showmedians=True, showmeans=True, showextrema=True)
+        for pc in parts["bodies"]:
+            pc.set_facecolor(color)
+            pc.set_alpha(0.6)
+        for key in ("cmins", "cmaxes", "cbars"):
+            parts[key].set_color(color)
+        parts["cmedians"].set_color("black")
+        parts["cmeans"].set_color("black")
+        parts["cmeans"].set_linestyle("dashed")
+        ax.legend(
+            handles=[
+                plt.Line2D([0], [0], color="black", linestyle="-",  label="Median"),
+                plt.Line2D([0], [0], color="black", linestyle="--", label="Mean"),
+            ],
+            fontsize=8,
+        )
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.set_xlabel("Iteration")
+        ax.grid(True, alpha=0.3)
+
+    # Row 0: per-pixel L2 norm — median line with min/max band
+    for col, (prefix, color, name) in enumerate([
+        ("s_norm", "C0", "Student"), ("t_norm", "C1", "Teacher")
+    ]):
+        ax = axes[0, col]
+        mins    = h[f"{prefix}_min"]
+        maxs    = h[f"{prefix}_max"]
+        medians = h[f"{prefix}_median"]
+        ax.fill_between(iters, mins, maxs, alpha=0.3, color=color, label="Min–Max")
+        ax.plot(iters, medians, linewidth=1.5, color=color, label="Median")
+        ax.set_ylabel("Per-pixel L2 norm")
+        ax.set_title(f"{name} feature magnitude  (high → potential divergence)")
+        ax.legend(fontsize=8)
+        ax.set_yscale("log")
+        ax.set_xlabel("Iteration")
+        ax.grid(True, alpha=0.3)
+
+    # Row 1: per-feature variance violin
+    draw_violin(axes[1, 0], [np.diag(m) for m in s_mats], "C0", "Per-feature variance", "Student Variance  (low → dimensional collapse)")
+    draw_violin(axes[1, 1], [np.diag(m) for m in t_mats], "C1", "Per-feature variance", "Teacher Variance  (low → dimensional collapse)")
+
+    # Row 2: participation ratio (scalar)
+    for col, (pr, label) in enumerate([(s_pr, "Student"), (t_pr, "Teacher")]):
+        ax = axes[2, col]
+        ax.plot(iters, pr, linewidth=1.5, color=f"C{col}")
+        ax.set_ylabel("Effective rank  [1, D]")
+        ax.set_title(f"{label} Participation Ratio  (low → few dominant channels)")
+        ax.set_xlabel("Iteration")
+        ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(out_dir / "feature_stats.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved feature_stats.png")
+
+
+def plot_cov_heatmap(data: dict, out_dir: Path):
+    h = data.get("stats", {})
+    s_mats = h.get("s_cov_mat", [])
+    t_mats = h.get("t_cov_mat", [])
+    if not s_mats:
+        return
+
+    iters = h.get("iter", [])
+
+    # Pick first and last snapshots (or just one if only one exists)
+    snapshots = [(0, "first")] if len(s_mats) == 1 else [(0, "first"), (-1, "last")]
+
+    for idx, label in snapshots:
+        s_cov = np.array(s_mats[idx])
+        t_cov = np.array(t_mats[idx])
+
+        # Normalize to correlation matrix: C[i,j] / sqrt(C[i,i] * C[j,j])
+        def to_corr(mat):
+            std = np.sqrt(np.diag(mat)).clip(1e-8)
+            return mat / np.outer(std, std)
+
+        s_corr = to_corr(s_cov)
+        t_corr = to_corr(t_cov)
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        title_suffix = f"iter {iters[idx]}" if iters else label
+
+        for ax, corr, name in zip(axes, [s_corr, t_corr], ["Student", "Teacher"]):
+            im = ax.imshow(corr, vmin=-1, vmax=1, cmap="RdBu_r", aspect="auto")
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            ax.set_title(f"{name} feature correlation ({title_suffix})")
+            ax.set_xlabel("Feature index")
+            ax.set_ylabel("Feature index")
+
+        fig.tight_layout()
+        fname = f"cov_heatmap_{label}.png"
+        fig.savefig(out_dir / fname, dpi=100, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  saved {fname}")
+
+
+def plot_eigen(data: dict, out_dir: Path):
+    h = data.get("stats", {})
+    s_mats = h.get("s_cov_mat", [])
+    t_mats = h.get("t_cov_mat", [])
+    if not s_mats:
+        return
+
+    iters = h.get("iter", [])
+    snapshots = [(0, "first")] if len(s_mats) == 1 else [(0, "first"), (-1, "last")]
+
+    s_eigen = compute_eigen([np.array(m) for m in s_mats])
+    t_eigen = compute_eigen([np.array(m) for m in t_mats])
+
+    for idx, label in snapshots:
+        s_cov = np.array(s_mats[idx])
+        t_cov = np.array(t_mats[idx])
+        s_vals, s_vecs = s_eigen[idx]
+        t_vals, t_vecs = t_eigen[idx]
+
+        # Covariance in eigenbasis: V.T @ C @ V = diag(eigenvalues), normalized by largest eigenvalue
+        s_cov_eigen = (s_vecs.T @ s_cov @ s_vecs) / s_vals[-1]
+        t_cov_eigen = (t_vecs.T @ t_cov @ t_vecs) / t_vals[-1]
+
+        title_suffix = f"iter {iters[idx]}" if iters else label
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+        # Top row: eigenvalue spectra
+        for ax, vals, name in zip(axes[0], [s_vals, t_vals], ["Student", "Teacher"]):
+            ax.bar(np.arange(len(vals)), vals, width=1.0)
+            ax.set_yscale("log")
+            ax.set_xlabel("Eigenvalue index (ascending)")
+            ax.set_ylabel("Eigenvalue")
+            ax.set_title(f"{name} eigenvalue spectrum ({title_suffix})")
+            ax.grid(True, alpha=0.3)
+
+        # Bottom row: covariance heatmap in eigenbasis
+        vmax = max(np.abs(s_cov_eigen).max(), np.abs(t_cov_eigen).max())
+        for ax, mat, name in zip(axes[1], [s_cov_eigen, t_cov_eigen], ["Student", "Teacher"]):
+            im = ax.imshow(mat, vmin=-vmax, vmax=vmax, cmap="RdBu_r", aspect="auto")
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            ax.set_title(f"{name} covariance in eigenbasis ({title_suffix})")
+            ax.set_xlabel("Eigenvector index")
+            ax.set_ylabel("Eigenvector index")
+
+        fig.tight_layout()
+        fname = f"eigen_{label}.png"
+        fig.savefig(out_dir / fname, dpi=100, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  saved {fname}")
+
+
+def plot_grads(data: dict, out_dir: Path):
+    grad = data.get("grad", {})
+    if not grad:
+        return
+
+    groups = sorted(grad.keys())
+    n = len(groups)
+    n_cols = min(4, n)
+    n_rows = (n + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 4, n_rows * 3),
+                             sharex=False, sharey=False)
+    axes_flat = np.array(axes).reshape(-1) if n > 1 else [axes]
+
+    for i, group in enumerate(groups):
+        ax = axes_flat[i]
+        for suffix, d in grad[group].items():
+            ax.plot(d["iter"], d["norm"], linewidth=1.5, label=suffix)
+        ax.legend(fontsize=7)
+        ax.set_title(group, fontsize=10)
+        ax.set_ylabel("Grad L2 Norm")
+        ax.set_yscale("log")
+        ax.grid(True, alpha=0.3)
+        if i >= n_cols * (n_rows - 1):
+            ax.set_xlabel("Iteration")
+
+    for i in range(n, len(axes_flat)):
+        axes_flat[i].set_visible(False)
+
+    fig.suptitle("Gradient Norms per Backbone Module", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_dir / "grad_norms.png", dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved grad_norms.png")
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python dino/plot_histories.py path/to/histories.json")
+        sys.exit(1)
+
+    json_path = Path(sys.argv[1]).resolve()
+    if not json_path.exists():
+        print(f"Error: {json_path} not found")
+        sys.exit(1)
+
+    out_dir = json_path.parent
+    print(f"Reading {json_path}")
+    print(f"Saving plots to {out_dir}/")
+
+    with open(json_path) as f:
+        data = json.load(f)
+
+    plot_loss(data, out_dir)
+    plot_stats(data, out_dir)
+    plot_cov_heatmap(data, out_dir)
+    plot_eigen(data, out_dir)
+    plot_grads(data, out_dir)
+
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()

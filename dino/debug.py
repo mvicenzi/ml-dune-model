@@ -39,8 +39,10 @@ class DINODebugger:
 
         # Histories for offline plotting
         self.stats_history = (
-            {"iter": [], "s_var": [], "t_var": [], "s_cov": [], "t_cov": [],
-             "s_norm": [], "t_norm": [], "s_pr": [], "t_pr": []}
+            {"iter": [],
+             "s_norm_min": [], "s_norm_max": [], "s_norm_median": [],
+             "t_norm_min": [], "t_norm_max": [], "t_norm_median": [],
+             "s_cov_mat": [], "t_cov_mat": []}
             if self.enabled else None
         )
         # grad_history: module_group -> {"iter": [...], "norm": [...]}
@@ -58,6 +60,9 @@ class DINODebugger:
         handler = logging.FileHandler(self.debug_dir / "training.log")
         handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
         self.logger.addHandler(handler)
+
+        # Overwrite any stale histories from a previous run immediately
+        self.save_histories()
 
     # ------------------------------------------------------------------
     # Startup / one-time methods
@@ -174,7 +179,7 @@ class DINODebugger:
         - Mean L2 feature norm: high → potential divergence
 
         Computed for both student and teacher. Runs every `debug_every` iterations.
-        Covariance is estimated on a random subsample (≤10 000 points) for efficiency.
+        Full covariance matrices (64×64) are saved to history for offline heatmap plotting.
         """
         if not self.enabled or self.logger is None:
             return
@@ -186,58 +191,37 @@ class DINODebugger:
             valid = active & (~mask)                # [B, H, W]
 
             # [N_valid, D] — use float32 for numerical stability
+            # first permute [B, D, H, W] to [B, H, W, D] 
+            # then apply valid mask [B, H, W] and flatten to [N_valid, D]
             s_flat = s_feats.detach().permute(0, 2, 3, 1)[valid].float()
             t_flat = t_feats.detach().permute(0, 2, 3, 1)[valid].float()
 
             if s_flat.shape[0] < 2:
                 return
 
-            # Subsample for covariance (avoid O(D² N) explosion on large batches)
-            max_pts = 10_000
-            if s_flat.shape[0] > max_pts:
-                idx = torch.randperm(s_flat.shape[0], device=s_flat.device)[:max_pts]
-                s_sub, t_sub = s_flat[idx], t_flat[idx]
-            else:
-                s_sub, t_sub = s_flat, t_flat
+            # make [N_valid, D] into [D, N_valid] with .T
+            s_cov_mat = torch.cov(s_flat.T)   # [D, D]
+            t_cov_mat = torch.cov(t_flat.T)
 
-            s_var_per_ch = s_sub.var(dim=0)   # [D]
-            t_var_per_ch = t_sub.var(dim=0)
-            s_var = s_var_per_ch.mean().item()
-            t_var = t_var_per_ch.mean().item()
-
-            # Participation ratio = effective number of active dimensions, bounded in [1, D]
-            s_pr = (s_var_per_ch.sum() ** 2 / (s_var_per_ch ** 2).sum()).item()
-            t_pr = (t_var_per_ch.sum() ** 2 / (t_var_per_ch ** 2).sum()).item()
-
-            D = s_sub.shape[1]
-            s_cov_mat = torch.cov(s_sub.T)   # [D, D]
-            t_cov_mat = torch.cov(t_sub.T)
-            off_diag = ~torch.eye(D, dtype=torch.bool, device=s_cov_mat.device)
-            s_cov = s_cov_mat[off_diag].abs().mean().item()
-            t_cov = t_cov_mat[off_diag].abs().mean().item()
-
-            # L2 norm on all valid points (not just subsample)
-            s_norm = s_flat.norm(dim=-1).mean().item()
-            t_norm = t_flat.norm(dim=-1).mean().item()
+            # L2 norm of the feature vector at each valid pixel [N_valid]
+            s_norms = s_flat.norm(dim=-1)
+            t_norms = t_flat.norm(dim=-1)
 
         self.logger.info(
             f"[iter {iteration:6d}] FEAT_STATS: "
-            f"s_var={s_var:.4f} t_var={t_var:.4f} "
-            f"s_pr={s_pr:.2f} t_pr={t_pr:.2f} "
-            f"s_cov={s_cov:.4f} t_cov={t_cov:.4f} "
-            f"s_norm={s_norm:.4f} t_norm={t_norm:.4f}"
+            f"s_norm={s_norms.mean():.4f} t_norm={t_norms.mean():.4f}"
         )
 
         h = self.stats_history
         h["iter"].append(iteration)
-        h["s_var"].append(s_var)
-        h["t_var"].append(t_var)
-        h["s_pr"].append(s_pr)
-        h["t_pr"].append(t_pr)
-        h["s_cov"].append(s_cov)
-        h["t_cov"].append(t_cov)
-        h["s_norm"].append(s_norm)
-        h["t_norm"].append(t_norm)
+        h["s_norm_min"].append(s_norms.min().item())
+        h["s_norm_max"].append(s_norms.max().item())
+        h["s_norm_median"].append(s_norms.median().item())
+        h["t_norm_min"].append(t_norms.min().item())
+        h["t_norm_max"].append(t_norms.max().item())
+        h["t_norm_median"].append(t_norms.median().item())
+        h["s_cov_mat"].append(s_cov_mat.cpu().tolist())
+        h["t_cov_mat"].append(t_cov_mat.cpu().tolist())
 
     def log_gradient_norms(self, iteration: int, student: torch.nn.Module):
         """
