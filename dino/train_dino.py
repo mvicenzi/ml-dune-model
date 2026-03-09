@@ -23,10 +23,39 @@ from .model import DINODuneModel
 from .debug import DINODebugger
 
 
+@torch.no_grad()
+def validate_epoch(model, val_loader, masker, loss_fn, device):
+    """
+    Compute mean DINO loss on the validation set.
+
+    Student runs in eval mode (no dropout / batchnorm stochasticity) with the
+    same random masking as during training. Teacher is always in eval mode.
+    No gradients are computed. Model is restored to train mode before returning.
+
+    Returns:
+        mean validation loss (0.0 if val_loader is empty)
+    """
+    model.eval()
+    total_loss = 0.0
+    n_batches = 0
+
+    for data, _ in val_loader:
+        data = data.to(device)
+        x_student, mask = masker(data)
+        teacher_feats = model.teacher(data)
+        student_feats = model.student(x_student)
+        loss = loss_fn(student_feats, teacher_feats, mask, data)
+        total_loss += loss.item()
+        n_batches += 1
+
+    model.train()  # restores student; teacher stays eval via DINODuneModel.train()
+    return total_loss / n_batches if n_batches > 0 else 0.0
+
+
 def main(
     backbone_name: str = "attn_default",
     epochs: int = 100,
-    batch_size: int = 16,
+    batch_size: int = 50,
     lr: float = 1e-4,
     mask_ratio: float = 0.5,
     loss_type: str = "cosine",
@@ -39,8 +68,9 @@ def main(
     save_every: int = 10,
     device: str = "cuda",
     debug: bool = False,
-    debug_every: int = 10,
+    debug_every: int = 100,
     debug_dir: str = "./dino_debug",
+    run_name: str = "",
     test_mode: bool = False,
     num_workers: int = 4,
 ):
@@ -62,15 +92,20 @@ def main(
         output_dir: Where to save checkpoints
         save_every: Save checkpoint every N epochs
         device: "cuda" or "cpu"
-        debug: Enable debugging and visualization
-        debug_every: Save debug visuals every N batches
-        debug_dir: Directory for debug outputs
+        debug: Enable debugging and history logging
+        debug_every: Log scalars / stats / grad norms every N batches
+        debug_dir: Base directory for debug outputs
+        run_name: Optional label; outputs go to debug_dir/run_name/ if set
         test_mode: Use small subset for quick smoke tests
         num_workers: Number of dataloader workers
     """
     # ============ Setup ============
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
+
+    # If a run name is given, nest outputs under debug_dir/run_name/
+    if run_name:
+        debug_dir = f"{debug_dir}/{run_name}"
 
     # Build config
     cfg = DINOConfig(
@@ -90,6 +125,7 @@ def main(
         debug=debug,
         debug_every=debug_every,
         debug_dir=debug_dir,
+        run_name=run_name,
         num_workers=num_workers,
     )
 
@@ -107,12 +143,20 @@ def main(
     )
 
     if test_mode:
-        n_subset = 1000
+        n_subset = 100000
         print(f"TEST MODE: using {n_subset} samples")
         subset_indices = torch.randperm(len(dataset))[:n_subset]
         dataset = Subset(dataset, subset_indices)
 
-    train_ds, val_ds, _, _ = train_val_split(dataset, val_fraction=0.2, use_cache=False)
+    train_ds, val_ds, train_idx, val_idx = train_val_split(dataset, val_fraction=0.2, use_cache=False)
+
+    train_set = set(train_idx.tolist())
+    val_set   = set(val_idx.tolist())
+    overlap = train_set & val_set
+    print(f"Train size: {len(train_set)}, Val size: {len(val_set)}")
+    print(f"Overlap: {len(overlap)} samples")                    # should be 0
+    print(f"Union covers full dataset: {len(train_set | val_set) == len(dataset)}")  # should be True
+
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -128,7 +172,6 @@ def main(
         pin_memory=True,
     )
 
-    print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
     epoch_len = len(train_loader)
     total_iters = epochs * epoch_len
     print(f"Total training iterations: {total_iters} (epochs={epochs}, epoch_len={epoch_len})")
@@ -198,30 +241,44 @@ def main(
                 param_group["lr"] = lr_val
                 param_group["weight_decay"] = wd_val
 
-            # Masking (for debug visualization)
-            x_student, mask_applied = masker(data)
-
             # Forward + backward
             optimizer.zero_grad()
-            loss_val, s_feats, t_feats, _ = model.forward_backward(data, masker, loss_fn)
+            loss_val, s_feats, t_feats, mask_fwd = model.forward_backward(data, masker, loss_fn)
             optimizer.step()
 
             # EMA teacher update
             model.update_teacher(mom_val)
 
-            # Logging
-            n_valid = (~mask_applied & (data != 0)).sum().item()
+            # Scalar logging
+            n_valid = (~mask_fwd & (data != 0)).sum().item()
             debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val)
 
-            # Debug visualizations
+            # Gradient norms per backbone module (.grad still populated before next zero_grad)
+            debugger.log_gradient_norms(iteration, model.student)
+
+            # Representation-quality statistics (variance, covariance, norm)
+            debugger.log_feature_stats(iteration, s_feats, t_feats, mask_fwd, data)
+
+            # First batch: log tensor shapes
             if first_batch:
-                debugger.log_shapes(data, x_student, mask_applied, s_feats, t_feats)
+                debugger.log_shapes(data, data, mask_fwd, s_feats, t_feats)
                 first_batch = False
-            debugger.maybe_save_visuals(iteration, data, x_student, mask_applied, s_feats, t_feats)
+
+            # Periodically persist histories to disk
+            debugger.maybe_save_histories(iteration)
+
+            # Explicitly free feature tensors: each is ~1.9 GB on GPU.
+            # Dropping them here lets CUDA reclaim memory before the next forward pass.
+            del s_feats, t_feats
 
             if (batch_idx + 1) % 50 == 0 or batch_idx == 0:
                 print(f"[{epoch}/{epochs}] iter {iteration}: loss={loss_val:.6f}, "
                       f"lr={lr_val:.2e}, mom={mom_val:.6f}")
+
+        # Validation
+        val_loss = validate_epoch(model, val_loader, masker, loss_fn, device)
+        print(f"[{epoch}/{epochs}] val_loss={val_loss:.6f}")
+        debugger.log_val_epoch(epoch, iteration, val_loss)
 
         # Save checkpoint
         if epoch % save_every == 0 or epoch == epochs:
@@ -235,6 +292,8 @@ def main(
             ckpt_path = output_dir / f"checkpoint_epoch{epoch}.pt"
             torch.save(ckpt, ckpt_path)
             print(f"Saved checkpoint: {ckpt_path}")
+
+    debugger.save_histories()
 
     print("\nTraining complete!")
     print(f"Checkpoints saved to: {output_dir}")

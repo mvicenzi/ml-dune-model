@@ -42,6 +42,7 @@ class DINOConfig:
     save_every: int = 10  # save checkpoint every N epochs
 
     # ============ Debug / Visualization ============
-    debug: bool = False               # enable PNG visualizations and detailed logging
-    debug_every: int = 100            # save debug info every N batches
-    debug_dir: str = "./dino_debug"   # directory for debug outputs
+    debug: bool = False               # enable detailed logging and history tracking
+    debug_every: int = 100            # log scalars / stats / grad norms every N batches
+    debug_dir: str = "./dino_debug"   # base directory for debug outputs
+    run_name: str = ""                # optional label; outputs go to debug_dir/run_name/ if set
