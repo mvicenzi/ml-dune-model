@@ -28,8 +28,11 @@ class DINOConfig:
     epochs: int = 100                # total training epochs
 
     # ============ Loss ============
-    loss_type: str = "cosine"  # "cosine" or "mse"
+    loss_type: str = "cosine"    # "cosine", "mse", or "dino"
     center_momentum: float = 0.9  # EMA decay for teacher centering
+    use_centering: bool = True    # subtract running center from teacher before loss
+    teacher_temp: float = 1.0    # teacher softmax temperature (only used for "dino")
+    student_temp: float = 1.0    # student softmax temperature (only used for "dino")
 
     # ============ Data ============
     rootdir: str = "/nfs/data/1/rrazakami/work/data_cvn/data/dune/2023_trainings/latest/dunevd"

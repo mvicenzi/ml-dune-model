@@ -18,21 +18,38 @@ class PixelDINOLoss(nn.Module):
     where the student actually computed features (unmasked active pixels), not at
     structural zeros from sparse→dense conversion.
 
-    Two loss modes:
+    Three loss modes:
     - "cosine": 1 - cosine_similarity (works well with normalized features)
-    - "mse": mean squared error (for unnormalized features)
+    - "mse":    mean squared error (for unnormalized features)
+    - "dino":   cross-entropy between softmax(teacher/tau_t) and log_softmax(student/tau_s);
+                treats the D-dim feature vector as logits, creating per-dimension competition
+                that prevents dimensional collapse
     """
 
-    def __init__(self, loss_type: str = "cosine", center_momentum: float = 0.9):
+    def __init__(
+        self,
+        loss_type: str = "cosine",
+        center_momentum: float = 0.9,
+        use_centering: bool = True,
+        teacher_temp: float = 1.0,
+        student_temp: float = 1.0,
+    ):
         """
         Args:
-            loss_type: "cosine" or "mse"
-            center_momentum: EMA decay for teacher center (default 0.9, same as DINOv2)
+            loss_type:        "cosine", "mse", or "dino"
+            center_momentum:  EMA decay for the teacher center buffer (default 0.9)
+            use_centering:    if True, subtract running center from teacher features before
+                              computing the loss; the center buffer is always updated regardless
+            teacher_temp:     softmax temperature for teacher logits (only used for "dino")
+            student_temp:     softmax temperature for student logits (only used for "dino")
         """
         super().__init__()
-        assert loss_type in ("cosine", "mse"), f"Unknown loss_type: {loss_type}"
+        assert loss_type in ("cosine", "mse", "dino"), f"Unknown loss_type: {loss_type}"
         self.loss_type = loss_type
         self.center_momentum = center_momentum
+        self.use_centering = use_centering
+        self.teacher_temp = teacher_temp
+        self.student_temp = student_temp
         # Lazily initialized on first forward call once feature dim D is known.
         # register_buffer ensures it moves with .to(device) and is saved in checkpoints.
         self.register_buffer("center", None)
@@ -71,6 +88,11 @@ class PixelDINOLoss(nn.Module):
         if student_flat.shape[0] == 0:
             return torch.tensor(0.0, device=student_feats.device, dtype=student_feats.dtype)
 
+        # For dino loss: L2-normalize to unit sphere so scale-invariant
+        if self.loss_type == "dino":
+            student_flat = F.normalize(student_flat, dim=-1)
+            teacher_flat = F.normalize(teacher_flat, dim=-1)
+
         # Lazy-initialize center on first forward call
         if self.center is None:
             self.center = torch.zeros(
@@ -79,16 +101,21 @@ class PixelDINOLoss(nn.Module):
                 dtype=teacher_flat.dtype,
             )
 
-        # Teacher centering: remove the running mean direction before loss computation
-        teacher_flat = teacher_flat - self.center
+        # Optionally subtract running mean from teacher to remove the dominant direction
+        if self.use_centering:
+            teacher_flat = teacher_flat - self.center
 
         # Compute loss
         if self.loss_type == "cosine":
-            # Cosine loss: 1 - similarity (similarity ranges [-1, 1], we want it close to 1)
             loss = 1.0 - F.cosine_similarity(student_flat, teacher_flat, dim=-1)
-        else:  # mse
-            # MSE between unnormalized features
+        elif self.loss_type == "mse":
             loss = F.mse_loss(student_flat, teacher_flat, reduction="none").mean(dim=-1)
+        else:  # dino
+            # Cross-entropy between sharpened teacher distribution and student log-probs.
+            # Both student and teacher are treated as raw logits over D dimensions.
+            t = F.softmax(teacher_flat / self.teacher_temp, dim=-1)        # [N_valid, D]
+            s = F.log_softmax(student_flat / self.student_temp, dim=-1)    # [N_valid, D]
+            loss = -(t * s).sum(dim=-1)                                    # [N_valid]
 
         return loss.mean()
 
@@ -110,6 +137,11 @@ class PixelDINOLoss(nn.Module):
 
         if teacher_flat.shape[0] == 0:
             return
+
+        # For dino loss: normalize to unit sphere before computing the center,
+        # consistent with the normalization applied in forward()
+        if self.loss_type == "dino":
+            teacher_flat = F.normalize(teacher_flat, dim=-1)
 
         # for each feature, take mean over all active pixels in the batch
         # result is [D]

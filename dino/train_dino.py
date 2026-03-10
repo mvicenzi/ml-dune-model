@@ -60,6 +60,9 @@ def main(
     mask_ratio: float = 0.5,
     loss_type: str = "cosine",
     center_momentum: float = 0.9,
+    use_centering: bool = True,
+    teacher_temp: float = 1.0,
+    student_temp: float = 1.0,
     momentum_start: float = 0.996,
     momentum_end: float = 0.9999,
     weight_decay: float = 0.04,
@@ -84,7 +87,11 @@ def main(
         batch_size: Batch size per GPU
         lr: Base learning rate
         mask_ratio: Fraction of active pixels to mask
-        loss_type: "cosine" or "mse"
+        loss_type: "cosine", "mse", or "dino"
+        center_momentum: EMA decay for the teacher center buffer
+        use_centering: subtract running center from teacher features before loss
+        teacher_temp: teacher softmax temperature (only used for "dino")
+        student_temp: student softmax temperature (only used for "dino")
         momentum_start: Initial EMA momentum
         momentum_end: Final EMA momentum
         weight_decay: L2 regularization
@@ -114,6 +121,9 @@ def main(
         mask_ratio=mask_ratio,
         loss_type=loss_type,
         center_momentum=center_momentum,
+        use_centering=use_centering,
+        teacher_temp=teacher_temp,
+        student_temp=student_temp,
         momentum_start=momentum_start,
         momentum_end=momentum_end,
         lr=lr,
@@ -184,7 +194,13 @@ def main(
     optimizer = optim.AdamW(model.student.parameters(), lr=lr, weight_decay=weight_decay)
 
     masker = SparseVoxelMasker(mask_ratio=mask_ratio)
-    loss_fn = PixelDINOLoss(loss_type=cfg.loss_type, center_momentum=cfg.center_momentum).to(device)
+    loss_fn = PixelDINOLoss(
+        loss_type=cfg.loss_type,
+        center_momentum=cfg.center_momentum,
+        use_centering=cfg.use_centering,
+        teacher_temp=cfg.teacher_temp,
+        student_temp=cfg.student_temp,
+    ).to(device)
 
     # ============ Schedulers ============
     warmup_iters = min(warmup_epochs * epoch_len, int(0.2 * total_iters))
