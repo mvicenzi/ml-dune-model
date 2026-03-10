@@ -144,6 +144,9 @@ def main(
     print(f"Device: {device}")
     print(f"Config: backbone={cfg.backbone_name}, mask_ratio={cfg.mask_ratio}, "
           f"lr={cfg.lr}, epochs={cfg.epochs}, batch_size={cfg.batch_size}")
+    print(f'Loss: type={cfg.loss_type}, center_momentum={cfg.center_momentum}, '
+          f'use_centering={cfg.use_centering}, teacher_temp={cfg.teacher_temp}, '
+          f'student_temp={cfg.student_temp}')
 
     # ============ Data ============
     print("\nLoading dataset...")
