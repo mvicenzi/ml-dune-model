@@ -72,26 +72,37 @@ def plot_stats(data: dict, out_dir: Path):
     t_pr = [pr_from_eigen(vals) for vals, _ in t_eigen]
 
     fig, axes = plt.subplots(3, 2, figsize=(14, 12))
-    violin_width = max(iters) * 0.04 if len(iters) > 1 else 1
 
-    def draw_violin(ax, dataset, color, ylabel, title):
-        parts = ax.violinplot(dataset, positions=iters, widths=violin_width,
-                              showmedians=True, showmeans=True, showextrema=True)
-        for pc in parts["bodies"]:
-            pc.set_facecolor(color)
-            pc.set_alpha(0.6)
-        for key in ("cmins", "cmaxes", "cbars"):
-            parts[key].set_color(color)
-        parts["cmedians"].set_color("black")
-        parts["cmeans"].set_color("black")
-        parts["cmeans"].set_linestyle("dashed")
-        ax.legend(
-            handles=[
-                plt.Line2D([0], [0], color="black", linestyle="-",  label="Median"),
-                plt.Line2D([0], [0], color="black", linestyle="--", label="Mean"),
-            ],
-            fontsize=8,
-        )
+    def draw_hist2d(ax, dataset, ylabel, title):
+        """2-D histogram of per-feature variance across iterations."""
+        x_arr = np.array(iters, dtype=float)
+        y_vals = np.concatenate(dataset)
+
+        # Build x-bin edges centred on each iteration snapshot
+        if len(x_arr) > 1:
+            mids = (x_arr[:-1] + x_arr[1:]) / 2.0
+            half_left  = mids[0]  - x_arr[0]
+            half_right = x_arr[-1] - mids[-1]
+            x_edges = np.concatenate([[x_arr[0] - half_left], mids, [x_arr[-1] + half_right]])
+        else:
+            x_edges = np.array([x_arr[0] - 0.5, x_arr[0] + 0.5])
+
+        y_edges = np.linspace(y_vals.min(), y_vals.max(), 51)
+
+        x_vals = np.concatenate([np.full(len(d), it) for d, it in zip(dataset, iters)])
+        H, xedges, yedges = np.histogram2d(x_vals, y_vals, bins=[x_edges, y_edges])
+
+        # Mask empty bins → white
+        H_masked = np.ma.masked_where(H.T == 0, H.T)
+        cmap = plt.cm.viridis.copy()
+        cmap.set_bad("white")
+        ax.pcolormesh(xedges, yedges, H_masked, cmap=cmap)
+
+        # Median overlay per iteration
+        medians = [np.median(d) for d in dataset]
+        ax.plot(x_arr, medians, color="red", linewidth=1.5, label="Median")
+
+        ax.legend(fontsize=8)
         ax.set_ylabel(ylabel)
         ax.set_title(title)
         ax.set_xlabel("Iteration")
@@ -114,9 +125,9 @@ def plot_stats(data: dict, out_dir: Path):
         ax.set_xlabel("Iteration")
         ax.grid(True, alpha=0.3)
 
-    # Row 1: per-feature variance violin
-    draw_violin(axes[1, 0], [np.diag(m) for m in s_mats], "C0", "Per-feature variance", "Student Variance  (low → dimensional collapse)")
-    draw_violin(axes[1, 1], [np.diag(m) for m in t_mats], "C1", "Per-feature variance", "Teacher Variance  (low → dimensional collapse)")
+    # Row 1: per-feature variance 2D histogram
+    draw_hist2d(axes[1, 0], [np.diag(m) for m in s_mats], "Per-feature variance", "Student Variance  (low → dimensional collapse)")
+    draw_hist2d(axes[1, 1], [np.diag(m) for m in t_mats], "Per-feature variance", "Teacher Variance  (low → dimensional collapse)")
 
     # Row 2: participation ratio (scalar)
     for col, (pr, label) in enumerate([(s_pr, "Student"), (t_pr, "Teacher")]):
