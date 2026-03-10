@@ -59,6 +59,7 @@ def main(
     lr: float = 1e-4,
     mask_ratio: float = 0.5,
     loss_type: str = "cosine",
+    center_momentum: float = 0.9,
     momentum_start: float = 0.996,
     momentum_end: float = 0.9999,
     weight_decay: float = 0.04,
@@ -112,6 +113,7 @@ def main(
         backbone_name=backbone_name,
         mask_ratio=mask_ratio,
         loss_type=loss_type,
+        center_momentum=center_momentum,
         momentum_start=momentum_start,
         momentum_end=momentum_end,
         lr=lr,
@@ -182,7 +184,7 @@ def main(
     optimizer = optim.AdamW(model.student.parameters(), lr=lr, weight_decay=weight_decay)
 
     masker = SparseVoxelMasker(mask_ratio=mask_ratio)
-    loss_fn = PixelDINOLoss(loss_type=loss_type).to(device)
+    loss_fn = PixelDINOLoss(loss_type=cfg.loss_type, center_momentum=cfg.center_momentum).to(device)
 
     # ============ Schedulers ============
     warmup_iters = min(warmup_epochs * epoch_len, int(0.2 * total_iters))
@@ -248,6 +250,9 @@ def main(
 
             # EMA teacher update
             model.update_teacher(mom_val)
+
+            # Centering: update teacher center for next iteration
+            loss_fn.update_center(t_feats, data)
 
             # Scalar logging
             n_valid = (~mask_fwd & (data != 0)).sum().item()

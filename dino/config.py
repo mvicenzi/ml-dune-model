@@ -29,6 +29,7 @@ class DINOConfig:
 
     # ============ Loss ============
     loss_type: str = "cosine"  # "cosine" or "mse"
+    center_momentum: float = 0.9  # EMA decay for teacher centering
 
     # ============ Data ============
     rootdir: str = "/nfs/data/1/rrazakami/work/data_cvn/data/dune/2023_trainings/latest/dunevd"

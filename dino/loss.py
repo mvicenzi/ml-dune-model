@@ -23,14 +23,19 @@ class PixelDINOLoss(nn.Module):
     - "mse": mean squared error (for unnormalized features)
     """
 
-    def __init__(self, loss_type: str = "cosine"):
+    def __init__(self, loss_type: str = "cosine", center_momentum: float = 0.9):
         """
         Args:
             loss_type: "cosine" or "mse"
+            center_momentum: EMA decay for teacher center (default 0.9, same as DINOv2)
         """
         super().__init__()
         assert loss_type in ("cosine", "mse"), f"Unknown loss_type: {loss_type}"
         self.loss_type = loss_type
+        self.center_momentum = center_momentum
+        # Lazily initialized on first forward call once feature dim D is known.
+        # register_buffer ensures it moves with .to(device) and is saved in checkpoints.
+        self.register_buffer("center", None)
 
     def forward(
         self,
@@ -66,6 +71,17 @@ class PixelDINOLoss(nn.Module):
         if student_flat.shape[0] == 0:
             return torch.tensor(0.0, device=student_feats.device, dtype=student_feats.dtype)
 
+        # Lazy-initialize center on first forward call
+        if self.center is None:
+            self.center = torch.zeros(
+                teacher_flat.shape[-1],
+                device=teacher_flat.device,
+                dtype=teacher_flat.dtype,
+            )
+
+        # Teacher centering: remove the running mean direction before loss computation
+        teacher_flat = teacher_flat - self.center
+
         # Compute loss
         if self.loss_type == "cosine":
             # Cosine loss: 1 - similarity (similarity ranges [-1, 1], we want it close to 1)
@@ -75,3 +91,31 @@ class PixelDINOLoss(nn.Module):
             loss = F.mse_loss(student_flat, teacher_flat, reduction="none").mean(dim=-1)
 
         return loss.mean()
+
+    @torch.no_grad()
+    def update_center(self, teacher_feats: Tensor, original_x: Tensor) -> None:
+        """
+        Update the running center with the EMA of teacher features at active positions.
+
+        Should be called once per training batch, AFTER the loss backward and optimizer
+        step. Must NOT be called during validation to avoid shifting the baseline with
+        eval-mode teacher outputs.
+
+        Args:
+            teacher_feats: Teacher backbone output [B, D, H, W], detached
+            original_x: Original (unmasked) image [B, 1, H, W] to identify active pixels
+        """
+        active = (original_x.squeeze(1) != 0)  # [B, H, W]
+        teacher_flat = teacher_feats.permute(0, 2, 3, 1)[active]  # [N_active, D]
+
+        if teacher_flat.shape[0] == 0:
+            return
+
+        # for each feature, take mean over all active pixels in the batch
+        # result is [D]
+        batch_mean = teacher_flat.mean(dim=0)
+
+        if self.center is None:
+            self.center = batch_mean.clone()
+        else:
+            self.center = self.center_momentum * self.center + (1.0 - self.center_momentum) * batch_mean
