@@ -143,7 +143,8 @@ def main(
 
     print(f"Device: {device}")
     print(f"Config: backbone={cfg.backbone_name}, mask_ratio={cfg.mask_ratio}, "
-          f"lr={cfg.lr}, epochs={cfg.epochs}, batch_size={cfg.batch_size}")
+          f"lr={cfg.lr}, epochs={cfg.epochs}, batch_size={cfg.batch_size}, warmup_epochs={cfg.warmup_epochs}, "
+          f" momentum_start={cfg.momentum_start}, momentum_end={cfg.momentum_end}")
     print(f'Loss: type={cfg.loss_type}, center_momentum={cfg.center_momentum}, '
           f'use_centering={cfg.use_centering}, teacher_temp={cfg.teacher_temp}, '
           f'student_temp={cfg.student_temp}')
@@ -272,6 +273,7 @@ def main(
 
             # Centering: update teacher center for next iteration
             loss_fn.update_center(t_feats, data)
+            debugger.log_center_stats(iteration, loss_fn)
 
             # Scalar logging
             n_valid = (~mask_fwd & (data != 0)).sum().item()
