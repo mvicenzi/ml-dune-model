@@ -236,6 +236,35 @@ def plot_eigen(data: dict, out_dir: Path):
         print(f"  saved {fname}")
 
 
+def plot_center_stats(data: dict, out_dir: Path):
+    h = data.get("stats", {})
+    iters       = h.get("iter", [])
+    center_norm = h.get("center_norm", [])
+    center_var  = h.get("center_var", [])
+
+    if not iters or not center_norm:
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    axes[0].plot(iters, center_norm, linewidth=1.5, color="C2")
+    axes[0].set_xlabel("Iteration")
+    axes[0].set_ylabel("L2 norm")
+    axes[0].set_title("Teacher center norm  (large → strong mean bias being corrected)")
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(iters, center_var, linewidth=1.5, color="C3")
+    axes[1].set_xlabel("Iteration")
+    axes[1].set_ylabel("Variance across dims")
+    axes[1].set_title("Teacher center variance  (low → center concentrated in few dims)")
+    axes[1].grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(out_dir / "center_stats.png", dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved center_stats.png")
+
+
 def _expand_groups(grad: dict) -> list[tuple[str, dict]]:
     """
     Return (title, params_dict) pairs for each subplot in forward-pass execution order.
@@ -327,6 +356,7 @@ def main():
 
     plot_loss(data, out_dir)
     plot_stats(data, out_dir)
+    plot_center_stats(data, out_dir)
     plot_cov_heatmap(data, out_dir)
     plot_eigen(data, out_dir)
     plot_grads(data, out_dir)

@@ -43,7 +43,8 @@ class DINODebugger:
             {"iter": [],
              "s_norm_min": [], "s_norm_max": [], "s_norm_median": [],
              "t_norm_min": [], "t_norm_max": [], "t_norm_median": [],
-             "s_cov_mat": [], "t_cov_mat": []}
+             "s_cov_mat": [], "t_cov_mat": [],
+             "center_norm": [], "center_var": []}
             if self.enabled else None
         )
         # grad_history: module_group -> {"iter": [...], "norm": [...]}
@@ -219,6 +220,34 @@ class DINODebugger:
         h["t_norm_median"].append(t_norms.median().item())
         h["s_cov_mat"].append(s_cov_mat.cpu().tolist())
         h["t_cov_mat"].append(t_cov_mat.cpu().tolist())
+
+    def log_center_stats(self, iteration: int, loss_fn) -> None:
+        """
+        Log the teacher center's L2 norm and per-dimension variance.
+
+        - norm: how large the dominant mean direction is; high values mean the
+          center captures a strong bias that centering must correct.
+        - var: spread across feature dimensions; low variance means the center
+          is concentrated in a few dimensions (a signal of collapse).
+
+        Shares the same `debug_every` cadence as log_feature_stats, so both
+        are indexed by the same `stats["iter"]` list in histories.json.
+        """
+        if not self.enabled or self.logger is None:
+            return
+        if iteration % self.debug_every != 0:
+            return
+        center = getattr(loss_fn, "center", None)
+        if center is None:
+            return
+        with torch.no_grad():
+            norm = center.norm().item()
+            var = center.var().item()
+        self.logger.info(
+            f"[iter {iteration:6d}] CENTER: norm={norm:.4f} var={var:.6f}"
+        )
+        self.stats_history["center_norm"].append(norm)
+        self.stats_history["center_var"].append(var)
 
     def log_gradient_norms(self, iteration: int, student: torch.nn.Module):
         """
