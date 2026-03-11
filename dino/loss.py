@@ -79,45 +79,54 @@ class PixelDINOLoss(nn.Module):
         # Valid positions: active AND not masked (where student computed real features)
         valid = active & (~mask)  # [B, H, W]
 
-        # Reshape features to [B*H*W, D] and select valid positions
-        # Permute to [B, H, W, D] then gather at valid mask positions
-        student_flat = student_feats.permute(0, 2, 3, 1)[valid]  # [N_valid, D]
-        teacher_flat = teacher_feats.permute(0, 2, 3, 1)[valid].detach()
+        counts = valid.sum(dim=(1, 2)).float()  # [B] valid pixels per image
 
         # Handle empty case
-        if student_flat.shape[0] == 0:
+        if counts.sum() == 0:
             return torch.tensor(0.0, device=student_feats.device, dtype=student_feats.dtype)
+
+        # Flatten to valid pixels only — keeps heavy ops (normalize, softmax) efficient
+        # for sparse images where N_valid << B*H*W
+        s = student_feats.permute(0, 2, 3, 1)[valid]           # [N_valid, D]
+        t = teacher_feats.permute(0, 2, 3, 1)[valid]           # [N_valid, D]
 
         # For dino loss: L2-normalize to unit sphere so scale-invariant
         if self.loss_type == "dino":
-            student_flat = F.normalize(student_flat, dim=-1)
-            teacher_flat = F.normalize(teacher_flat, dim=-1)
+            s = F.normalize(s, dim=-1)
+            t = F.normalize(t, dim=-1)
 
         # Lazy-initialize center on first forward call
         if self.center is None:
             self.center = torch.zeros(
-                teacher_flat.shape[-1],
-                device=teacher_flat.device,
-                dtype=teacher_flat.dtype,
+                t.shape[-1],
+                device=t.device,
+                dtype=t.dtype,
             )
 
         # Optionally subtract running mean from teacher to remove the dominant direction
         if self.use_centering:
-            teacher_flat = teacher_flat - self.center
+            t = t - self.center
 
-        # Compute loss
+        # Compute per-pixel loss [N_valid]
         if self.loss_type == "cosine":
-            loss = 1.0 - F.cosine_similarity(student_flat, teacher_flat, dim=-1)
+            loss = 1.0 - F.cosine_similarity(s, t, dim=-1)
         elif self.loss_type == "mse":
-            loss = F.mse_loss(student_flat, teacher_flat, reduction="none").mean(dim=-1)
+            loss = F.mse_loss(s, t, reduction="none").mean(dim=-1)
         else:  # dino
             # Cross-entropy between sharpened teacher distribution and student log-probs.
             # Both student and teacher are treated as raw logits over D dimensions.
-            t = F.softmax(teacher_flat / self.teacher_temp, dim=-1)        # [N_valid, D]
-            s = F.log_softmax(student_flat / self.student_temp, dim=-1)    # [N_valid, D]
-            loss = -(t * s).sum(dim=-1)                                    # [N_valid]
+            t_prob = F.softmax(t / self.teacher_temp, dim=-1)      # [N_valid, D]
+            s_logp = F.log_softmax(s / self.student_temp, dim=-1)  # [N_valid, D]
+            loss = -(t_prob * s_logp).sum(dim=-1)                  # [N_valid]
 
-        return loss.mean()
+        # Two-stage reduction: sum per image via scatter, divide by count, then mean.
+        # Mirrors DINOv2: sum(loss * mask) / mask.sum() per image, then .mean()
+        B = student_feats.shape[0]
+        batch_idx = torch.where(valid)[0]  # [N_valid] — image index for each valid pixel
+        per_image_loss = torch.zeros(B, device=loss.device, dtype=loss.dtype)
+        per_image_loss.scatter_add_(0, batch_idx, loss)
+        per_image_loss = per_image_loss / counts.clamp(min=1.0)
+        return per_image_loss[counts > 0].mean()
 
     @torch.no_grad()
     def update_center(self, teacher_feats: Tensor, original_x: Tensor) -> None:
