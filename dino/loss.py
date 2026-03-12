@@ -90,11 +90,6 @@ class PixelDINOLoss(nn.Module):
         s = student_feats.permute(0, 2, 3, 1)[valid]           # [N_valid, D]
         t = teacher_feats.permute(0, 2, 3, 1)[valid]           # [N_valid, D]
 
-        # For dino loss: L2-normalize to unit sphere so scale-invariant
-        if self.loss_type == "dino":
-            s = F.normalize(s, dim=-1)
-            t = F.normalize(t, dim=-1)
-
         # Lazy-initialize center on first forward call
         if self.center is None:
             self.center = torch.zeros(
@@ -106,6 +101,11 @@ class PixelDINOLoss(nn.Module):
         # Optionally subtract running mean from teacher to remove the dominant direction
         if self.use_centering:
             t = t - self.center
+
+        # For dino loss: L2-normalize to unit sphere so scale-invariant
+        if self.loss_type == "dino":
+            s = F.normalize(s, dim=-1)
+            t = F.normalize(t, dim=-1)
 
         # Compute per-pixel loss [N_valid]
         if self.loss_type == "cosine":
@@ -146,11 +146,6 @@ class PixelDINOLoss(nn.Module):
 
         if teacher_flat.shape[0] == 0:
             return
-
-        # For dino loss: normalize to unit sphere before computing the center,
-        # consistent with the normalization applied in forward()
-        if self.loss_type == "dino":
-            teacher_flat = F.normalize(teacher_flat, dim=-1)
 
         # for each feature, take mean over all active pixels in the batch
         # result is [D]
