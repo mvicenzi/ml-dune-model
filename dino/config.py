@@ -27,6 +27,13 @@ class DINOConfig:
     warmup_epochs: int = 5           # linear LR warmup duration
     epochs: int = 100                # total training epochs
 
+    # ============ Projection head ============
+    use_proj_head: bool = False       # if True, attach a DINOHead after the backbone
+    proj_hidden_dim: int = 256        # hidden layer width inside the head MLP
+    proj_bottleneck_dim: int = 128    # MLP output dim before the weight-norm projection
+    proj_out_dim: int = 256           # prototype dimension output by the head (>> feature_dim)
+    proj_nlayers: int = 2             # number of Linear→GELU blocks in the head MLP
+
     # ============ Loss ============
     loss_type: str = "cosine"    # "cosine", "mse", or "dino"
     center_momentum: float = 0.9  # EMA decay for teacher centering

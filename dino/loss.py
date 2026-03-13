@@ -33,15 +33,20 @@ class PixelDINOLoss(nn.Module):
         use_centering: bool = True,
         teacher_temp: float = 1.0,
         student_temp: float = 1.0,
+        normalize_features: bool = True,
     ):
         """
         Args:
-            loss_type:        "cosine", "mse", or "dino"
-            center_momentum:  EMA decay for the teacher center buffer (default 0.9)
-            use_centering:    if True, subtract running center from teacher features before
-                              computing the loss; the center buffer is always updated regardless
-            teacher_temp:     softmax temperature for teacher logits (only used for "dino")
-            student_temp:     softmax temperature for student logits (only used for "dino")
+            loss_type:           "cosine", "mse", or "dino"
+            center_momentum:     EMA decay for the teacher center buffer (default 0.9)
+            use_centering:       if True, subtract running center from teacher features before
+                                 computing the loss; the center buffer is always updated regardless
+            teacher_temp:        softmax temperature for teacher logits (only used for "dino")
+            student_temp:        softmax temperature for student logits (only used for "dino")
+            normalize_features:  if True (default), L2-normalize features before the dino loss.
+                                 Should be set to False when using a projection head, whose
+                                 weight-norm last layer already produces cosine-similarity-scaled
+                                 outputs; re-normalizing those would destroy the prototype structure.
         """
         super().__init__()
         assert loss_type in ("cosine", "mse", "dino"), f"Unknown loss_type: {loss_type}"
@@ -50,6 +55,7 @@ class PixelDINOLoss(nn.Module):
         self.use_centering = use_centering
         self.teacher_temp = teacher_temp
         self.student_temp = student_temp
+        self.normalize_features = normalize_features
         # Lazily initialized on first forward call once feature dim D is known.
         # register_buffer ensures it moves with .to(device) and is saved in checkpoints.
         self.register_buffer("center", None)
@@ -102,8 +108,11 @@ class PixelDINOLoss(nn.Module):
         if self.use_centering:
             t = t - self.center
 
-        # For dino loss: L2-normalize to unit sphere so scale-invariant
-        if self.loss_type == "dino":
+        # For dino loss without a projection head: L2-normalize raw backbone features
+        # to make them scale-invariant before treating them as logits.
+        # Skip when using a projection head — the head's weight-norm layer already
+        # produces cosine-similarity-scaled outputs; re-normalizing would distort them.
+        if self.loss_type == "dino" and self.normalize_features:
             s = F.normalize(s, dim=-1)
             t = F.normalize(t, dim=-1)
 

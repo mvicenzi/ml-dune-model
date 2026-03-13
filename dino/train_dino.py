@@ -42,8 +42,8 @@ def validate_epoch(model, val_loader, masker, loss_fn, device):
     for data, _ in val_loader:
         data = data.to(device)
         x_student, mask = masker(data)
-        teacher_feats = model.teacher(data)
-        student_feats = model.student(x_student)
+        teacher_feats = model.encode_teacher(data)
+        student_feats = model.encode_student(x_student)
         loss = loss_fn(student_feats, teacher_feats, mask, data)
         total_loss += loss.item()
         n_batches += 1
@@ -77,6 +77,11 @@ def main(
     run_name: str = "",
     test_mode: bool = False,
     num_workers: int = 4,
+    use_proj_head: bool = False,
+    proj_hidden_dim: int = 256,
+    proj_bottleneck_dim: int = 128,
+    proj_out_dim: int = 256,
+    proj_nlayers: int = 2,
 ):
     """
     DINO training loop for DUNE detector.
@@ -139,6 +144,11 @@ def main(
         debug_dir=debug_dir,
         run_name=run_name,
         num_workers=num_workers,
+        use_proj_head=use_proj_head,
+        proj_hidden_dim=proj_hidden_dim,
+        proj_bottleneck_dim=proj_bottleneck_dim,
+        proj_out_dim=proj_out_dim,
+        proj_nlayers=proj_nlayers,
     )
 
     print(f"Device: {device}")
@@ -194,8 +204,19 @@ def main(
 
     # ============ Model, optimizer, loss ============
     print("\nBuilding model...")
-    model = DINODuneModel(backbone_name=backbone_name).to(device)
-    optimizer = optim.AdamW(model.student.parameters(), lr=lr, weight_decay=weight_decay)
+    model = DINODuneModel(
+        backbone_name=backbone_name,
+        use_proj_head=cfg.use_proj_head,
+        proj_in_dim=cfg.feature_dim,
+        proj_out_dim=cfg.proj_out_dim,
+        proj_hidden_dim=cfg.proj_hidden_dim,
+        proj_bottleneck_dim=cfg.proj_bottleneck_dim,
+        proj_nlayers=cfg.proj_nlayers,
+    ).to(device)
+    student_params = list(model.student.parameters())
+    if model.student_head is not None:
+        student_params += list(model.student_head.parameters())
+    optimizer = optim.AdamW(student_params, lr=lr, weight_decay=weight_decay)
 
     masker = SparseVoxelMasker(mask_ratio=mask_ratio)
     loss_fn = PixelDINOLoss(
@@ -204,6 +225,7 @@ def main(
         use_centering=cfg.use_centering,
         teacher_temp=cfg.teacher_temp,
         student_temp=cfg.student_temp,
+        normalize_features=not cfg.use_proj_head,
     ).to(device)
 
     # ============ Schedulers ============
@@ -312,6 +334,8 @@ def main(
                 "epoch": epoch,
                 "student": model.student.state_dict(),
                 "teacher": model.teacher.state_dict(),
+                "student_head": model.student_head.state_dict() if model.student_head is not None else None,
+                "teacher_head": model.teacher_head.state_dict() if model.teacher_head is not None else None,
                 "optimizer": optimizer.state_dict(),
                 "cfg": cfg,
             }
