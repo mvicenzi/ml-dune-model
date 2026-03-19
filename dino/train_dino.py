@@ -47,7 +47,7 @@ def validate_epoch(model, val_loader, masker, loss_fn, device):
         x_student, mask = masker(data)
         teacher_feats = model.teacher(data)
         student_feats = model.student(x_student)
-        loss = loss_fn(student_feats, teacher_feats, mask, data)
+        loss, _, _ = loss_fn(student_feats, teacher_feats, mask, data)
         total_loss += loss.item()
         n_batches += 1
 
@@ -269,7 +269,7 @@ def main(
 
             # Forward + backward
             optimizer.zero_grad()
-            loss_val, s_feats, t_feats, mask_fwd = model.forward_backward(data, masker, loss_fn)
+            loss_val, teacher_entropy, kl, s_feats, t_feats, mask_fwd = model.forward_backward(data, masker, loss_fn)
             optimizer.step()
 
             # EMA teacher update
@@ -281,7 +281,7 @@ def main(
 
             # Scalar logging
             n_valid = (~mask_fwd & (data != 0)).sum().item()
-            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val)
+            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, kl)
 
             # Gradient norms per backbone module (.grad still populated before next zero_grad)
             debugger.log_gradient_norms(iteration, model.student)

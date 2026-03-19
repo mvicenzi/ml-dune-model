@@ -83,7 +83,7 @@ class PixelDINOLoss(nn.Module):
 
         # Handle empty case
         if counts.sum() == 0:
-            return torch.tensor(0.0, device=student_feats.device, dtype=student_feats.dtype)
+            return torch.tensor(0.0, device=student_feats.device, dtype=student_feats.dtype), None, None
 
         # Flatten to valid pixels only — keeps heavy ops (normalize, softmax) efficient
         # for sparse images where N_valid << B*H*W
@@ -107,17 +107,27 @@ class PixelDINOLoss(nn.Module):
             s = F.normalize(s, dim=-1)
             t = F.normalize(t, dim=-1)
 
+        # teacher_entropy_px and kl_px are only set in the dino branch;
+        # initialize to None so they have a defined value for the other loss types.
+        teacher_entropy_px = None
+        kl_px = None
+
         # Compute per-pixel loss [N_valid]
         if self.loss_type == "cosine":
             loss = 1.0 - F.cosine_similarity(s, t, dim=-1)
         elif self.loss_type == "mse":
             loss = F.mse_loss(s, t, reduction="none").mean(dim=-1)
         else:  # dino
-            # Cross-entropy between sharpened teacher distribution and student log-probs.
+            # Cross-entropy H(P_t, P_s) = H(P_t) + KL(P_t || P_s).
             # Both student and teacher are treated as raw logits over D dimensions.
             t_prob = F.softmax(t / self.teacher_temp, dim=-1)      # [N_valid, D]
             s_logp = F.log_softmax(s / self.student_temp, dim=-1)  # [N_valid, D]
-            loss = -(t_prob * s_logp).sum(dim=-1)                  # [N_valid]
+            t_logp = F.log_softmax(t / self.teacher_temp, dim=-1)  # [N_valid, D]
+            loss = -(t_prob * s_logp).sum(dim=-1)                  # H(P_t, P_s) [N_valid]
+
+            # decompose loss into teacher entropy and KL divergence for diagnostics:
+            teacher_entropy_px = -(t_prob * t_logp).sum(dim=-1)    # H(P_t)      [N_valid]
+            kl_px = loss - teacher_entropy_px                      # KL(P_t|P_s)[N_valid]
 
         # Two-stage reduction: sum per image via scatter, divide by count, then mean.
         # Mirrors DINOv2: sum(loss * mask) / mask.sum() per image, then .mean()
@@ -126,7 +136,21 @@ class PixelDINOLoss(nn.Module):
         per_image_loss = torch.zeros(B, device=loss.device, dtype=loss.dtype)
         per_image_loss.scatter_add_(0, batch_idx, loss)
         per_image_loss = per_image_loss / counts.clamp(min=1.0)
-        return per_image_loss[counts > 0].mean()
+        scalar_loss = per_image_loss[counts > 0].mean()
+
+        if teacher_entropy_px is not None:
+            per_image_t_ent = torch.zeros(B, device=loss.device, dtype=loss.dtype)
+            per_image_t_ent.scatter_add_(0, batch_idx, teacher_entropy_px)
+            t_ent = (per_image_t_ent / counts.clamp(min=1.0))[counts > 0].mean().item()
+
+            per_image_kl = torch.zeros(B, device=loss.device, dtype=loss.dtype)
+            per_image_kl.scatter_add_(0, batch_idx, kl_px)
+            kl = (per_image_kl / counts.clamp(min=1.0))[counts > 0].mean().item()
+        else:
+            t_ent = None
+            kl = None
+
+        return scalar_loss, t_ent, kl
 
     @torch.no_grad()
     def update_center(self, teacher_feats: Tensor, original_x: Tensor) -> None:

@@ -87,7 +87,7 @@ class DINODuneModel(nn.Module):
         student_feats = self.student(x_student)  # [B, D, H, W]
 
         # Compute loss and backprop
-        loss = loss_fn(student_feats, teacher_feats, mask, x)
+        loss, teacher_entropy, kl = loss_fn(student_feats, teacher_feats, mask, x)
         loss.backward()
 
-        return loss.item(), student_feats.detach(), teacher_feats.detach(), mask
+        return loss.item(), teacher_entropy, kl, student_feats.detach(), teacher_feats.detach(), mask
