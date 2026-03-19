@@ -111,9 +111,10 @@ def main(
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
 
-    # If a run name is given, nest outputs under debug_dir/run_name/
+    # If a run name is given, nest outputs under debug_dir/run_name/ and output_dir/run_name/
     if run_name:
         debug_dir = f"{debug_dir}/{run_name}"
+        output_dir = f"{output_dir}/{run_name}"
 
     # Build config
     cfg = DINOConfig(
