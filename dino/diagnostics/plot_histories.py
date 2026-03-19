@@ -37,19 +37,51 @@ def plot_loss(data: dict, out_dir: Path):
         return
     val = data.get("val", {})
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(loss, linewidth=1.0, alpha=0.8, label="Train (per batch)")
+    # Extract non-null teacher entropy and KL values along with their iteration indices.
+    # Values are null (None after JSON load) for non-dino loss types.
+    raw_t_ent = data.get("teacher_entropy", [])
+    raw_kl    = data.get("kl", [])
+    t_ent_iters = [i for i, v in enumerate(raw_t_ent) if v is not None]
+    t_ent_vals  = [raw_t_ent[i] for i in t_ent_iters]
+    kl_iters    = [i for i, v in enumerate(raw_kl) if v is not None]
+    kl_vals     = [raw_kl[i] for i in kl_iters]
+    has_components = bool(t_ent_vals and kl_vals)
+
+    if has_components:
+        fig, axes = plt.subplots(2, 1, figsize=(10, 9), sharex=False)
+        ax_loss, ax_comp = axes
+    else:
+        fig, ax_loss = plt.subplots(figsize=(10, 5))
+
+    ax_loss.plot(loss, linewidth=1.0, alpha=0.8, label="Train (per batch)")
     if val and val.get("iter"):
-        ax.plot(
+        ax_loss.plot(
             val["iter"], val["loss"],
             "o-", linewidth=2.0, markersize=5, label="Val (per epoch)",
         )
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Loss")
-    ax.set_title("Training and Validation Loss")
-    ax.set_yscale("log")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax_loss.set_xlabel("Iteration")
+    ax_loss.set_ylabel("Loss")
+    ax_loss.set_title("Training and Validation Loss")
+    #ax_loss.set_yscale("log")
+    ax_loss.legend()
+    ax_loss.grid(True, alpha=0.3)
+
+    if has_components:
+        K = 64  # feature dimension (number of softmax categories)
+        h_max = np.log(K)  # -log(1/K) = log(K): entropy of a uniform distribution over K dims
+        ax_comp.plot(t_ent_iters, t_ent_vals, linewidth=1.0, alpha=0.8,
+                     color="C2", label="Teacher entropy  H(P_t)")
+        ax_comp.plot(kl_iters, kl_vals, linewidth=1.0, alpha=0.8,
+                     color="C3", label="KL divergence  KL(P_t|P_s)")
+        ax_comp.axhline(h_max, color="C2", linewidth=1.2, linestyle="--", alpha=0.7,
+                        label=f"H_max = log({K})")
+        ax_comp.set_xlabel("Iteration")
+        ax_comp.set_ylabel("Nats")
+        ax_comp.set_title("Loss decomposition: H(P_t, P_s) = H(P_t) + KL(P_t|P_s)")
+        #ax_comp.set_yscale("log")
+        ax_comp.legend()
+        ax_comp.grid(True, alpha=0.3)
+
     fig.tight_layout()
     fig.savefig(out_dir / "loss_curve.png", dpi=100, bbox_inches="tight")
     plt.close(fig)
