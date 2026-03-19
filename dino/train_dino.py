@@ -7,6 +7,9 @@ Usage:
 """
 
 import fire
+import inspect
+import json
+import sys
 import torch
 import torch.optim as optim
 from pathlib import Path
@@ -326,5 +329,61 @@ def main(
     print(f"Checkpoints saved to: {output_dir}")
 
 
+def from_config(
+    config_path: str,
+    run_name: str = "",
+    device: str = "cuda",
+    test_mode: bool = False,
+):
+    """
+    Start training from a saved run_config.json file.
+
+    Loads training parameters from a previously saved run_config.json (e.g. from
+    ./dino_debug/<run_name>/run_config.json).  Any JSON field that does not match
+    a parameter of main() is silently ignored, so old configs with stale or missing
+    keys work without errors — missing fields fall back to main()'s defaults.
+
+    The `run_name`, `device`, and `test_mode` arguments override the corresponding
+    values from the config file.  Providing a new run_name is recommended when
+    re-running a config so outputs don't overwrite the original run.
+
+    Args:
+        config_path: Path to the run_config.json file
+        run_name: Override run name (determines output sub-directories)
+        device: Override device ("cuda" or "cpu")
+        test_mode: Override test_mode flag
+    """
+    with open(config_path) as f:
+        raw = json.load(f)
+
+    # Discover which parameters main() accepts (names + defaults)
+    sig = inspect.signature(main)
+    valid_params = set(sig.parameters)
+
+    # Build kwargs: only keep JSON keys that main() understands
+    kwargs = {k: v for k, v in raw.items() if k in valid_params}
+
+    # The JSON stores debug_dir as the fully-nested path (debug_dir/run_name).
+    # main() will re-append run_name, so we strip the suffix here to avoid
+    # double-nesting.  We use the original run_name from the JSON for this,
+    # before any CLI override is applied.
+    orig_run_name = kwargs.get("run_name", "")
+    stored_debug_dir = kwargs.get("debug_dir", "")
+    if orig_run_name and stored_debug_dir.endswith("/" + orig_run_name):
+        kwargs["debug_dir"] = stored_debug_dir[: -len("/" + orig_run_name)]
+
+    # CLI-level overrides always win
+    if run_name:
+        kwargs["run_name"] = run_name
+    kwargs["device"] = device
+    kwargs["test_mode"] = test_mode
+
+    main(**kwargs)
+
+
 if __name__ == "__main__":
-    fire.Fire(main)
+    if len(sys.argv) > 1 and sys.argv[1] == "from_config":
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+        fire.Fire(from_config)
+    else:
+        fire.Fire(main)
