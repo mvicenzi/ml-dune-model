@@ -204,8 +204,8 @@ def plot_dominant_heatmaps(
                     fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
                     ax.set_title(f"{name}  |  image {img_idx}  label={label}  λ={ev:.3g}")
                     ax.invert_yaxis()
-                    ax.set_aspect("equal")
-                    ax.axis("off")
+                    #ax.set_aspect("equal")
+                    ax.axis("on")
 
                 fig.suptitle(
                     f"Eigenvector dim {dim + 1}  [{tag}]",
