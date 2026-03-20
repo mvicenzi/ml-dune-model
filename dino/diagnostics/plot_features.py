@@ -1,16 +1,20 @@
 """
 Analyse feature covariance structure from a saved extract_features .npz file.
 
-Produces two figures saved alongside the input file:
+Produces three figures saved alongside the input file:
 
-  features_cov_corr.png  —  covariance and correlation matrices for student
-                             and teacher (2 × 2 grid)
-  features_eigen.png     —  eigenvalue spectrum and covariance in eigenbasis
-                             for student and teacher (2 × 2 grid)
+  features_cov_corr.png       —  covariance and correlation matrices for student
+                                  and teacher (2 × 2 grid)
+  features_eigen.png          —  eigenvalue spectrum and covariance in eigenbasis
+                                  for student and teacher (2 × 2 grid)
+  features_dominant_heatmap_dim1.png  — spatial projection of the 1st dominant
+  features_dominant_heatmap_dim2.png    eigenvector (one file per dimension)
+  ...                                   for a handful of sample images (student vs teacher)
 
 Usage:
     python -m dino.diagnostics.plot_features path/to/features_ep10.npz
     python -m dino.diagnostics.plot_features path/to/features_ep10.npz --out_dir=./plots
+    python -m dino.diagnostics.plot_features path/to/features_ep10.npz --n_samples=8 --n_dominant=3
 """
 
 import sys
@@ -19,6 +23,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 
 
@@ -132,6 +137,88 @@ def plot_eigen(s_cov: np.ndarray, t_cov: np.ndarray, out_dir: Path, tag: str):
 
 
 # ---------------------------------------------------------------------------
+# Plot 3: dominant eigenvector projected spatially onto sample images
+# ---------------------------------------------------------------------------
+
+def plot_dominant_heatmaps(
+    s_feats: np.ndarray,
+    t_feats: np.ndarray,
+    positions: np.ndarray,
+    offsets: np.ndarray,
+    labels: np.ndarray,
+    s_cov: np.ndarray,
+    t_cov: np.ndarray,
+    out_dir: Path,
+    tag: str,
+    n_samples: int = 5,
+    n_dominant: int = 1,
+):
+    """Project the top-N dominant covariance eigenvectors onto sample images.
+
+    One figure is saved per eigenvector dimension (dim1 = most dominant).
+    """
+    # eigh returns ascending order → reverse to get dominant-first
+    s_vals, s_vecs = _eigh(s_cov)
+    t_vals, t_vecs = _eigh(t_cov)
+
+    n_images = len(offsets) - 1
+    n_samples = min(n_samples, n_images)
+    n_dominant = min(n_dominant, s_cov.shape[0])
+    sample_indices = np.linspace(0, n_images - 1, n_samples, dtype=int)
+
+    for dim in range(n_dominant):
+        # dim=0 → largest eigenvalue (index -1), dim=1 → second largest, …
+        s_vec = s_vecs[:, -(dim + 1)]   # [D]
+        t_vec = t_vecs[:, -(dim + 1)]
+        s_ev  = s_vals[-(dim + 1)]
+        t_ev  = t_vals[-(dim + 1)]
+
+        fname = f"features_dominant_heatmap_dim{dim + 1}.pdf"
+        with PdfPages(out_dir / fname) as pdf:
+            for img_idx in sample_indices:
+                sl  = slice(offsets[img_idx], offsets[img_idx + 1])
+                s_f = s_feats[sl]    # [n_pix, D]
+                t_f = t_feats[sl]
+                pos = positions[sl]  # [n_pix, 2]  (row, col)
+
+                # Projection onto this eigenvector
+                s_proj = s_f @ s_vec   # [n_pix]
+                t_proj = t_f @ t_vec
+
+                prows, cols = pos[:, 0], pos[:, 1]
+                label = int(labels[img_idx])
+
+                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+                for ax, proj, name, ev in zip(
+                    axes, [s_proj, t_proj], ["Student", "Teacher"], [s_ev, t_ev]
+                ):
+                    #vmax = float(np.abs(proj).max())
+                    sc = ax.scatter(
+                        cols, prows, c=proj, cmap="RdBu_r",
+                        #vmin=-vmax, vmax=vmax,
+                        s=1, linewidths=0,
+                    )
+                    #binary = (proj > 0).astype(float)
+                    #sc = ax.scatter(cols, prows, c=binary, cmap="viridis", vmin=0, vmax=1, s=1)
+
+                    fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+                    ax.set_title(f"{name}  |  image {img_idx}  label={label}  λ={ev:.3g}")
+                    ax.invert_yaxis()
+                    ax.set_aspect("equal")
+                    ax.axis("off")
+
+                fig.suptitle(
+                    f"Eigenvector dim {dim + 1}  [{tag}]",
+                    fontsize=13,
+                )
+                fig.tight_layout()
+                pdf.savefig(fig, dpi=200, bbox_inches="tight")
+                plt.close(fig)
+
+        print(f"  saved {fname}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -145,6 +232,14 @@ def main():
         "--out_dir", default="",
         help="Output directory for plots (default: same directory as the .npz file)",
     )
+    parser.add_argument(
+        "--n_samples", type=int, default=5,
+        help="Number of sample images for the dominant-eigenvector heatmap (default: 5)",
+    )
+    parser.add_argument(
+        "--n_dominant", type=int, default=1,
+        help="Number of dominant eigenvectors to plot, one figure each (default: 1)",
+    )
     args = parser.parse_args()
 
     npz_path = Path(args.npz_path).resolve()
@@ -157,9 +252,9 @@ def main():
 
     print(f"Loading {npz_path}")
     data = np.load(npz_path)
-    s_feats = data["student_features"]   # [N, D]
-    t_feats = data["teacher_features"]   # [N, D]
-    print(f"  Pixels: {s_feats.shape[0]}   Feature dim: {s_feats.shape[1]}")
+    s_feats = data["student_features"]   # [N_valid, D]
+    t_feats = data["teacher_features"]   # [N_valid, D]
+    print(f"  Valid pixels: {s_feats.shape[0]}   Feature dim: {s_feats.shape[1]}")
 
     tag = npz_path.stem   # e.g. "features_ep10"
 
@@ -170,6 +265,19 @@ def main():
     print(f"Saving plots to {out_dir}/")
     plot_cov_and_corr(s_cov, t_cov, out_dir, tag)
     plot_eigen(s_cov, t_cov, out_dir, tag)
+
+    if "positions" in data and "offsets" in data and "labels" in data:
+        positions = data["positions"]   # [N_valid, 2]
+        offsets   = data["offsets"]     # [N_images+1]
+        labels    = data["labels"]      # [N_images]
+        print(f"  Images: {len(labels)}")
+        plot_dominant_heatmaps(
+            s_feats, t_feats, positions, offsets, labels,
+            s_cov, t_cov, out_dir, tag,
+            n_samples=args.n_samples, n_dominant=args.n_dominant,
+        )
+    else:
+        print("  Skipping dominant heatmap: npz missing positions/offsets/labels arrays.")
 
     print("Done.")
 
