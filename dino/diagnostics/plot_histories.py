@@ -47,12 +47,18 @@ def plot_loss(data: dict, out_dir: Path):
     kl_vals     = [raw_kl[i] for i in kl_iters]
     has_components = bool(t_ent_vals and kl_vals)
 
-    if has_components:
-        fig, axes = plt.subplots(2, 1, figsize=(10, 9), sharex=False)
-        ax_loss, ax_comp = axes
-    else:
-        fig, ax_loss = plt.subplots(figsize=(10, 5))
+    # Extract non-null covariance penalty values.
+    raw_cov = data.get("cov_penalty", [])
+    cov_iters = [i for i, v in enumerate(raw_cov) if v is not None]
+    cov_vals  = [raw_cov[i] for i in cov_iters]
+    has_cov = bool(cov_vals)
 
+    n_rows = 1 + int(has_components) + int(has_cov)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(10, 4 + 4 * (n_rows - 1)), sharex=False)
+    if n_rows == 1:
+        axes = [axes]
+
+    ax_loss = axes[0]
     ax_loss.plot(loss, linewidth=1.0, alpha=0.8, label="Train (per batch)")
     if val and val.get("iter"):
         ax_loss.plot(
@@ -66,7 +72,10 @@ def plot_loss(data: dict, out_dir: Path):
     ax_loss.legend()
     ax_loss.grid(True, alpha=0.3)
 
+    next_row = 1
     if has_components:
+        ax_comp = axes[next_row]
+        next_row += 1
         K = 64  # feature dimension (number of softmax categories)
         h_max = np.log(K)  # -log(1/K) = log(K): entropy of a uniform distribution over K dims
         ax_comp.plot(t_ent_iters, t_ent_vals, linewidth=1.0, alpha=0.8,
@@ -81,6 +90,16 @@ def plot_loss(data: dict, out_dir: Path):
         #ax_comp.set_yscale("log")
         ax_comp.legend()
         ax_comp.grid(True, alpha=0.3)
+
+    if has_cov:
+        ax_cov = axes[next_row]
+        ax_cov.plot(cov_iters, cov_vals, linewidth=1.0, alpha=0.8,
+                    color="C4", label="Covariance penalty (raw, unweighted)")
+        ax_cov.set_xlabel("Iteration")
+        ax_cov.set_ylabel("Penalty")
+        ax_cov.set_title("VICReg covariance decorrelation penalty  (low → less dimensional correlation)")
+        ax_cov.legend()
+        ax_cov.grid(True, alpha=0.3)
 
     fig.tight_layout()
     fig.savefig(out_dir / "loss_curve.png", dpi=100, bbox_inches="tight")

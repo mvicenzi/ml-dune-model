@@ -28,6 +28,7 @@ class DINODebugger:
     - loss:            [float, ...]                      per-batch train loss
     - teacher_entropy: [float|null, ...]                 per-batch H(P_t)       (dino only, else null)
     - kl:              [float|null, ...]                 per-batch KL(P_t||P_s) (dino only, else null)
+    - cov_penalty:     [float|null, ...]                 per-batch raw covariance penalty (if enabled, else null)
     - val:    {iter: [...], loss: [...]}         per-epoch val loss
     - stats:  {iter: [...], s_var: [...], ...}  feature statistics
     - grad:   {module: {iter: [...], norm: [...]}, ...}
@@ -41,6 +42,7 @@ class DINODebugger:
         self.loss_history = [] if self.enabled else None
         self.teacher_entropy_history = [] if self.enabled else None
         self.kl_history = [] if self.enabled else None
+        self.cov_penalty_history = [] if self.enabled else None
 
         # Histories for offline plotting
         self.stats_history = (
@@ -117,6 +119,7 @@ class DINODebugger:
         momentum: float,
         teacher_entropy: float | None = None,
         kl: float | None = None,
+        cov_penalty: float | None = None,
     ):
         """Log per-batch scalar information (every batch)."""
         if not self.enabled or self.logger is None:
@@ -124,6 +127,8 @@ class DINODebugger:
         extra = ""
         if teacher_entropy is not None and kl is not None:
             extra = f" teacher_entropy={teacher_entropy:.6f} kl={kl:.6f}"
+        if cov_penalty is not None:
+            extra += f" cov_penalty={cov_penalty:.6f}"
         self.logger.info(
             f"[epoch {epoch:3d} batch {batch_idx:4d} iter {iteration:6d}] "
             f"loss={loss:.6f} n_valid={n_valid} lr={lr:.2e} momentum={momentum:.6f}{extra}"
@@ -134,6 +139,8 @@ class DINODebugger:
             self.teacher_entropy_history.append(teacher_entropy)
         if self.kl_history is not None:
             self.kl_history.append(kl)
+        if self.cov_penalty_history is not None:
+            self.cov_penalty_history.append(cov_penalty)
 
     def log_val_epoch(self, epoch: int, iteration: int, val_loss: float):
         """
@@ -158,6 +165,7 @@ class DINODebugger:
           loss:            [float, ...]                      per-batch train loss
           teacher_entropy: [float|null, ...]                 per-batch H(P_t)       (dino only, else null)
           kl:              [float|null, ...]                 per-batch KL(P_t||P_s) (dino only, else null)
+          cov_penalty:     [float|null, ...]                 per-batch raw covariance penalty (if enabled, else null)
           val:             {iter: [...], loss: [...]}        per-epoch val loss
           stats:           {iter: [...], s_var: [...], ...}  feature statistics
           grad:            {module: {iter: [...], norm: [...]}, ...}
@@ -168,6 +176,7 @@ class DINODebugger:
             "loss":             self.loss_history             or [],
             "teacher_entropy":  self.teacher_entropy_history  or [],
             "kl":               self.kl_history               or [],
+            "cov_penalty":      self.cov_penalty_history      or [],
             "val":              self.val_history               or {},
             "stats":            self.stats_history             or {},
             "grad":             self.grad_history              or {},

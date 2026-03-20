@@ -47,7 +47,7 @@ def validate_epoch(model, val_loader, masker, loss_fn, device):
         x_student, mask = masker(data)
         teacher_feats = model.teacher(data)
         student_feats = model.student(x_student)
-        loss, _, _ = loss_fn(student_feats, teacher_feats, mask, data)
+        loss, _, _, _ = loss_fn(student_feats, teacher_feats, mask, data)
         total_loss += loss.item()
         n_batches += 1
 
@@ -66,6 +66,8 @@ def main(
     use_centering: bool = True,
     teacher_temp: float = 1.0,
     student_temp: float = 1.0,
+    use_cov_penalty: bool = False,
+    cov_penalty_weight: float = 1e-3,
     momentum_start: float = 0.996,
     momentum_end: float = 0.9999,
     weight_decay: float = 0.04,
@@ -95,6 +97,8 @@ def main(
         use_centering: subtract running center from teacher features before loss
         teacher_temp: teacher softmax temperature (only used for "dino")
         student_temp: student softmax temperature (only used for "dino")
+        use_cov_penalty: add VICReg covariance decorrelation penalty on student features
+        cov_penalty_weight: weight for the covariance penalty term
         momentum_start: Initial EMA momentum
         momentum_end: Final EMA momentum
         weight_decay: L2 regularization
@@ -128,6 +132,8 @@ def main(
         use_centering=use_centering,
         teacher_temp=teacher_temp,
         student_temp=student_temp,
+        use_cov_penalty=use_cov_penalty,
+        cov_penalty_weight=cov_penalty_weight,
         momentum_start=momentum_start,
         momentum_end=momentum_end,
         lr=lr,
@@ -151,7 +157,8 @@ def main(
           f" momentum_start={cfg.momentum_start}, momentum_end={cfg.momentum_end}")
     print(f'Loss: type={cfg.loss_type}, center_momentum={cfg.center_momentum}, '
           f'use_centering={cfg.use_centering}, teacher_temp={cfg.teacher_temp}, '
-          f'student_temp={cfg.student_temp}')
+          f'student_temp={cfg.student_temp}, use_cov_penalty={cfg.use_cov_penalty}, '
+          f'cov_penalty_weight={cfg.cov_penalty_weight}')
 
     # ============ Data ============
     print("\nLoading dataset...")
@@ -208,6 +215,8 @@ def main(
         use_centering=cfg.use_centering,
         teacher_temp=cfg.teacher_temp,
         student_temp=cfg.student_temp,
+        use_cov_penalty=cfg.use_cov_penalty,
+        cov_penalty_weight=cfg.cov_penalty_weight,
     ).to(device)
 
     # ============ Schedulers ============
@@ -269,7 +278,7 @@ def main(
 
             # Forward + backward
             optimizer.zero_grad()
-            loss_val, teacher_entropy, kl, s_feats, t_feats, mask_fwd = model.forward_backward(data, masker, loss_fn)
+            loss_val, teacher_entropy, kl, cov_penalty, s_feats, t_feats, mask_fwd = model.forward_backward(data, masker, loss_fn)
             optimizer.step()
 
             # EMA teacher update
@@ -281,7 +290,7 @@ def main(
 
             # Scalar logging
             n_valid = (~mask_fwd & (data != 0)).sum().item()
-            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, kl)
+            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, kl, cov_penalty)
 
             # Gradient norms per backbone module (.grad still populated before next zero_grad)
             debugger.log_gradient_norms(iteration, model.student)
@@ -334,6 +343,7 @@ def from_config(
     run_name: str = "",
     device: str = "cuda",
     test_mode: bool = False,
+    **overrides,
 ):
     """
     Start training from a saved run_config.json file.
@@ -344,14 +354,17 @@ def from_config(
     keys work without errors — missing fields fall back to main()'s defaults.
 
     The `run_name`, `device`, and `test_mode` arguments override the corresponding
-    values from the config file.  Providing a new run_name is recommended when
-    re-running a config so outputs don't overwrite the original run.
+    values from the config file.  Any other parameter accepted by main() can also
+    be overridden via CLI (e.g. --use_cov_penalty=True --cov_penalty_weight=1e-2).
+    Providing a new run_name is recommended when re-running a config so outputs
+    don't overwrite the original run.
 
     Args:
         config_path: Path to the run_config.json file
         run_name: Override run name (determines output sub-directories)
         device: Override device ("cuda" or "cpu")
         test_mode: Override test_mode flag
+        **overrides: Any additional main() parameter to override (e.g. use_cov_penalty=True)
     """
     with open(config_path) as f:
         raw = json.load(f)
@@ -377,6 +390,9 @@ def from_config(
         kwargs["run_name"] = run_name
     kwargs["device"] = device
     kwargs["test_mode"] = test_mode
+    for k, v in overrides.items():
+        if k in valid_params:
+            kwargs[k] = v
 
     main(**kwargs)
 

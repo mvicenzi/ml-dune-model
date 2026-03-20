@@ -33,6 +33,8 @@ class DINOConfig:
     use_centering: bool = True    # subtract running center from teacher before loss
     teacher_temp: float = 1.0    # teacher softmax temperature (only used for "dino")
     student_temp: float = 1.0    # student softmax temperature (only used for "dino")
+    use_cov_penalty: bool = False    # add VICReg covariance decorrelation penalty
+    cov_penalty_weight: float = 1e-3  # weight for the covariance penalty term
 
     # ============ Data ============
     rootdir: str = "/nfs/data/1/rrazakami/work/data_cvn/data/dune/2023_trainings/latest/dunevd"
