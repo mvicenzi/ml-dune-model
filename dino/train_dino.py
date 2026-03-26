@@ -177,9 +177,10 @@ def main(
 
     # ---- ImageNette ----
     # Grayscale converts RGB → single channel [1, H, W], matching the backbone's expected input.
-    # Images are kept at their native resolution; the backbone handles arbitrary spatial sizes.
+    # Resize to a fixed size so images can be collated into batches (ImageNette has variable sizes).
     imagenet_transform = transforms.Compose([
         transforms.Grayscale(num_output_channels=1),
+        transforms.Resize((224, 224)),
         transforms.ToTensor(),
     ])
     train_ds = Imagenette(root=imagenette_dir, split="train", download=True, transform=imagenet_transform)
