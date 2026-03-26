@@ -68,7 +68,7 @@ def _least_occupied_cuda_device() -> torch.device:
 
 
 # ── project imports ────────────────────────────────────────────────────────
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from models.mae_model import SparseMAEModel, voxels_to_device, log1p_voxels, expm1_voxels
 from models.sparse_masking import sparse_block_mask
