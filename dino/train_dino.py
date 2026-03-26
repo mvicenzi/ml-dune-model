@@ -2,8 +2,13 @@
 DINO training script for DUNE sparse UNet backbone.
 
 Usage:
+    # ImageNette (natural images, auto-download):
     python dino/train_dino.py --epochs=100 --batch_size=16 --backbone_name=attn_default
-    python dino/train_dino.py --epochs=2 --batch_size=4 --test_mode=True --debug=True
+    python dino/train_dino.py --epochs=2 --batch_size=4 --max_images=200 --debug=True
+
+    # DUNE (original, commented out below):
+    # python dino/train_dino.py --epochs=100 --batch_size=16 --backbone_name=attn_default
+    # python dino/train_dino.py --epochs=2 --batch_size=4 --test_mode=True --debug=True
 """
 
 import fire
@@ -13,10 +18,12 @@ import sys
 import torch
 import torch.optim as optim
 from pathlib import Path
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
+from torchvision.datasets import Imagenette
+from torchvision import transforms
 
-from loader.dataset import DUNEImageDataset
-from loader.splits import train_val_split, Subset
+# from loader.dataset import DUNEImageDataset
+# from loader.splits import train_val_split, Subset
 
 from .config import DINOConfig
 from .masking import SparseVoxelMasker
@@ -82,6 +89,9 @@ def main(
     run_name: str = "",
     test_mode: bool = False,
     num_workers: int = 4,
+    # ---- ImageNette ----
+    imagenette_dir: str = "../imagenette_data",  # root dir for download/cache
+    max_images: int = -1,                       # -1 = full dataset; N = cap train at N, val at N//5
 ):
     """
     DINO training loop for DUNE detector.
@@ -111,8 +121,10 @@ def main(
         debug_every: Log scalars / stats / grad norms every N batches
         debug_dir: Base directory for debug outputs
         run_name: Optional label; outputs go to debug_dir/run_name/ if set
-        test_mode: Use small subset for quick smoke tests
+        test_mode: (DUNE only) Use small subset for quick smoke tests
         num_workers: Number of dataloader workers
+        imagenette_dir: Directory to download/cache ImageNette into
+        max_images: Cap on training images (-1 = all); val is capped at max_images//5
     """
     # ============ Setup ============
     device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -162,27 +174,47 @@ def main(
 
     # ============ Data ============
     print("\nLoading dataset...")
-    dataset = DUNEImageDataset(
-        rootdir=cfg.rootdir,
-        class_names=["numu", "nue", "nutau", "NC"],
-        view_index=cfg.view_index,
-        use_cache=True,
-    )
 
-    if test_mode:
-        n_subset = 100000
-        print(f"TEST MODE: using {n_subset} samples")
-        subset_indices = torch.randperm(len(dataset))[:n_subset]
-        dataset = Subset(dataset, subset_indices)
+    # ---- ImageNette ----
+    # Grayscale converts RGB → single channel [1, H, W], matching the backbone's expected input.
+    # Images are kept at their native resolution; the backbone handles arbitrary spatial sizes.
+    imagenet_transform = transforms.Compose([
+        transforms.Grayscale(num_output_channels=1),
+        transforms.ToTensor(),
+    ])
+    train_ds = Imagenette(root=imagenette_dir, split="train", download=True, transform=imagenet_transform)
+    val_ds   = Imagenette(root=imagenette_dir, split="val",   download=True, transform=imagenet_transform)
 
-    train_ds, val_ds, train_idx, val_idx = train_val_split(dataset, val_fraction=0.2, use_cache=False)
+    if max_images > 0:
+        train_indices = torch.randperm(len(train_ds))[:max_images]
+        val_indices   = torch.randperm(len(val_ds))[:max(1, max_images // 5)]
+        train_ds = Subset(train_ds, train_indices)
+        val_ds   = Subset(val_ds,   val_indices)
 
-    train_set = set(train_idx.tolist())
-    val_set   = set(val_idx.tolist())
-    overlap = train_set & val_set
-    print(f"Train size: {len(train_set)}, Val size: {len(val_set)}")
-    print(f"Overlap: {len(overlap)} samples")                    # should be 0
-    print(f"Union covers full dataset: {len(train_set | val_set) == len(dataset)}")  # should be True
+    print(f"Train size: {len(train_ds)}, Val size: {len(val_ds)}")
+
+    # ---- DUNE (original) ----
+    # dataset = DUNEImageDataset(
+    #     rootdir=cfg.rootdir,
+    #     class_names=["numu", "nue", "nutau", "NC"],
+    #     view_index=cfg.view_index,
+    #     use_cache=True,
+    # )
+    #
+    # if test_mode:
+    #     n_subset = 100000
+    #     print(f"TEST MODE: using {n_subset} samples")
+    #     subset_indices = torch.randperm(len(dataset))[:n_subset]
+    #     dataset = Subset(dataset, subset_indices)
+    #
+    # train_ds, val_ds, train_idx, val_idx = train_val_split(dataset, val_fraction=0.2, use_cache=False)
+    #
+    # train_set = set(train_idx.tolist())
+    # val_set   = set(val_idx.tolist())
+    # overlap = train_set & val_set
+    # print(f"Train size: {len(train_set)}, Val size: {len(val_set)}")
+    # print(f"Overlap: {len(overlap)} samples")                    # should be 0
+    # print(f"Union covers full dataset: {len(train_set | val_set) == len(dataset)}")  # should be True
 
     train_loader = DataLoader(
         train_ds,

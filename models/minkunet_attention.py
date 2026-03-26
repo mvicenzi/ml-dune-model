@@ -119,7 +119,8 @@ class MinkUNetSparseAttention(nn.Module):
         out = self.final(out)                   # Feature refinement [B,64,500,500]
 
         # Convert to dense and return features (no head)
-        out_dense = out.to_dense(channel_dim=1, spatial_shape=(500, 500))  # [B,64,500,500]
+        spatial_shape = (x.shape[2], x.shape[3])
+        out_dense = out.to_dense(channel_dim=1, spatial_shape=spatial_shape)  # [B,64,H,W]
 
         # https://github.com/NVlabs/WarpConvNet/issues/23
         # to_dense() infers batch_size via bincount on batch indices (offsets)
