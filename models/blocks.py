@@ -1,4 +1,6 @@
+from typing import Tuple
 from torch import Tensor
+import torch
 import torch.nn as nn              # Neural network base classes
 
 from warpconvnet.geometry.base.geometry import Geometry                 # Voxels derives from this
@@ -6,11 +8,50 @@ from warpconvnet.geometry.types.voxels import Voxels                    # Sparse
 from warpconvnet.nn.modules.sparse_conv import SparseConv2d             # 2D sparse convolution
 from warpconvnet.nn.modules.sequential import Sequential                # Ordered list of sparse modules
 from warpconvnet.nn.modules.activations import ReLU                     # Sparse-aware ReLU activation
-from warpconvnet.nn.modules.normalizations import LayerNorm             # layer normalization 
+from warpconvnet.nn.modules.normalizations import LayerNorm             # layer normalization
 from warpconvnet.nn.modules.activations import GELU                     # Sparse-aware ReLU activation
 
 #from warpconvnet.nn.modules.attention import PatchAttention, SpatialFeatureAttention  # Sparse attention
 from .attention2D import SpatialFeatureAttention2D
+
+# ---------------------------------------------------------------------------
+# Dense ↔ Sparse boundary blocks
+# ---------------------------------------------------------------------------
+
+class DenseInput(nn.Module):
+    """
+    Converts a dense image tensor to a sparse Voxels object.
+    Wraps Voxels.from_dense() as an nn.Module so the dense→sparse boundary
+    is an explicit, named layer that can be removed or replaced when
+    switching to a fully-sparse pipeline.
+    """
+    def forward(self, x: Tensor) -> Voxels:
+        return Voxels.from_dense(x)
+
+
+class DenseOutput(nn.Module):
+    """
+    Converts a sparse Voxels object back to a dense tensor.
+    Wraps Voxels.to_dense() as an nn.Module. Spatial shape and batch size
+    are inferred from a reference tensor (the original dense input) so this
+    block is not hardcoded to a specific resolution.
+
+    """
+    def forward(self, x: Voxels, reference: Tensor) -> Tensor:
+        B, _, H, W = reference.shape
+        out = x.to_dense(channel_dim=1, spatial_shape=(H, W))
+
+        # https://github.com/NVlabs/WarpConvNet/issues/23
+        # to_dense() infers batch_size via bincount on batch indices (offsets)
+        # if the last sample is empty image, it gets dropped by from_dense()
+        # because it contributes no voxels; to_dense() then returns B' < B
+        # Pad back with zeros.
+        if out.shape[0] < B:
+            pad = out.new_zeros(B - out.shape[0], *out.shape[1:])
+            out = torch.cat([out, pad], dim=0)
+
+        return out
+
 
 # ---------------------------------------------------------------------------
 # Building blocks: small modular components used to construct the main model

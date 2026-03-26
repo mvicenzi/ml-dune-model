@@ -15,8 +15,9 @@ from warpconvnet.nn.functional.transforms import cat                    # Concat
 from warpconvnet.nn.modules.sparse_conv import SparseConv2d             # 2D sparse convolution
 
 from .blocks import (
-    ConvBlock2D, ConvTrBlock2D, 
-    ResidualSparseBlock2D, 
+    ConvBlock2D, ConvTrBlock2D,
+    ResidualSparseBlock2D,
+    DenseInput, DenseOutput,
     )
 
 # ---------------------------------------------------------------------------
@@ -38,6 +39,10 @@ class MinkUNetSparse(nn.Module):
     """
     def __init__(self):
         super().__init__()
+
+        # ---- Dense ↔ Sparse boundary ----
+        self.from_dense = DenseInput()
+        self.to_dense = DenseOutput()
 
         # ---- Initial convolution (full resolution feature extraction) ----
         self.conv0 = ConvBlock2D(1, 32, kernel_size=3, stride=1)  # [B,1,500,500] → [B,32,500,500]
@@ -72,8 +77,7 @@ class MinkUNetSparse(nn.Module):
         Input: [B, 1, 500, 500] dense tensor
         Output: [B, 64, 500, 500] dense feature map
         """
-        # Convert dense input image to sparse voxel representation
-        xs = Voxels.from_dense(x)
+        xs = self.from_dense(x)
 
         # ============ ENCODER ============
 
@@ -108,9 +112,7 @@ class MinkUNetSparse(nn.Module):
         # ============ FINAL PROJECTION ============
         out = self.final(out)                   # Feature refinement [B,64,500,500]
 
-        # Convert to dense and return features (no head)
-        out_dense = out.to_dense(channel_dim=1, spatial_shape=(500, 500))  # [B,64,500,500]
-        return out_dense
+        return self.to_dense(out, reference=x)
 
 
 class MinkUNetSparseClassifier(nn.Module):

@@ -2,18 +2,30 @@
 """
 Model registry for DUNE neutrino detector classifiers and backbones.
 
-After refactoring:
-- Backbones: pure feature extractors, return [B, 64, 500, 500] dense features
+Backbone naming convention:
+- Sparse variants (Voxels → Voxels): MinkUNetSparseAttention*
+- Dense variants  (Tensor → Tensor): MinkUNetSparseAttention*Dense
+  Dense = sparse backbone wrapped with DenseInput / DenseOutput boundary layers.
+
+- Backbones: pure feature extractors, return [B, 64, H, W] dense features (Dense) or Voxels (Sparse)
 - Classifiers: backbone + classification head, return [B, 4] class logits
 """
 
-# ============ Backbone classes (feature extractors only) ============
+# ============ Sparse backbone classes (Voxels → Voxels) ============
 from .minkunet import MinkUNetSparse
 from .minkunet_attention import (
     MinkUNetSparseAttention,
     MinkUNetSparseAttentionNoEnc,
     MinkUNetSparseAttentionNoFlash,
     MinkUNetSparseAttentionNoFlashEnc,
+)
+
+# ============ Dense backbone classes (Tensor → Tensor) ============
+from .minkunet_attention import (
+    MinkUNetSparseAttentionDense,
+    MinkUNetSparseAttentionNoEncDense,
+    MinkUNetSparseAttentionNoFlashDense,
+    MinkUNetSparseAttentionNoFlashEncDense,
 )
 
 # ============ Classifier wrapper classes (backbone + head for supervised training) ============
@@ -40,14 +52,16 @@ MODEL_REGISTRY = {
 }
 
 # ============ BACKBONE_REGISTRY (exposed for DINO and other self-supervised methods) ============
+# Points to Dense variants (Tensor → Tensor) to keep the current dense dataloader working.
+# Switch to sparse variants once the sparse pipeline is in place.
 BACKBONE_REGISTRY = {
     # Backbone with sparse attention
-    "attn_default":     MinkUNetSparseAttention,
+    "attn_default":     MinkUNetSparseAttentionDense,
 
     # Variants of sparse attention module
-    "attn_noenc":       MinkUNetSparseAttentionNoEnc,
-    "attn_noflash":     MinkUNetSparseAttentionNoFlash,
-    "attn_noflashenc":  MinkUNetSparseAttentionNoFlashEnc,
+    "attn_noenc":       MinkUNetSparseAttentionNoEncDense,
+    "attn_noflash":     MinkUNetSparseAttentionNoFlashDense,
+    "attn_noflashenc":  MinkUNetSparseAttentionNoFlashEncDense,
 
     # Backbone without attention
     "base":             MinkUNetSparse,

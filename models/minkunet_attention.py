@@ -6,7 +6,6 @@
 #   Head:      Dense global pooling and classification
 
 from torch import Tensor
-import torch
 import torch.nn.functional as F    # Functional layer calls (stateless)
 import torch.nn as nn              # Neural network base classes
 
@@ -16,9 +15,10 @@ from warpconvnet.nn.functional.transforms import cat                    # Concat
 from warpconvnet.nn.modules.sparse_conv import SparseConv2d             # 2D sparse convolution
 
 from .blocks import (
-    ConvBlock2D, ConvTrBlock2D, 
-    ResidualSparseBlock2D, 
-    BottleneckSparseAttention2D
+    ConvBlock2D, ConvTrBlock2D,
+    ResidualSparseBlock2D,
+    BottleneckSparseAttention2D,
+    DenseInput, DenseOutput,
     )
 
 # ---------------------------------------------------------------------------
@@ -36,7 +36,7 @@ class MinkUNetSparseAttention(nn.Module):
     - Decoder: transposed convolutions + skip connections + residual blocks (2 stages)
     - Final: feature refinement (1×1 sparse conv)
 
-    Returns: [B, 64, 500, 500] dense feature map (no classification head)
+    Input/output: Voxels → Voxels (fully sparse, no dense materialisation)
     """
     def __init__(self, *,
                  spatial_encoding: bool = True,
@@ -76,14 +76,7 @@ class MinkUNetSparseAttention(nn.Module):
         # ---- Final projection (feature refinement, no classification head) ----
         self.final = SparseConv2d(64, 64, kernel_size=1, bias=True)  # Feature refinement
 
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Forward pass through the backbone.
-        Input: [B, 1, 500, 500] dense tensor
-        Output: [B, 64, 500, 500] dense feature map
-        """
-        # Convert dense input image to sparse voxel representation
-        xs = Voxels.from_dense(x)
+    def forward(self, xs: Voxels) -> Voxels:
 
         # ============ ENCODER ============
 
@@ -118,32 +111,40 @@ class MinkUNetSparseAttention(nn.Module):
         # ============ FINAL PROJECTION ============
         out = self.final(out)                   # Feature refinement [B,64,500,500]
 
-        # Convert to dense and return features (no head)
-        out_dense = out.to_dense(channel_dim=1, spatial_shape=(500, 500))  # [B,64,500,500]
+        return out
 
-        # https://github.com/NVlabs/WarpConvNet/issues/23
-        # to_dense() infers batch_size via bincount on batch indices (offsets)
-        # if the last sample is empty image, it gets dropped by from_dense() 
-        # because it contributes no voxels; to_dense() then returns B' < B
-        # Pad back with zeros.
-        B = x.shape[0]
-        if out_dense.shape[0] < B:
-            pad = out_dense.new_zeros(B - out_dense.shape[0], *out_dense.shape[1:])
-            out_dense = torch.cat([out_dense, pad], dim=0)
 
-        return out_dense
+class MinkUNetSparseAttentionDense(MinkUNetSparseAttention):
+    """
+    Dense-interface wrapper around MinkUNetSparseAttention.
+
+    Attaches DenseInput (Tensor → Voxels) and DenseOutput (Voxels → Tensor)
+    around the sparse backbone, preserving a Tensor → Tensor interface for use
+    with dense dataloaders or the supervised classifier head.
+
+    Input/output: [B, 1, H, W] Tensor → [B, 64, H, W] Tensor
+    """
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.from_dense = DenseInput()
+        self.to_dense   = DenseOutput()
+
+    def forward(self, x: Tensor) -> Tensor:
+        xs  = self.from_dense(x)
+        out = super().forward(xs)
+        return self.to_dense(out, reference=x)
 
 
 class MinkUNetSparseAttentionClassifier(nn.Module):
     """
-    Supervised classification wrapper: MinkUNetSparseAttention backbone + classification head.
+    Supervised classification wrapper: MinkUNetSparseAttentionDense backbone + classification head.
 
     Wraps the backbone and adds a classification head for supervised training.
     Returns: [B, n_classes] log-probabilities
     """
     def __init__(self, n_classes: int = 4, **backbone_kwargs):
         super().__init__()
-        self.backbone = MinkUNetSparseAttention(**backbone_kwargs)
+        self.backbone = MinkUNetSparseAttentionDense(**backbone_kwargs)
         self.head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -157,6 +158,8 @@ class MinkUNetSparseAttentionClassifier(nn.Module):
         return F.log_softmax(logits, dim=1)    # [B, n_classes] log-probabilities
     
 
+# ============ Sparse (Voxels → Voxels) variants ============
+
 class MinkUNetSparseAttentionNoEnc(MinkUNetSparseAttention):
     """Backbone variant: no spatial encoding"""
     def __init__(self, *args, **kwargs):
@@ -169,6 +172,23 @@ class MinkUNetSparseAttentionNoFlash(MinkUNetSparseAttention):
 
 class MinkUNetSparseAttentionNoFlashEnc(MinkUNetSparseAttention):
     """Backbone variant: no flash attention, no spatial encoding"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, spatial_encoding=False, flash_attention=False, **kwargs)
+
+# ============ Dense (Tensor → Tensor) variants ============
+
+class MinkUNetSparseAttentionNoEncDense(MinkUNetSparseAttentionDense):
+    """Dense-interface variant: no spatial encoding"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, spatial_encoding=False, flash_attention=True, **kwargs)
+
+class MinkUNetSparseAttentionNoFlashDense(MinkUNetSparseAttentionDense):
+    """Dense-interface variant: no flash attention"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, spatial_encoding=True, flash_attention=False, **kwargs)
+
+class MinkUNetSparseAttentionNoFlashEncDense(MinkUNetSparseAttentionDense):
+    """Dense-interface variant: no flash attention, no spatial encoding"""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, spatial_encoding=False, flash_attention=False, **kwargs)
 
