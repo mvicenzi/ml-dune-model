@@ -94,13 +94,13 @@ class DINODebugger:
         with open(self.debug_dir / "run_config.json", "w") as f:
             json.dump(config_dict, f, indent=2)
 
-    def log_shapes(self, x, x_student, mask, s_feats, t_feats):
+    def log_shapes(self, x: Tensor, s_feats: Tensor, t_feats: Tensor):
         """Log tensor shapes on first batch."""
         if not self.enabled or self.logger is None:
             return
         self.logger.info(
-            f"Shapes: x={tuple(x.shape)}, x_student={tuple(x_student.shape)}, "
-            f"mask={tuple(mask.shape)}, s_feats={tuple(s_feats.shape)}, "
+            f"Shapes: x={tuple(x.shape)}, "
+            f"s_feats={tuple(s_feats.shape)}, "
             f"t_feats={tuple(t_feats.shape)}"
         )
 
@@ -191,16 +191,14 @@ class DINODebugger:
     def log_feature_stats(
         self,
         iteration: int,
-        s_feats: Tensor,
-        t_feats: Tensor,
-        mask: Tensor,
-        x: Tensor,
+        s_feats: Tensor,  # [N_student, D] student feature tensor
+        t_feats: Tensor,  # [N_teacher, D] teacher feature tensor
     ):
         """
-        Compute and log representation-quality statistics at valid pixels.
+        Compute and log representation-quality statistics.
 
-        Valid pixels = active (non-zero in original image) AND unmasked
-        (positions the student actually processed).
+        s_feats / t_feats are the raw feature tensors from the sparse backbone
+        (already filtered to active voxels — no masking needed here).
 
         Computed for both student and teacher. Runs every `debug_every` iterations.
         Full covariance matrices (64×64) are saved to history for offline heatmap plotting.
@@ -211,14 +209,8 @@ class DINODebugger:
             return
 
         with torch.no_grad():
-            active = (x.squeeze(1) != 0)           # [B, H, W]
-            valid = active & (~mask)                # [B, H, W]
-
-            # [N_valid, D] — use float32 for numerical stability
-            # first permute [B, D, H, W] to [B, H, W, D] 
-            # then apply valid mask [B, H, W] and flatten to [N_valid, D]
-            s_flat = s_feats.detach().permute(0, 2, 3, 1)[valid].float()
-            t_flat = t_feats.detach().permute(0, 2, 3, 1)[valid].float()
+            s_flat = s_feats.detach().float()  # [N_student, D]
+            t_flat = t_feats.detach().float()  # [N_teacher, D]
 
             if s_flat.shape[0] < 2:
                 return

@@ -52,16 +52,15 @@ MODEL_REGISTRY = {
 }
 
 # ============ BACKBONE_REGISTRY (exposed for DINO and other self-supervised methods) ============
-# Points to Dense variants (Tensor → Tensor) to keep the current dense dataloader working.
-# Switch to sparse variants once the sparse pipeline is in place.
+# Points to sparse variants (Voxels → Voxels).
 BACKBONE_REGISTRY = {
     # Backbone with sparse attention
-    "attn_default":     MinkUNetSparseAttentionDense,
+    "attn_default":     MinkUNetSparseAttention,
 
     # Variants of sparse attention module
-    "attn_noenc":       MinkUNetSparseAttentionNoEncDense,
-    "attn_noflash":     MinkUNetSparseAttentionNoFlashDense,
-    "attn_noflashenc":  MinkUNetSparseAttentionNoFlashEncDense,
+    "attn_noenc":       MinkUNetSparseAttentionNoEnc,
+    "attn_noflash":     MinkUNetSparseAttentionNoFlash,
+    "attn_noflashenc":  MinkUNetSparseAttentionNoFlashEnc,
 
     # Backbone without attention
     "base":             MinkUNetSparse,

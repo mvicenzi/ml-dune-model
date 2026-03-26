@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from models import BACKBONE_REGISTRY
+from models.blocks import DenseInput
 
 
 class DINODuneModel(nn.Module):
@@ -27,7 +28,10 @@ class DINODuneModel(nn.Module):
         """
         super().__init__()
 
-        # Instantiate both backbones
+        ## FIXME FIXME: TEMPORARY
+        self.from_dense = DenseInput()
+
+        # Instantiate both backbones (sparse: Voxels → Voxels)
         backbone_cls = BACKBONE_REGISTRY[backbone_name]
         print("Initializing STUDENT backbone:")
         self.student = backbone_cls()
@@ -66,28 +70,33 @@ class DINODuneModel(nn.Module):
         Forward pass and backward update.
 
         Args:
-            x: [B, 1, 500, 500] dense image
+            x: [B, 1, H, W] dense image tensor (from the dense dataloader)
             masker: SparseVoxelMasker instance
             loss_fn: PixelDINOLoss instance
 
         Returns:
-            loss_value: scalar loss
-            student_feats: student output (detached)
-            teacher_feats: teacher output (from no_grad context)
-            mask: mask applied to student input
+            loss_value:      scalar loss
+            teacher_entropy: H(P_t) per batch (dino loss only, else None)
+            kl:              KL(P_t||P_s) per batch (dino loss only, else None)
+            cov_penalty:     covariance penalty (if enabled, else None)
+            student_out:     student Voxels output
+            teacher_out:     teacher Voxels output
         """
-        # Apply masking to create student input
-        x_student, mask = masker(x)
+        # FIXME FIXME: TEMPORARY
+        xs = self.from_dense(x)
 
-        # Teacher forward (full image, frozen, no grad)
+        # Masking on Voxels: returns reduced student Voxels + kept_indices
+        xs_student, kept_indices = masker(xs)
+
+        # Teacher forward (full Voxels, frozen, no grad)
         with torch.no_grad():
-            teacher_feats = self.teacher(x)  # [B, D, H, W]
+            teacher_out = self.teacher(xs)
 
-        # Student forward (masked image, trainable)
-        student_feats = self.student(x_student)  # [B, D, H, W]
+        # Student forward (masked Voxels, trainable)
+        student_out = self.student(xs_student)
 
         # Compute loss and backprop
-        loss, teacher_entropy, kl, cov_penalty = loss_fn(student_feats, teacher_feats, mask, x)
+        loss, teacher_entropy, kl, cov_penalty = loss_fn(student_out, teacher_out, kept_indices)
         loss.backward()
 
-        return loss.item(), teacher_entropy, kl, cov_penalty, student_feats.detach(), teacher_feats.detach(), mask
+        return loss.item(), teacher_entropy, kl, cov_penalty, student_out, teacher_out

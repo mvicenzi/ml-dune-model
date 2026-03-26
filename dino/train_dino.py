@@ -44,10 +44,11 @@ def validate_epoch(model, val_loader, masker, loss_fn, device):
 
     for data, _ in val_loader:
         data = data.to(device)
-        x_student, mask = masker(data)
-        teacher_feats = model.teacher(data)
-        student_feats = model.student(x_student)
-        loss, _, _, _ = loss_fn(student_feats, teacher_feats, mask, data)
+        xs = model.from_dense(data)
+        xs_student, kept_indices = masker(xs)
+        teacher_out = model.teacher(xs)
+        student_out = model.student(xs_student)
+        loss, _, _, _ = loss_fn(student_out, teacher_out, kept_indices)
         total_loss += loss.item()
         n_batches += 1
 
@@ -278,37 +279,36 @@ def main(
 
             # Forward + backward
             optimizer.zero_grad()
-            loss_val, teacher_entropy, kl, cov_penalty, s_feats, t_feats, mask_fwd = model.forward_backward(data, masker, loss_fn)
+            loss_val, teacher_entropy, kl, cov_penalty, student_out, teacher_out = model.forward_backward(data, masker, loss_fn)
             optimizer.step()
 
             # EMA teacher update
             model.update_teacher(mom_val)
 
             # Centering: update teacher center for next iteration
-            loss_fn.update_center(t_feats, data)
+            loss_fn.update_center(teacher_out)
             debugger.log_center_stats(iteration, loss_fn)
 
             # Scalar logging
-            n_valid = (~mask_fwd & (data != 0)).sum().item()
+            n_valid = student_out.feature_tensor.shape[0]
             debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, kl, cov_penalty)
 
             # Gradient norms per backbone module (.grad still populated before next zero_grad)
             debugger.log_gradient_norms(iteration, model.student)
 
             # Representation-quality statistics (variance, covariance, norm)
-            debugger.log_feature_stats(iteration, s_feats, t_feats, mask_fwd, data)
+            debugger.log_feature_stats(iteration, student_out.feature_tensor, teacher_out.feature_tensor)
 
             # First batch: log tensor shapes
             if first_batch:
-                debugger.log_shapes(data, data, mask_fwd, s_feats, t_feats)
+                debugger.log_shapes(data, student_out.feature_tensor, teacher_out.feature_tensor)
                 first_batch = False
 
             # Periodically persist histories to disk
             debugger.maybe_save_histories(iteration)
 
-            # Explicitly free feature tensors: each is ~1.9 GB on GPU.
-            # Dropping them here lets CUDA reclaim memory before the next forward pass.
-            del s_feats, t_feats
+            # Free Voxels objects to release GPU memory before the next forward pass
+            del student_out, teacher_out
 
             if (batch_idx + 1) % 50 == 0 or batch_idx == 0:
                 print(f"[{epoch}/{epochs}] iter {iteration}: loss={loss_val:.6f}, "

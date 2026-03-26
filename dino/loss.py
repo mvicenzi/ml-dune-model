@@ -1,9 +1,13 @@
 """Per-pixel DINO-style loss for self-supervised training."""
 
+from typing import List
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+
+from warpconvnet.geometry.types.voxels import Voxels
 
 
 class PixelDINOLoss(nn.Module):
@@ -63,39 +67,50 @@ class PixelDINOLoss(nn.Module):
 
     def forward(
         self,
-        student_feats: Tensor,  # [B, D, H, W] student output
-        teacher_feats: Tensor,  # [B, D, H, W] teacher output (should be detached)
-        mask: Tensor,           # [B, H, W] bool, True = masked (student didn't see)
-        original_x: Tensor,     # [B, 1, H, W] original (unmodified) image
+        student_out: Voxels,         # sparse student output
+        teacher_out: Voxels,         # sparse teacher output (should be detached)
+        kept_indices: List[Tensor],  # per-batch-item indices mapping student→teacher positions
     ) -> Tensor:
         """
-        Compute pixel-level DINO loss at unmasked active positions.
+        Compute per-voxel DINO loss at the positions the student processed.
+
+        For each batch item b, kept_indices[b] maps student voxel i to the
+        corresponding teacher voxel: teacher[t_start + kept_indices[b][i]].
 
         Args:
-            student_feats: Student backbone output [B, D, H, W]
-            teacher_feats: Teacher backbone output [B, D, H, W], pre-detached
-            mask: Boolean mask [B, H, W], True where pixels were masked from student
-            original_x: Original image [B, 1, H, W] to identify active pixels
+            student_out:   Student backbone output (Voxels)
+            teacher_out:   Teacher backbone output (Voxels), pre-detached
+            kept_indices:  List of B index tensors from SparseVoxelMasker
 
         Returns:
             Scalar loss value
         """
-        # Identify active pixels (originally non-zero in the image)
-        active = (original_x.squeeze(1) != 0)  # [B, H, W]
+        B      = len(student_out.offsets) - 1
+        device = student_out.feature_tensor.device
 
-        # Valid positions: active AND not masked (where student computed real features)
-        valid = active & (~mask)  # [B, H, W]
+        # Align student and teacher features using kept_indices
+        s_parts, t_parts = [], []
+        for b in range(B):
+            # for each image, find pixels in student/teacher
+            t_start = int(teacher_out.offsets[b])
+            t_end   = int(teacher_out.offsets[b + 1])
+            s_start = int(student_out.offsets[b])
+            s_end   = int(student_out.offsets[b + 1])
 
-        counts = valid.sum(dim=(1, 2)).float()  # [B] valid pixels per image
+            t_b = teacher_out.feature_tensor[t_start:t_end]           # [N_teacher, D]
+            s_b = student_out.feature_tensor[s_start:s_end]           # [N_student, D]
 
-        # Handle empty case
-        if counts.sum() == 0:
-            return torch.tensor(0.0, device=student_feats.device, dtype=student_feats.dtype), None, None, None
+            # select teacher pixels only if originnaly kept for the student 
+            t_at_student = t_b[kept_indices[b].to(device)]            # [N_student, D]
 
-        # Flatten to valid pixels only — keeps heavy ops (normalize, softmax) efficient
-        # for sparse images where N_valid << B*H*W
-        s = student_feats.permute(0, 2, 3, 1)[valid]           # [N_valid, D]
-        t = teacher_feats.permute(0, 2, 3, 1)[valid]           # [N_valid, D]
+            s_parts.append(s_b)
+            t_parts.append(t_at_student)
+
+        s = torch.cat(s_parts, dim=0)  # [N_total, D]
+        t = torch.cat(t_parts, dim=0)  # [N_total, D]
+
+        # Per-image voxel counts (from student offsets, which reflect unmasked voxels)
+        counts = (student_out.offsets[1:] - student_out.offsets[:-1]).float().to(device)  # [B]
 
         # Lazy-initialize center on first forward call
         if self.center is None:
@@ -149,8 +164,8 @@ class PixelDINOLoss(nn.Module):
 
         # Two-stage reduction: sum per image via scatter, divide by count, then mean.
         # Mirrors DINOv2: sum(loss * mask) / mask.sum() per image, then .mean()
-        B = student_feats.shape[0]
-        batch_idx = torch.where(valid)[0]  # [N_valid] — image index for each valid pixel
+        student_counts = (student_out.offsets[1:] - student_out.offsets[:-1]).to(device)
+        batch_idx = torch.repeat_interleave(torch.arange(B, device=device), student_counts)
         per_image_loss = torch.zeros(B, device=loss.device, dtype=loss.dtype)
         per_image_loss.scatter_add_(0, batch_idx, loss)
         per_image_loss = per_image_loss / counts.clamp(min=1.0)
@@ -200,7 +215,7 @@ class PixelDINOLoss(nn.Module):
         return off_diag_sq / D
 
     @torch.no_grad()
-    def update_center(self, teacher_feats: Tensor, original_x: Tensor) -> None:
+    def update_center(self, teacher_out: Voxels) -> None:
         """
         Update the running center with the EMA of teacher features at active positions.
 
@@ -209,11 +224,9 @@ class PixelDINOLoss(nn.Module):
         eval-mode teacher outputs.
 
         Args:
-            teacher_feats: Teacher backbone output [B, D, H, W], detached
-            original_x: Original (unmasked) image [B, 1, H, W] to identify active pixels
+            teacher_out: Teacher backbone output (Voxels); all voxels are active by definition
         """
-        active = (original_x.squeeze(1) != 0)  # [B, H, W]
-        teacher_flat = teacher_feats.permute(0, 2, 3, 1)[active]  # [N_active, D]
+        teacher_flat = teacher_out.feature_tensor  # [N_active, D]
 
         if teacher_flat.shape[0] == 0:
             return
@@ -224,9 +237,7 @@ class PixelDINOLoss(nn.Module):
         #if self.loss_type == "dino":
         #    teacher_flat = F.normalize(teacher_flat, dim=-1)
 
-        # for each feature, take mean over all active pixels in the batch
-        # result is [D]
-        batch_mean = teacher_flat.mean(dim=0)
+        batch_mean = teacher_flat.mean(dim=0)  # [D]
 
         if self.center is None:
             self.center = batch_mean.clone()
