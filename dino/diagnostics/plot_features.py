@@ -192,10 +192,10 @@ def plot_dominant_heatmaps(
                 for ax, proj, name, ev in zip(
                     axes, [s_proj, t_proj], ["Student", "Teacher"], [s_ev, t_ev]
                 ):
-                    #vmax = float(np.abs(proj).max())
+                    vmax = float(np.abs(proj).max())
                     sc = ax.scatter(
                         cols, prows, c=proj, cmap="RdBu_r",
-                        #vmin=-vmax, vmax=vmax,
+                        vmin=-vmax, vmax=vmax,
                         s=1, linewidths=0,
                     )
                     #binary = (proj > 0).astype(float)
