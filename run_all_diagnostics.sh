@@ -22,6 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 HISTORIES="$SCRIPT_DIR/dino_debug/${RUNNAME}/histories.json"
 FEATURES="$SCRIPT_DIR/dino_checkpoints/${RUNNAME}/features_ep10.npz"
+CHECKPOINT="$SCRIPT_DIR/dino_checkpoints/${RUNNAME}/checkpoint_epoch10.pt"
 
 # Validate inputs
 if [[ ! -f "$HISTORIES" ]]; then
@@ -29,8 +30,14 @@ if [[ ! -f "$HISTORIES" ]]; then
     exit 1
 fi
 if [[ ! -f "$FEATURES" ]]; then
-    echo "Error: features file not found: $FEATURES"
-    exit 1
+    echo "Features file not found: $FEATURES"
+    if [[ ! -f "$CHECKPOINT" ]]; then
+        echo "Error: checkpoint not found either: $CHECKPOINT"
+        exit 1
+    fi
+    echo "Extracting features from checkpoint: $CHECKPOINT"
+    python -m dino.diagnostics.extract_features "$CHECKPOINT"
+    echo
 fi
 
 echo "=== Running diagnostics for run: ${RUNNAME} ==="
