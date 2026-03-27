@@ -24,17 +24,24 @@ class DINOConfig:
     min_lr: float = 1e-6             # minimum learning rate (after cosine annealing)
     weight_decay: float = 0.04       # L2 weight decay
     weight_decay_end: float = 0.4    # weight decay at end of training (cosine annealed)
-    warmup_epochs: int = 5           # linear LR warmup duration
-    epochs: int = 100                # total training epochs
+    warmup_epochs: int = 1           # linear LR warmup duration
+    epochs: int = 10                 # total training epochs
+
+    # ============ Projection head ============
+    use_proj_head: bool = True         # attach MLP projection head between backbone and loss
+    proj_head_hidden_dim: int = 256     # inner MLP width (DINO paper uses 2048)
+    proj_head_output_dim: int = 128     # output dimension of the final FC layer
+    proj_head_n_layers: int = 2         # number of MLP layers before the final FC
 
     # ============ Loss ============
-    loss_type: str = "cosine"    # "cosine", "mse", or "dino"
-    center_momentum: float = 0.9  # EMA decay for teacher centering
-    use_centering: bool = True    # subtract running center from teacher before loss
-    teacher_temp: float = 1.0    # teacher softmax temperature (only used for "dino")
-    student_temp: float = 1.0    # student softmax temperature (only used for "dino")
-    use_cov_penalty: bool = False    # add VICReg covariance decorrelation penalty
-    cov_penalty_weight: float = 1e-3  # weight for the covariance penalty term
+    loss_type: str = "dino"         # "cosine", "mse", or "dino"
+    center_momentum: float = 0.996  # EMA decay for teacher centering
+    use_centering: bool = True      # subtract running center from teacher before loss
+    teacher_temp: float = 0.04      # teacher softmax temperature (only used for "dino")
+    student_temp: float = 0.1       # student softmax temperature (only used for "dino")
+    normalize_features: bool = False  # L2-normalise student+teacher features before loss; set to False when use_proj_head=True (head normalises internally)
+    use_cov_penalty: bool = True      # add VICReg covariance decorrelation penalty
+    cov_penalty_weight: float = 10  # weight for the covariance penalty term
 
     # ============ Data ============
     rootdir: str = "/nfs/data/1/rrazakami/work/data_cvn/data/dune/2023_trainings/latest/dunevd"

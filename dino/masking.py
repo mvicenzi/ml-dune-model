@@ -1,72 +1,84 @@
 """Sparse-aware pixel masking for DINO student augmentation."""
 
-from typing import Tuple
+from typing import List, Tuple
+
 import torch
-from torch import Tensor
+from warpconvnet.geometry.types.voxels import Voxels
+from warpconvnet.geometry.coords.integer import IntCoords
+from warpconvnet.geometry.features.cat import CatFeatures
 
 
 class SparseVoxelMasker:
     """
-    Masks active pixels in a dense image before sparse conversion.
+    Masks active voxels for the DINO student by removing entries from a Voxels object.
 
     For each image in a batch:
-    1. Identify active pixel coordinates (non-zero values)
-    2. Randomly select a fraction to mask
-    3. Zero those pixels in the dense tensor
+    1. Randomly select a fraction of active voxels to keep (1 - mask_ratio)
+    2. Return a reduced student Voxels and the kept indices per batch item
 
-    The sparse backbone then excludes these zeros from its computation,
-    so the student processes only the unmasked active pixels.
+    The kept_indices are needed by the loss to align student and teacher features:
+    teacher_out.feature_tensor[t_start:t_end][kept_indices[b]] gives the teacher
+    features at exactly the positions the student processed.
     """
 
     def __init__(self, mask_ratio: float = 0.5, seed: int = None):
         """
         Args:
-            mask_ratio: Fraction of active pixels to mask (0.0 to 1.0)
+            mask_ratio: Fraction of active voxels to mask (0.0 to 1.0)
             seed: Optional random seed for reproducibility
         """
         self.mask_ratio = mask_ratio
         if seed is not None:
             torch.manual_seed(seed)
 
-    def __call__(self, x: Tensor) -> Tuple[Tensor, Tensor]:
+    def __call__(self, voxels: Voxels) -> Tuple[Voxels, List[torch.Tensor]]:
         """
-        Apply sparse-aware masking to a batch of dense images.
+        Apply masking to a batched Voxels object.
 
         Args:
-            x: [B, 1, H, W] float32 tensor, typically from DUNEImageDataset
+            voxels: Batched Voxels with batch_size B
 
         Returns:
-            x_student: [B, 1, H, W] modified tensor with masked pixels zeroed
-            mask: [B, H, W] bool tensor, True where pixels were masked
+            student_voxels: Voxels with ~(1 - mask_ratio) of the original active voxels
+            kept_indices:   List of B tensors; kept_indices[b] indexes into the
+                            per-batch-item slice of voxels (i.e. offsets[b]:offsets[b+1])
         """
-        B, C, H, W = x.shape
-        assert C == 1, f"Expected single channel, got {C}"
+        B = len(voxels.offsets) - 1
+        device = voxels.coordinate_tensor.device
 
-        device = x.device
-        mask = torch.zeros(B, H, W, dtype=torch.bool, device=device)
-        x_student = x.clone()
+        kept_indices = []
+        coords_list  = []
+        feats_list   = []
 
         for b in range(B):
-            # Find all active (non-zero) pixels in this image
-            active_coords = (x[b, 0] != 0).nonzero(as_tuple=False)  # [N, 2] (row, col)
-            N = active_coords.shape[0]
+
+            # find pixels in this image
+            start = int(voxels.offsets[b])
+            end   = int(voxels.offsets[b + 1])
+            N     = end - start
 
             if N == 0:
-                # Image has no active pixels, skip masking
+                kept_indices.append(torch.zeros(0, dtype=torch.long, device=device))
                 continue
 
-            # How many pixels to mask
-            n_mask = int(N * self.mask_ratio)
+            n_keep = max(1, N - int(N * self.mask_ratio))
+            perm   = torch.randperm(N, device=device)
+            keep   = perm[:n_keep].sort().values   # sorted to preserve spatial order
 
-            if n_mask > 0:
-                # Randomly select which active pixels to mask
-                perm = torch.randperm(N, device=device)[:n_mask]
-                masked_coords = active_coords[perm]
+            kept_indices.append(keep)
+            coords_list.append(voxels.coordinate_tensor[start:end][keep])
+            feats_list.append(voxels.feature_tensor[start:end][keep])
 
-                # Mark these positions in the mask
-                mask[b, masked_coords[:, 0], masked_coords[:, 1]] = True
+        counts      = torch.tensor([k.shape[0] for k in kept_indices], dtype=torch.int64)
+        new_offsets = torch.cat([torch.zeros(1, dtype=torch.int64), counts.cumsum(0)])
 
-                # Zero them in the student input
-                x_student[b, 0, masked_coords[:, 0], masked_coords[:, 1]] = 0.0
+        new_coords = torch.cat(coords_list, dim=0) if coords_list else voxels.coordinate_tensor.new_zeros(0, voxels.coordinate_tensor.shape[1])
+        new_feats  = torch.cat(feats_list,  dim=0) if feats_list  else voxels.feature_tensor.new_zeros(0, voxels.feature_tensor.shape[1])
 
-        return x_student, mask
+        student_voxels = Voxels(
+            batched_coordinates=IntCoords(new_coords, offsets=new_offsets),
+            batched_features=CatFeatures(new_feats, offsets=new_offsets),
+            offsets=new_offsets,
+        )
+
+        return student_voxels, kept_indices

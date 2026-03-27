@@ -44,10 +44,11 @@ def validate_epoch(model, val_loader, masker, loss_fn, device):
 
     for data, _ in val_loader:
         data = data.to(device)
-        x_student, mask = masker(data)
-        teacher_feats = model.teacher(data)
-        student_feats = model.student(x_student)
-        loss, _, _, _ = loss_fn(student_feats, teacher_feats, mask, data)
+        xs = model.from_dense(data)
+        xs_student, kept_indices = masker(xs)
+        _ , teacher_out = model.encode_teacher(xs)
+        student_backbone_out, student_out = model.encode_student(xs_student)
+        loss, _, _, _, _ = loss_fn(student_out, student_backbone_out, teacher_out, kept_indices)
         total_loss += loss.item()
         n_batches += 1
 
@@ -61,18 +62,22 @@ def main(
     batch_size: int = 50,
     lr: float = 1e-4,
     mask_ratio: float = 0.5,
-    loss_type: str = "cosine",
-    center_momentum: float = 0.9,
+    loss_type: str = "dino",
+    center_momentum: float = 0.995,
     use_centering: bool = True,
-    teacher_temp: float = 1.0,
-    student_temp: float = 1.0,
-    use_cov_penalty: bool = False,
-    cov_penalty_weight: float = 1e-3,
+    teacher_temp: float = 0.04,
+    student_temp: float = 0.1,
+    use_proj_head: bool = True,
+    proj_head_hidden_dim: int = 256,
+    proj_head_output_dim: int = 128,
+    proj_head_n_layers: int = 2,
+    use_cov_penalty: bool = True,
+    cov_penalty_weight: float = 10.0,
     momentum_start: float = 0.996,
     momentum_end: float = 0.9999,
     weight_decay: float = 0.04,
     weight_decay_end: float = 0.4,
-    warmup_epochs: int = 5,
+    warmup_epochs: int = 1,
     output_dir: str = "./dino_checkpoints",
     save_every: int = 10,
     device: str = "cuda",
@@ -97,6 +102,10 @@ def main(
         use_centering: subtract running center from teacher features before loss
         teacher_temp: teacher softmax temperature (only used for "dino")
         student_temp: student softmax temperature (only used for "dino")
+        use_proj_head: attach DINO MLP projection head between backbone and loss
+        proj_head_hidden_dim: inner MLP width of the projection head
+        proj_head_output_dim: output dimension of the projection head's final FC layer
+        proj_head_n_layers: number of MLP layers before the final FC
         use_cov_penalty: add VICReg covariance decorrelation penalty on student features
         cov_penalty_weight: weight for the covariance penalty term
         momentum_start: Initial EMA momentum
@@ -124,10 +133,19 @@ def main(
         output_dir = f"{output_dir}/{run_name}"
 
     # Build config
+    # normalize_features is the negation of use_proj_head:
+    # the head's internal L2 norm handles normalisation when the head is active.
+    normalize_features = not use_proj_head
+
     cfg = DINOConfig(
         backbone_name=backbone_name,
         mask_ratio=mask_ratio,
+        use_proj_head=use_proj_head,
+        proj_head_hidden_dim=proj_head_hidden_dim,
+        proj_head_output_dim=proj_head_output_dim,
+        proj_head_n_layers=proj_head_n_layers,
         loss_type=loss_type,
+        normalize_features=normalize_features,
         center_momentum=center_momentum,
         use_centering=use_centering,
         teacher_temp=teacher_temp,
@@ -152,8 +170,11 @@ def main(
     )
 
     print(f"Device: {device}")
-    print(f"Config: backbone={cfg.backbone_name}, mask_ratio={cfg.mask_ratio}, "
-          f"lr={cfg.lr}, epochs={cfg.epochs}, batch_size={cfg.batch_size}, warmup_epochs={cfg.warmup_epochs}, "
+    print(f"Model: backbone_name={cfg.backbone_name}, use_proj_head={cfg.use_proj_head}, "
+          f"proj_head_hidden_dim={cfg.proj_head_hidden_dim}, proj_head_output_dim={cfg.proj_head_output_dim}, "
+          f"proj_head_n_layers={cfg.proj_head_n_layers}")
+    print(f"Config: mask_ratio={cfg.mask_ratio}, epochs={cfg.epochs}, "
+          f"lr={cfg.lr}, batch_size={cfg.batch_size}, warmup_epochs={cfg.warmup_epochs}, "
           f" momentum_start={cfg.momentum_start}, momentum_end={cfg.momentum_end}")
     print(f'Loss: type={cfg.loss_type}, center_momentum={cfg.center_momentum}, '
           f'use_centering={cfg.use_centering}, teacher_temp={cfg.teacher_temp}, '
@@ -205,12 +226,23 @@ def main(
 
     # ============ Model, optimizer, loss ============
     print("\nBuilding model...")
-    model = DINODuneModel(backbone_name=backbone_name).to(device)
-    optimizer = optim.AdamW(model.student.parameters(), lr=lr, weight_decay=weight_decay)
+    model = DINODuneModel(
+        backbone_name=backbone_name,
+        use_proj_head=use_proj_head,
+        proj_head_hidden_dim=proj_head_hidden_dim,
+        proj_head_output_dim=proj_head_output_dim,
+        proj_head_n_layers=proj_head_n_layers,
+    ).to(device)
+    # Optimise backbone + head (if present)
+    student_params = list(model.student.parameters())
+    if model.student_head is not None:
+        student_params += list(model.student_head.parameters())
+    optimizer = optim.AdamW(student_params, lr=lr, weight_decay=weight_decay)
 
     masker = SparseVoxelMasker(mask_ratio=mask_ratio)
     loss_fn = PixelDINOLoss(
         loss_type=cfg.loss_type,
+        normalize_features=cfg.normalize_features,
         center_momentum=cfg.center_momentum,
         use_centering=cfg.use_centering,
         teacher_temp=cfg.teacher_temp,
@@ -278,37 +310,40 @@ def main(
 
             # Forward + backward
             optimizer.zero_grad()
-            loss_val, teacher_entropy, kl, cov_penalty, s_feats, t_feats, mask_fwd = model.forward_backward(data, masker, loss_fn)
+            loss_val, teacher_entropy, student_entropy, kl, cov_penalty, student_backbone_out, teacher_backbone_out, student_out, teacher_out = model.forward_backward(data, masker, loss_fn)
             optimizer.step()
 
             # EMA teacher update
             model.update_teacher(mom_val)
 
             # Centering: update teacher center for next iteration
-            loss_fn.update_center(t_feats, data)
+            loss_fn.update_center(teacher_out)
             debugger.log_center_stats(iteration, loss_fn)
 
             # Scalar logging
-            n_valid = (~mask_fwd & (data != 0)).sum().item()
-            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, kl, cov_penalty)
+            n_valid = student_out.feature_tensor.shape[0]
+            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, student_entropy, kl, cov_penalty)
 
             # Gradient norms per backbone module (.grad still populated before next zero_grad)
             debugger.log_gradient_norms(iteration, model.student)
 
             # Representation-quality statistics (variance, covariance, norm)
-            debugger.log_feature_stats(iteration, s_feats, t_feats, mask_fwd, data)
+            # Pass head features separately when a head is present (student_out != student_backbone_out)
+            s_head_feats = student_out.feature_tensor if model.student_head is not None else None
+            t_head_feats = teacher_out.feature_tensor if model.teacher_head is not None else None
+            debugger.log_feature_stats(iteration, student_backbone_out.feature_tensor, teacher_backbone_out.feature_tensor,
+                                        s_head_feats, t_head_feats)
 
             # First batch: log tensor shapes
             if first_batch:
-                debugger.log_shapes(data, data, mask_fwd, s_feats, t_feats)
+                debugger.log_shapes(data, student_backbone_out.feature_tensor, teacher_backbone_out.feature_tensor)
                 first_batch = False
 
             # Periodically persist histories to disk
             debugger.maybe_save_histories(iteration)
 
-            # Explicitly free feature tensors: each is ~1.9 GB on GPU.
-            # Dropping them here lets CUDA reclaim memory before the next forward pass.
-            del s_feats, t_feats
+            # Free Voxels objects to release GPU memory before the next forward pass
+            del student_backbone_out, student_out, teacher_backbone_out, teacher_out
 
             if (batch_idx + 1) % 50 == 0 or batch_idx == 0:
                 print(f"[{epoch}/{epochs}] iter {iteration}: loss={loss_val:.6f}, "
@@ -328,6 +363,9 @@ def main(
                 "optimizer": optimizer.state_dict(),
                 "cfg": cfg,
             }
+            if model.student_head is not None:
+                ckpt["student_head"] = model.student_head.state_dict()
+                ckpt["teacher_head"] = model.teacher_head.state_dict()
             ckpt_path = output_dir / f"checkpoint_epoch{epoch}.pt"
             torch.save(ckpt, ckpt_path)
             print(f"Saved checkpoint: {ckpt_path}")
@@ -376,7 +414,7 @@ def from_config(
     # Build kwargs: only keep JSON keys that main() understands
     kwargs = {k: v for k, v in raw.items() if k in valid_params}
 
-    # The JSON stores debug_dir as the fully-nested path (debug_dir/run_name).
+    # The JSON stores debug_dir and output_dir as fully-nested paths (base/run_name).
     # main() will re-append run_name, so we strip the suffix here to avoid
     # double-nesting.  We use the original run_name from the JSON for this,
     # before any CLI override is applied.
@@ -384,6 +422,9 @@ def from_config(
     stored_debug_dir = kwargs.get("debug_dir", "")
     if orig_run_name and stored_debug_dir.endswith("/" + orig_run_name):
         kwargs["debug_dir"] = stored_debug_dir[: -len("/" + orig_run_name)]
+    stored_output_dir = kwargs.get("output_dir", "")
+    if orig_run_name and stored_output_dir.endswith("/" + orig_run_name):
+        kwargs["output_dir"] = stored_output_dir[: -len("/" + orig_run_name)]
 
     # CLI-level overrides always win
     if run_name:

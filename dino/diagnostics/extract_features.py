@@ -13,8 +13,10 @@ Usage:
         --output=./my_features.npz --batch_size=16
 
 Output (.npz):
-    teacher_features  [N_valid, D]   float32   teacher features at valid pixels
-    student_features  [N_valid, D]   float32   student features at valid pixels
+    teacher_features       [N_valid, D_bb]   float32   teacher backbone features at valid pixels
+    student_features       [N_valid, D_bb]   float32   student backbone features at valid pixels
+    teacher_head_features  [N_valid, D_hd]   float32   teacher head features (only if head present)
+    student_head_features  [N_valid, D_hd]   float32   student head features (only if head present)
     labels            [N_images]     int64     class label per image
     positions         [N_valid, 2]   int32     (row, col) pixel coordinates
     offsets           [N_images+1]   int64     CSR-style: image i occupies rows offsets[i]:offsets[i+1]
@@ -30,6 +32,8 @@ from loader.dataset import DUNEImageDataset
 from loader.splits import Subset
 from models import BACKBONE_REGISTRY
 from dino.config import DINOConfig
+from dino.projhead import DINOProjectionHead
+from warpconvnet.geometry.types.voxels import Voxels
 
 
 def _load_backbone(ckpt: dict, key: str, device: torch.device):
@@ -42,43 +46,75 @@ def _load_backbone(ckpt: dict, key: str, device: torch.device):
     return model
 
 
-@torch.no_grad()
-def _run_loader(student, teacher, loader, device):
-    """
-    Run both student and teacher over the loader.
+def _load_head(ckpt: dict, key: str, device: torch.device):
+    """Load a projection head from checkpoint; returns None if key absent."""
+    if key not in ckpt:
+        return None
+    cfg = ckpt["cfg"]
+    head = DINOProjectionHead(
+        in_dim=cfg.feature_dim,
+        hidden_dim=cfg.proj_head_hidden_dim,
+        out_dim=cfg.proj_head_output_dim,
+        n_layers=cfg.proj_head_n_layers,
+    ).to(device)
+    head.load_state_dict(ckpt[key])
+    head.eval()
+    for p in head.parameters():
+        p.requires_grad = False
+    return head
 
-    Returns three flat arrays: student_features, teacher_features, labels,
-    positions — one row per valid (non-zero) pixel across the whole dataset.
+
+@torch.no_grad()
+def _run_loader(student, teacher, loader, device, student_head=None, teacher_head=None):
+    """
+    Run both student and teacher (+ optional heads) over the loader.
+
+    Returns flat arrays: student_features, teacher_features,
+    student_head_features (or None), teacher_head_features (or None),
+    labels, positions — one row per valid (non-zero) pixel.
     """
     s_feats_all, t_feats_all, labels_all, pos_all, offsets = [], [], [], [], [0]
+    s_head_all, t_head_all = [], []
+    have_head = student_head is not None
 
     for images, labels in loader:
         images = images.to(device)          # [B, 1, H, W]
-        active = images.squeeze(1) != 0     # [B, H, W]  — valid pixel mask
 
-        s_out = student(images)             # [B, D, H, W]
-        t_out = teacher(images)
+        # Convert dense → sparse; coords are (row, col) for active pixels
+        xs = Voxels.from_dense(images)      # Voxels: N_active voxels across batch
 
-        # [B, H, W, D] — easier to index by spatial mask
-        s_hwc = s_out.permute(0, 2, 3, 1).float()
-        t_hwc = t_out.permute(0, 2, 3, 1).float()
+        s_out = student(xs)                 # Voxels [N_active, D_bb]
+        t_out = teacher(xs)                 # Voxels [N_active, D_bb]
 
-        # Flatten across batch: collect each image's valid pixels
+        coords   = xs.coordinate_tensor.cpu()              # [N_active, 2]
+        s_feats  = s_out.feature_tensor.float().cpu()      # [N_active, D_bb]
+        t_feats  = t_out.feature_tensor.float().cpu()      # [N_active, D_bb]
+        img_offs = xs.offsets.cpu()                        # [B+1]
+
+        if have_head:
+            s_hd = student_head(s_out).feature_tensor.float().cpu()  # [N_active, D_hd]
+            t_hd = teacher_head(t_out).feature_tensor.float().cpu()
+
         for b in range(images.shape[0]):
-            m = active[b]                                    # [H, W]
-            n = m.sum().item()
+            start = int(img_offs[b])
+            end   = int(img_offs[b + 1])
+            n     = end - start
 
-            s_feats_all.append(s_hwc[b][m].cpu().numpy())   # [n, D]
-            t_feats_all.append(t_hwc[b][m].cpu().numpy())
-
-            rows, cols = m.nonzero(as_tuple=True)
-            pos_all.append(torch.stack([rows, cols], dim=1).cpu().numpy())  # [n, 2]
+            s_feats_all.append(s_feats[start:end].numpy())
+            t_feats_all.append(t_feats[start:end].numpy())
+            pos_all.append(coords[start:end].numpy())
             labels_all.append(labels[b].item())
             offsets.append(offsets[-1] + n)
+
+            if have_head:
+                s_head_all.append(s_hd[start:end].numpy())
+                t_head_all.append(t_hd[start:end].numpy())
 
     return (
         np.concatenate(s_feats_all, axis=0).astype(np.float32),
         np.concatenate(t_feats_all, axis=0).astype(np.float32),
+        np.concatenate(s_head_all,  axis=0).astype(np.float32) if have_head else None,
+        np.concatenate(t_head_all,  axis=0).astype(np.float32) if have_head else None,
         np.array(labels_all, dtype=np.int64),
         np.concatenate(pos_all,     axis=0).astype(np.int32),
         np.array(offsets,           dtype=np.int64),
@@ -147,22 +183,35 @@ def main(
     student = _load_backbone(ckpt, "student", device)
     teacher = _load_backbone(ckpt, "teacher", device)
 
+    student_head = _load_head(ckpt, "student_head", device)
+    teacher_head = _load_head(ckpt, "teacher_head", device)
+    if student_head is not None:
+        print(f"  Projection head found: {cfg.feature_dim}→{cfg.proj_head_output_dim}D")
+
     # Extract
     print("Extracting features ...")
-    s_feats, t_feats, labels, positions, offsets = _run_loader(student, teacher, loader, device)
+    s_feats, t_feats, s_head_feats, t_head_feats, labels, positions, offsets = _run_loader(
+        student, teacher, loader, device, student_head, teacher_head
+    )
 
-    print(f"  Images:      {len(labels)}")
-    print(f"  Valid pixels: {s_feats.shape[0]}")
-    print(f"  Feature dim:  {s_feats.shape[1]}")
+    print(f"  Images:        {len(labels)}")
+    print(f"  Valid pixels:  {s_feats.shape[0]}")
+    print(f"  Backbone dim:  {s_feats.shape[1]}")
+    if s_head_feats is not None:
+        print(f"  Head dim:      {s_head_feats.shape[1]}")
 
-    np.savez_compressed(
-        out_path,
+    arrays = dict(
         student_features=s_feats,
         teacher_features=t_feats,
         labels=labels,
         positions=positions,
         offsets=offsets,
     )
+    if s_head_feats is not None:
+        arrays["student_head_features"] = s_head_feats
+        arrays["teacher_head_features"] = t_head_feats
+
+    np.savez_compressed(out_path, **arrays)
     print(f"\nSaved: {out_path}")
 
 
