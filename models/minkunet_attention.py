@@ -7,9 +7,9 @@
 #
 # The backbone is split into three composable modules:
 #
-#   MinkUNetSparseAttention_Input   Dense Tensor  →  Voxels
+#   FromDense                       Dense Tensor  →  Voxels
 #   MinkUNetSparseAttentionCore     Voxels        →  Voxels   (all learnable layers)
-#   MinkUNetSparseAttention_Output  Voxels        →  Dense Tensor
+#   ToDense                         Voxels        →  Dense Tensor
 #
 # MinkUNetSparseAttention composes all three for the original Dense → Dense interface.
 # Use MinkUNetSparseAttentionCore directly when input already arrives as Voxels
@@ -28,25 +28,8 @@ from .blocks import (
     ConvBlock2D, ConvTrBlock2D,
     ResidualSparseBlock2D,
     BottleneckSparseAttention2D,
+    FromDense, ToDense
 )
-
-# ---------------------------------------------------------------------------
-# Input adapter: Dense Tensor → Voxels
-# ---------------------------------------------------------------------------
-
-class MinkUNetSparseAttention_Input(nn.Module):
-    """
-    Input adapter: converts a dense image tensor to a sparse Voxels object.
-
-    Interface: Tensor [B, 1, H, W]  →  Voxels
-
-    No learnable parameters.  Can be skipped entirely when the data pipeline
-    already delivers Voxels (e.g. APASparseDataset), feeding them directly to
-    MinkUNetSparseAttentionCore.
-    """
-
-    def forward(self, x: Tensor) -> Voxels:
-        return Voxels.from_dense(x)
 
 
 # ---------------------------------------------------------------------------
@@ -134,34 +117,6 @@ class MinkUNetSparseAttentionCore(nn.Module):
         return self.final(out)              # → [B, 64, 500×500]
 
 
-# ---------------------------------------------------------------------------
-# Output adapter: Voxels → Dense Tensor
-# ---------------------------------------------------------------------------
-
-class MinkUNetSparseAttention_Output(nn.Module):
-    """
-    Output adapter: materialises sparse Voxels into a dense feature tensor.
-
-    Interface: (Voxels, batch_size: int)  →  Tensor [B, 64, H, W]
-
-    batch_size must be provided explicitly to handle WarpConvNet issue #23:
-    if the last sample in a batch is an all-zero image, from_dense() drops it
-    (no active voxels), causing voxels.batch_size < true B.  The adapter
-    zero-pads the missing trailing samples back to the original batch size.
-
-    No learnable parameters.
-    """
-
-    def __init__(self, spatial_shape: tuple = (500, 500)):
-        super().__init__()
-        self.spatial_shape = spatial_shape
-
-    def forward(self, xs: Voxels, batch_size: int) -> Tensor:
-        out = xs.to_dense(channel_dim=1, spatial_shape=self.spatial_shape)
-        if out.shape[0] < batch_size:
-            pad = out.new_zeros(batch_size - out.shape[0], *out.shape[1:])
-            out = torch.cat([out, pad], dim=0)
-        return out                          # [B, 64, H, W]
 
 
 # ---------------------------------------------------------------------------
@@ -174,9 +129,9 @@ class MinkUNetSparseAttention(nn.Module):
     Dense Tensor → Dense Tensor (original, backward-compatible interface).
 
     Composes:
-        self.input  = MinkUNetSparseAttention_Input   (Dense → Sparse)
+        self.input  = FromDense   (Dense → Sparse)
         self.core   = MinkUNetSparseAttentionCore     (Sparse → Sparse)
-        self.output = MinkUNetSparseAttention_Output  (Sparse → Dense)
+        self.output = ToDense  (Sparse → Dense)
 
     For pipelines where data arrives as Voxels, use self.core directly and
     call self.output manually with the true batch_size.
@@ -191,14 +146,14 @@ class MinkUNetSparseAttention(nn.Module):
                  encoding_range:   float = 125.0,
                  **kwargs):
         super().__init__()
-        self.input  = MinkUNetSparseAttention_Input()
+        self.input  = FromDense()
         self.core   = MinkUNetSparseAttentionCore(
             spatial_encoding=spatial_encoding,
             flash_attention=flash_attention,
             encoding_dim=encoding_dim,
             encoding_range=encoding_range,
         )
-        self.output = MinkUNetSparseAttention_Output()
+        self.output = ToDense()
 
     def forward(self, x: Tensor) -> Tensor:
         """

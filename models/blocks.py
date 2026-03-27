@@ -176,3 +176,51 @@ class BottleneckSparseAttention2D(nn.Module):
 
         x_out = self.post_proj(x2)
         return x_out
+
+
+# ---------------------------------------------------------------------------
+# Input adapter: Dense Tensor → Voxels
+# ---------------------------------------------------------------------------
+
+class FromDense(nn.Module):
+    """
+    Input adapter: converts a dense image tensor to a sparse Voxels object.
+
+    Interface: Tensor [B, 1, H, W]  →  Voxels
+
+    No learnable parameters.  Can be skipped entirely when the data pipeline
+    already delivers Voxels (e.g. APASparseDataset), feeding them directly to
+    MinkUNetSparseAttentionCore.
+    """
+
+    def forward(self, x: Tensor) -> Voxels:
+        return Voxels.from_dense(x)
+
+# ---------------------------------------------------------------------------
+# Output adapter: Voxels → Dense Tensor
+# ---------------------------------------------------------------------------
+
+class ToDense(nn.Module):
+    """
+    Output adapter: materialises sparse Voxels into a dense feature tensor.
+
+    Interface: (Voxels, batch_size: int)  →  Tensor [B, 64, H, W]
+
+    batch_size must be provided explicitly to handle WarpConvNet issue #23:
+    if the last sample in a batch is an all-zero image, from_dense() drops it
+    (no active voxels), causing voxels.batch_size < true B.  The adapter
+    zero-pads the missing trailing samples back to the original batch size.
+
+    No learnable parameters.
+    """
+
+    def __init__(self, spatial_shape: tuple = (500, 500)):
+        super().__init__()
+        self.spatial_shape = spatial_shape
+
+    def forward(self, xs: Voxels, batch_size: int) -> Tensor:
+        out = xs.to_dense(channel_dim=1, spatial_shape=self.spatial_shape)
+        if out.shape[0] < batch_size:
+            pad = out.new_zeros(batch_size - out.shape[0], *out.shape[1:])
+            out = torch.cat([out, pad], dim=0)
+        return out                          # [B, 64, H, W]
