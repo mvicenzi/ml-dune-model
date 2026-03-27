@@ -328,7 +328,11 @@ def main(
             debugger.log_gradient_norms(iteration, model.student)
 
             # Representation-quality statistics (variance, covariance, norm)
-            debugger.log_feature_stats(iteration, student_backbone_out.feature_tensor, teacher_out.feature_tensor)
+            # Pass head features separately when a head is present (student_out != student_backbone_out)
+            s_head_feats = student_out.feature_tensor if model.student_head is not None else None
+            t_head_feats = teacher_out.feature_tensor if model.teacher_head is not None else None
+            debugger.log_feature_stats(iteration, student_backbone_out.feature_tensor, teacher_out.feature_tensor,
+                                        s_head_feats, t_head_feats)
 
             # First batch: log tensor shapes
             if first_batch:
@@ -339,7 +343,7 @@ def main(
             debugger.maybe_save_histories(iteration)
 
             # Free Voxels objects to release GPU memory before the next forward pass
-            del student_out, teacher_out
+            del student_backbone_out, student_out, teacher_out
 
             if (batch_idx + 1) % 50 == 0 or batch_idx == 0:
                 print(f"[{epoch}/{epochs}] iter {iteration}: loss={loss_val:.6f}, "

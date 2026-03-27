@@ -52,6 +52,7 @@ class DINODebugger:
              "s_norm_min": [], "s_norm_max": [], "s_norm_median": [],
              "t_norm_min": [], "t_norm_max": [], "t_norm_median": [],
              "s_cov_mat": [], "t_cov_mat": [],
+             "s_head_cov_mat": [], "t_head_cov_mat": [],
              "center_norm": [], "center_var": []}
             if self.enabled else None
         )
@@ -190,7 +191,7 @@ class DINODebugger:
         }
         try:
             with open(self.debug_dir / "histories.json", "w") as f:
-                json.dump(data, f, indent=2)
+                json.dump(data, f, indent=1)
         except Exception as e:
             if self.logger:
                 self.logger.error(f"Error saving histories: {e}")
@@ -198,17 +199,19 @@ class DINODebugger:
     def log_feature_stats(
         self,
         iteration: int,
-        s_feats: Tensor,  # [N_student, D] student feature tensor
-        t_feats: Tensor,  # [N_teacher, D] teacher feature tensor
+        s_feats: Tensor,                  # [N_student, D_backbone] raw backbone features
+        t_feats: Tensor,                  # [N_teacher, D_backbone] raw backbone features
+        s_head_feats: Tensor | None = None,  # [N_student, D_head] head output (if head present)
+        t_head_feats: Tensor | None = None,  # [N_teacher, D_head] head output (if head present)
     ):
         """
         Compute and log representation-quality statistics.
 
-        s_feats / t_feats are the raw feature tensors from the sparse backbone
-        (already filtered to active voxels — no masking needed here).
+        s_feats / t_feats are the raw 64-dim backbone feature tensors.
+        s_head_feats / t_head_feats are the optional projection head outputs (e.g. 128-dim).
 
-        Computed for both student and teacher. Runs every `debug_every` iterations.
-        Full covariance matrices (64×64) are saved to history for offline heatmap plotting.
+        Runs every `debug_every` iterations. Covariance matrices for both backbone and
+        head (when present) are saved to history for offline heatmap/eigenvalue plotting.
         """
         if not self.enabled or self.logger is None:
             return
@@ -222,13 +225,14 @@ class DINODebugger:
             if s_flat.shape[0] < 2:
                 return
 
-            # make [N_valid, D] into [D, N_valid] with .T
             s_cov_mat = torch.cov(s_flat.T)   # [D, D]
             t_cov_mat = torch.cov(t_flat.T)
 
-            # L2 norm of the feature vector at each valid pixel [N_valid]
             s_norms = s_flat.norm(dim=-1)
             t_norms = t_flat.norm(dim=-1)
+
+            s_head_cov = torch.cov(s_head_feats.detach().float().T).cpu().tolist() if s_head_feats is not None else []
+            t_head_cov = torch.cov(t_head_feats.detach().float().T).cpu().tolist() if t_head_feats is not None else []
 
         self.logger.info(
             f"[iter {iteration:6d}] FEAT_STATS: "
@@ -245,6 +249,8 @@ class DINODebugger:
         h["t_norm_median"].append(t_norms.median().item())
         h["s_cov_mat"].append(s_cov_mat.cpu().tolist())
         h["t_cov_mat"].append(t_cov_mat.cpu().tolist())
+        h["s_head_cov_mat"].append(s_head_cov)
+        h["t_head_cov_mat"].append(t_head_cov)
 
     def log_center_stats(self, iteration: int, loss_fn) -> None:
         """

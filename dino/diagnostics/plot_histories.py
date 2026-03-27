@@ -113,14 +113,21 @@ def plot_loss(data: dict, out_dir: Path):
     print(f"  saved loss_curve.png")
 
 
-def plot_stats(data: dict, out_dir: Path):
+def plot_stats(data: dict, out_dir: Path, label: str = "backbone", mat_key: str = ""):
     h = data.get("stats", {})
     if not h or len(h.get("iter", [])) == 0:
         return
 
+    key_s = f"s_{mat_key}cov_mat" if mat_key else "s_cov_mat"
+    key_t = f"t_{mat_key}cov_mat" if mat_key else "t_cov_mat"
+    raw_s = h.get(key_s, [])
+    raw_t = h.get(key_t, [])
+    if not raw_s or not raw_s[0]:  # head mats are [] when no head was used
+        return
+
     iters = h["iter"]
-    s_mats = [np.array(m) for m in h["s_cov_mat"]]
-    t_mats = [np.array(m) for m in h["t_cov_mat"]]
+    s_mats = [np.array(m) for m in raw_s]
+    t_mats = [np.array(m) for m in raw_t]
 
     s_eigen = compute_eigen(s_mats)
     t_eigen = compute_eigen(t_mats)
@@ -183,70 +190,71 @@ def plot_stats(data: dict, out_dir: Path):
         ax.grid(True, alpha=0.3)
 
     # Row 1: per-feature variance 2D histogram
-    draw_hist2d(axes[1, 0], [np.diag(m) for m in s_mats], "Per-feature variance", "Student Variance  (low → dimensional collapse)")
-    draw_hist2d(axes[1, 1], [np.diag(m) for m in t_mats], "Per-feature variance", "Teacher Variance  (low → dimensional collapse)")
+    draw_hist2d(axes[1, 0], [np.diag(m) for m in s_mats], "Per-feature variance", f"Student Variance [{label}]  (low → dimensional collapse)")
+    draw_hist2d(axes[1, 1], [np.diag(m) for m in t_mats], "Per-feature variance", f"Teacher Variance [{label}]  (low → dimensional collapse)")
 
     # Row 2: participation ratio (scalar)
-    for col, (pr, label) in enumerate([(s_pr, "Student"), (t_pr, "Teacher")]):
+    for col, (pr, role) in enumerate([(s_pr, "Student"), (t_pr, "Teacher")]):
         ax = axes[2, col]
         ax.plot(iters, pr, linewidth=1.5, color=f"C{col}")
         ax.set_ylabel("Effective rank  [1, D]")
-        ax.set_title(f"{label} Participation Ratio  (low → few dominant channels)")
+        ax.set_title(f"{role} Participation Ratio [{label}]  (low → few dominant channels)")
         ax.set_xlabel("Iteration")
         ax.grid(True, alpha=0.3)
 
+    fname = f"feature_stats_{label}.png"
     fig.tight_layout()
-    fig.savefig(out_dir / "feature_stats.png", dpi=300, bbox_inches="tight")
+    fig.savefig(out_dir / fname, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"  saved feature_stats.png")
+    print(f"  saved {fname}")
 
 
-def plot_cov_heatmap(data: dict, out_dir: Path):
+def plot_cov_heatmap(data: dict, out_dir: Path, label: str = "backbone", mat_key: str = ""):
     h = data.get("stats", {})
-    s_mats = h.get("s_cov_mat", [])
-    t_mats = h.get("t_cov_mat", [])
-    if not s_mats:
+    key_s = f"s_{mat_key}cov_mat" if mat_key else "s_cov_mat"
+    key_t = f"t_{mat_key}cov_mat" if mat_key else "t_cov_mat"
+    s_mats = h.get(key_s, [])
+    t_mats = h.get(key_t, [])
+    if not s_mats or not s_mats[0]:
         return
 
     iters = h.get("iter", [])
 
+    def to_corr(mat):
+        std = np.sqrt(np.diag(mat)).clip(1e-8)
+        return mat / np.outer(std, std)
+
     # Pick first and last snapshots (or just one if only one exists)
     snapshots = [(0, "first")] if len(s_mats) == 1 else [(0, "first"), (-1, "last")]
 
-    for idx, label in snapshots:
-        s_cov = np.array(s_mats[idx])
-        t_cov = np.array(t_mats[idx])
-
-        # Normalize to correlation matrix: C[i,j] / sqrt(C[i,i] * C[j,j])
-        def to_corr(mat):
-            std = np.sqrt(np.diag(mat)).clip(1e-8)
-            return mat / np.outer(std, std)
-
-        s_corr = to_corr(s_cov)
-        t_corr = to_corr(t_cov)
+    for idx, snap in snapshots:
+        s_corr = to_corr(np.array(s_mats[idx]))
+        t_corr = to_corr(np.array(t_mats[idx]))
 
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-        title_suffix = f"iter {iters[idx]}" if iters else label
+        title_suffix = f"iter {iters[idx]}" if iters else snap
 
         for ax, corr, name in zip(axes, [s_corr, t_corr], ["Student", "Teacher"]):
             im = ax.imshow(corr, vmin=-1, vmax=1, cmap="RdBu_r", aspect="auto")
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            ax.set_title(f"{name} feature correlation ({title_suffix})")
+            ax.set_title(f"{name} [{label}] feature correlation ({title_suffix})")
             ax.set_xlabel("Feature index")
             ax.set_ylabel("Feature index")
 
         fig.tight_layout()
-        fname = f"cov_heatmap_{label}.png"
+        fname = f"cov_heatmap_{label}_{snap}.png"
         fig.savefig(out_dir / fname, dpi=100, bbox_inches="tight")
         plt.close(fig)
         print(f"  saved {fname}")
 
 
-def plot_eigen(data: dict, out_dir: Path):
+def plot_eigen(data: dict, out_dir: Path, label: str = "backbone", mat_key: str = ""):
     h = data.get("stats", {})
-    s_mats = h.get("s_cov_mat", [])
-    t_mats = h.get("t_cov_mat", [])
-    if not s_mats:
+    key_s = f"s_{mat_key}cov_mat" if mat_key else "s_cov_mat"
+    key_t = f"t_{mat_key}cov_mat" if mat_key else "t_cov_mat"
+    s_mats = h.get(key_s, [])
+    t_mats = h.get(key_t, [])
+    if not s_mats or not s_mats[0]:
         return
 
     iters = h.get("iter", [])
@@ -255,39 +263,36 @@ def plot_eigen(data: dict, out_dir: Path):
     s_eigen = compute_eigen([np.array(m) for m in s_mats])
     t_eigen = compute_eigen([np.array(m) for m in t_mats])
 
-    for idx, label in snapshots:
+    for idx, snap in snapshots:
         s_cov = np.array(s_mats[idx])
         t_cov = np.array(t_mats[idx])
         s_vals, s_vecs = s_eigen[idx]
         t_vals, t_vecs = t_eigen[idx]
 
-        # Covariance in eigenbasis: V.T @ C @ V = diag(eigenvalues), normalized by largest eigenvalue
         s_cov_eigen = (s_vecs.T @ s_cov @ s_vecs) / s_vals[-1]
         t_cov_eigen = (t_vecs.T @ t_cov @ t_vecs) / t_vals[-1]
 
-        title_suffix = f"iter {iters[idx]}" if iters else label
+        title_suffix = f"iter {iters[idx]}" if iters else snap
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-        # Top row: eigenvalue spectra
         for ax, vals, name in zip(axes[0], [s_vals, t_vals], ["Student", "Teacher"]):
             ax.bar(np.arange(len(vals)), vals, width=1.0)
             ax.set_yscale("log")
             ax.set_xlabel("Eigenvalue index (ascending)")
             ax.set_ylabel("Eigenvalue")
-            ax.set_title(f"{name} eigenvalue spectrum ({title_suffix})")
+            ax.set_title(f"{name} [{label}] eigenvalue spectrum ({title_suffix})")
             ax.grid(True, alpha=0.3)
 
-        # Bottom row: covariance heatmap in eigenbasis
         vmax = max(np.abs(s_cov_eigen).max(), np.abs(t_cov_eigen).max())
         for ax, mat, name in zip(axes[1], [s_cov_eigen, t_cov_eigen], ["Student", "Teacher"]):
             im = ax.imshow(mat, vmin=-vmax, vmax=vmax, cmap="RdBu_r", aspect="auto")
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            ax.set_title(f"{name} covariance in eigenbasis ({title_suffix})")
+            ax.set_title(f"{name} [{label}] covariance in eigenbasis ({title_suffix})")
             ax.set_xlabel("Eigenvector index")
             ax.set_ylabel("Eigenvector index")
 
         fig.tight_layout()
-        fname = f"eigen_{label}.png"
+        fname = f"eigen_{label}_{snap}.png"
         fig.savefig(out_dir / fname, dpi=100, bbox_inches="tight")
         plt.close(fig)
         print(f"  saved {fname}")
@@ -412,10 +417,13 @@ def main():
         data = json.load(f)
 
     plot_loss(data, out_dir)
-    plot_stats(data, out_dir)
+    plot_stats(data, out_dir, label="backbone", mat_key="")
+    plot_stats(data, out_dir, label="head", mat_key="head_")
     plot_center_stats(data, out_dir)
-    plot_cov_heatmap(data, out_dir)
-    plot_eigen(data, out_dir)
+    plot_cov_heatmap(data, out_dir, label="backbone", mat_key="")
+    plot_cov_heatmap(data, out_dir, label="head", mat_key="head_")
+    plot_eigen(data, out_dir, label="backbone", mat_key="")
+    plot_eigen(data, out_dir, label="head", mat_key="head_")
     plot_grads(data, out_dir)
 
     print("Done.")
