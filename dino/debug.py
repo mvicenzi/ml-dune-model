@@ -222,6 +222,9 @@ class DINODebugger:
             s_flat = s_feats.detach().float()  # [N_student, D]
             t_flat = t_feats.detach().float()  # [N_teacher, D]
 
+            s_head_flat = s_head_feats.detach().float() if s_head_feats is not None else None
+            t_head_flat = t_head_feats.detach().float() if t_head_feats is not None else None
+
             if s_flat.shape[0] < 2:
                 return
 
@@ -231,8 +234,8 @@ class DINODebugger:
             s_norms = s_flat.norm(dim=-1)
             t_norms = t_flat.norm(dim=-1)
 
-            s_head_cov = torch.cov(s_head_feats.detach().float().T).cpu().tolist() if s_head_feats is not None else []
-            t_head_cov = torch.cov(t_head_feats.detach().float().T).cpu().tolist() if t_head_feats is not None else []
+            s_head_cov = torch.cov(s_head_flat.T) if s_head_flat is not None else None
+            t_head_cov = torch.cov(t_head_flat.T) if t_head_flat is not None else None
 
         self.logger.info(
             f"[iter {iteration:6d}] FEAT_STATS: "
@@ -249,8 +252,8 @@ class DINODebugger:
         h["t_norm_median"].append(t_norms.median().item())
         h["s_cov_mat"].append(s_cov_mat.cpu().tolist())
         h["t_cov_mat"].append(t_cov_mat.cpu().tolist())
-        h["s_head_cov_mat"].append(s_head_cov)
-        h["t_head_cov_mat"].append(t_head_cov)
+        h["s_head_cov_mat"].append(s_head_cov.cpu().tolist() if s_head_cov is not None else [])
+        h["t_head_cov_mat"].append(t_head_cov.cpu().tolist() if t_head_cov is not None else [])
 
     def log_center_stats(self, iteration: int, loss_fn) -> None:
         """

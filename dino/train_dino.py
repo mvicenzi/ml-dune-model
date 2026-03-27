@@ -46,7 +46,7 @@ def validate_epoch(model, val_loader, masker, loss_fn, device):
         data = data.to(device)
         xs = model.from_dense(data)
         xs_student, kept_indices = masker(xs)
-        teacher_out = model.encode_teacher(xs)
+        _ , teacher_out = model.encode_teacher(xs)
         student_backbone_out, student_out = model.encode_student(xs_student)
         loss, _, _, _, _ = loss_fn(student_out, student_backbone_out, teacher_out, kept_indices)
         total_loss += loss.item()
@@ -310,7 +310,7 @@ def main(
 
             # Forward + backward
             optimizer.zero_grad()
-            loss_val, teacher_entropy, student_entropy, kl, cov_penalty, student_backbone_out, student_out, teacher_out = model.forward_backward(data, masker, loss_fn)
+            loss_val, teacher_entropy, student_entropy, kl, cov_penalty, student_backbone_out, teacher_backbone_out, student_out, teacher_out = model.forward_backward(data, masker, loss_fn)
             optimizer.step()
 
             # EMA teacher update
@@ -331,19 +331,19 @@ def main(
             # Pass head features separately when a head is present (student_out != student_backbone_out)
             s_head_feats = student_out.feature_tensor if model.student_head is not None else None
             t_head_feats = teacher_out.feature_tensor if model.teacher_head is not None else None
-            debugger.log_feature_stats(iteration, student_backbone_out.feature_tensor, teacher_out.feature_tensor,
+            debugger.log_feature_stats(iteration, student_backbone_out.feature_tensor, teacher_backbone_out.feature_tensor,
                                         s_head_feats, t_head_feats)
 
             # First batch: log tensor shapes
             if first_batch:
-                debugger.log_shapes(data, student_backbone_out.feature_tensor, teacher_out.feature_tensor)
+                debugger.log_shapes(data, student_backbone_out.feature_tensor, teacher_backbone_out.feature_tensor)
                 first_batch = False
 
             # Periodically persist histories to disk
             debugger.maybe_save_histories(iteration)
 
             # Free Voxels objects to release GPU memory before the next forward pass
-            del student_backbone_out, student_out, teacher_out
+            del student_backbone_out, student_out, teacher_backbone_out, teacher_out
 
             if (batch_idx + 1) % 50 == 0 or batch_idx == 0:
                 print(f"[{epoch}/{epochs}] iter {iteration}: loss={loss_val:.6f}, "

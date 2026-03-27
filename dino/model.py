@@ -103,10 +103,10 @@ class DINODuneModel(nn.Module):
 
     def encode_teacher(self, xs: Voxels) -> Voxels:
         """Run the teacher backbone (+ head if present). Always called in no_grad context."""
-        out = self.teacher(xs)
+        backbone_out = self.teacher(xs)
         if self.teacher_head is not None:
-            out = self.teacher_head(out)
-        return out
+            return backbone_out, self.teacher_head(backbone_out)
+        return backbone_out, backbone_out
 
     def encode_student(self, xs: Voxels) -> tuple[Voxels, Voxels]:
         """
@@ -148,7 +148,7 @@ class DINODuneModel(nn.Module):
 
         # Teacher forward (full Voxels, frozen, no grad)
         with torch.no_grad():
-            teacher_out = self.encode_teacher(xs)
+            teacher_backbone_out, teacher_out = self.encode_teacher(xs)
 
         # Student forward (masked Voxels, trainable)
         student_backbone_out, student_out = self.encode_student(xs_student)
@@ -157,4 +157,4 @@ class DINODuneModel(nn.Module):
         loss, teacher_entropy, student_entropy, kl, cov_penalty = loss_fn(student_out, student_backbone_out, teacher_out, kept_indices)
         loss.backward()
 
-        return loss.item(), teacher_entropy, student_entropy, kl, cov_penalty, student_backbone_out, student_out, teacher_out
+        return loss.item(), teacher_entropy, student_entropy, kl, cov_penalty, student_backbone_out, teacher_backbone_out, student_out, teacher_out
