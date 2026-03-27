@@ -27,12 +27,19 @@ class DINOConfig:
     warmup_epochs: int = 5           # linear LR warmup duration
     epochs: int = 100                # total training epochs
 
+    # ============ Projection head ============
+    use_proj_head: bool = False         # attach MLP projection head between backbone and loss
+    proj_head_hidden_dim: int = 256     # inner MLP width (DINO paper uses 2048)
+    proj_head_output_dim: int = 256     # output dimension of the final FC layer
+    proj_head_n_layers: int = 4         # number of MLP layers before the final FC
+
     # ============ Loss ============
     loss_type: str = "cosine"    # "cosine", "mse", or "dino"
     center_momentum: float = 0.9  # EMA decay for teacher centering
     use_centering: bool = True    # subtract running center from teacher before loss
     teacher_temp: float = 1.0    # teacher softmax temperature (only used for "dino")
     student_temp: float = 1.0    # student softmax temperature (only used for "dino")
+    normalize_features: bool = True   # L2-normalise student+teacher features before loss; set to False when use_proj_head=True (head normalises internally)
     use_cov_penalty: bool = False    # add VICReg covariance decorrelation penalty
     cov_penalty_weight: float = 1e-3  # weight for the covariance penalty term
 

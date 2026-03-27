@@ -37,6 +37,7 @@ class PixelDINOLoss(nn.Module):
         use_centering: bool = True,
         teacher_temp: float = 1.0,
         student_temp: float = 1.0,
+        normalize_features: bool = True,
         use_cov_penalty: bool = False,
         cov_penalty_weight: float = 1e-3,
     ):
@@ -48,6 +49,9 @@ class PixelDINOLoss(nn.Module):
                                  computing the loss; the center buffer is always updated regardless
             teacher_temp:        softmax temperature for teacher logits (only used for "dino")
             student_temp:        softmax temperature for student logits (only used for "dino")
+            normalize_features:  if True, L2-normalise student and teacher features before the
+                                 loss; set to False when a projection head is used (the head's
+                                 internal L2 norm already normalises the features)
             use_cov_penalty:     if True, add a VICReg-style covariance decorrelation penalty on
                                  student features to prevent dimensional collapse
             cov_penalty_weight:  scalar weight for the covariance penalty term (default 1e-3)
@@ -59,6 +63,7 @@ class PixelDINOLoss(nn.Module):
         self.use_centering = use_centering
         self.teacher_temp = teacher_temp
         self.student_temp = student_temp
+        self.normalize_features = normalize_features
         self.use_cov_penalty = use_cov_penalty
         self.cov_penalty_weight = cov_penalty_weight
         # Lazily initialized on first forward call once feature dim D is known.
@@ -130,8 +135,10 @@ class PixelDINOLoss(nn.Module):
         if self.use_centering:
             t = t - self.center
 
-        # For dino loss: L2-normalize to unit sphere so scale-invariant
-        if self.loss_type == "dino":
+        # For dino loss: L2-normalize to unit sphere so scale-invariant.
+        # normalize_features=False skips this when a projection head is used
+        # (the head's internal L2 norm already puts features on the sphere).
+        if self.loss_type == "dino" and self.normalize_features:
             s = F.normalize(s, dim=-1)
             t = F.normalize(t, dim=-1)
 

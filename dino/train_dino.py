@@ -46,8 +46,8 @@ def validate_epoch(model, val_loader, masker, loss_fn, device):
         data = data.to(device)
         xs = model.from_dense(data)
         xs_student, kept_indices = masker(xs)
-        teacher_out = model.teacher(xs)
-        student_out = model.student(xs_student)
+        teacher_out = model.encode_teacher(xs)
+        student_out = model.encode_student(xs_student)
         loss, _, _, _, _ = loss_fn(student_out, teacher_out, kept_indices)
         total_loss += loss.item()
         n_batches += 1
@@ -67,6 +67,10 @@ def main(
     use_centering: bool = True,
     teacher_temp: float = 1.0,
     student_temp: float = 1.0,
+    use_proj_head: bool = False,
+    proj_head_hidden_dim: int = 256,
+    proj_head_output_dim: int = 256,
+    proj_head_n_layers: int = 4,
     use_cov_penalty: bool = False,
     cov_penalty_weight: float = 1e-3,
     momentum_start: float = 0.996,
@@ -98,6 +102,10 @@ def main(
         use_centering: subtract running center from teacher features before loss
         teacher_temp: teacher softmax temperature (only used for "dino")
         student_temp: student softmax temperature (only used for "dino")
+        use_proj_head: attach DINO MLP projection head between backbone and loss
+        proj_head_hidden_dim: inner MLP width of the projection head
+        proj_head_output_dim: output dimension of the projection head's final FC layer
+        proj_head_n_layers: number of MLP layers before the final FC
         use_cov_penalty: add VICReg covariance decorrelation penalty on student features
         cov_penalty_weight: weight for the covariance penalty term
         momentum_start: Initial EMA momentum
@@ -125,10 +133,19 @@ def main(
         output_dir = f"{output_dir}/{run_name}"
 
     # Build config
+    # normalize_features is the negation of use_proj_head:
+    # the head's internal L2 norm handles normalisation when the head is active.
+    normalize_features = not use_proj_head
+
     cfg = DINOConfig(
         backbone_name=backbone_name,
         mask_ratio=mask_ratio,
+        use_proj_head=use_proj_head,
+        proj_head_hidden_dim=proj_head_hidden_dim,
+        proj_head_output_dim=proj_head_output_dim,
+        proj_head_n_layers=proj_head_n_layers,
         loss_type=loss_type,
+        normalize_features=normalize_features,
         center_momentum=center_momentum,
         use_centering=use_centering,
         teacher_temp=teacher_temp,
@@ -153,8 +170,11 @@ def main(
     )
 
     print(f"Device: {device}")
-    print(f"Config: backbone={cfg.backbone_name}, mask_ratio={cfg.mask_ratio}, "
-          f"lr={cfg.lr}, epochs={cfg.epochs}, batch_size={cfg.batch_size}, warmup_epochs={cfg.warmup_epochs}, "
+    print(f"Model: backbone_name={cfg.backbone_name}, use_proj_head={cfg.use_proj_head}, "
+          f"proj_head_hidden_dim={cfg.proj_head_hidden_dim}, proj_head_output_dim={cfg.proj_head_output_dim}, "
+          f"proj_head_n_layers={cfg.proj_head_n_layers}")
+    print(f"Config: mask_ratio={cfg.mask_ratio}, epochs={cfg.epochs}, "
+          f"lr={cfg.lr}, batch_size={cfg.batch_size}, warmup_epochs={cfg.warmup_epochs}, "
           f" momentum_start={cfg.momentum_start}, momentum_end={cfg.momentum_end}")
     print(f'Loss: type={cfg.loss_type}, center_momentum={cfg.center_momentum}, '
           f'use_centering={cfg.use_centering}, teacher_temp={cfg.teacher_temp}, '
@@ -206,12 +226,23 @@ def main(
 
     # ============ Model, optimizer, loss ============
     print("\nBuilding model...")
-    model = DINODuneModel(backbone_name=backbone_name).to(device)
-    optimizer = optim.AdamW(model.student.parameters(), lr=lr, weight_decay=weight_decay)
+    model = DINODuneModel(
+        backbone_name=backbone_name,
+        use_proj_head=use_proj_head,
+        proj_head_hidden_dim=proj_head_hidden_dim,
+        proj_head_output_dim=proj_head_output_dim,
+        proj_head_n_layers=proj_head_n_layers,
+    ).to(device)
+    # Optimise backbone + head (if present)
+    student_params = list(model.student.parameters())
+    if model.student_head is not None:
+        student_params += list(model.student_head.parameters())
+    optimizer = optim.AdamW(student_params, lr=lr, weight_decay=weight_decay)
 
     masker = SparseVoxelMasker(mask_ratio=mask_ratio)
     loss_fn = PixelDINOLoss(
         loss_type=cfg.loss_type,
+        normalize_features=cfg.normalize_features,
         center_momentum=cfg.center_momentum,
         use_centering=cfg.use_centering,
         teacher_temp=cfg.teacher_temp,
