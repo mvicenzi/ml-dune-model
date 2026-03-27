@@ -10,7 +10,7 @@ from warpconvnet.geometry.coords.integer import IntCoords
 from warpconvnet.geometry.features.cat import CatFeatures
 from warpconvnet.nn.modules.sparse_conv import SparseConv2d
 
-from .minkunet_attention import MinkUNetSparseAttentionCore
+from .minkunet_attention import MinkUNetSparseAttention as MinkUNetSparseAttentionCore
 
 
 # ---------------------------------------------------------------------------
