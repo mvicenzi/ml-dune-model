@@ -75,7 +75,7 @@ from models.sparse_masking import sparse_block_mask
 from loader.apa_sparse_dataset import APASparseDataset
 from loader.apa_sparse_meta_dataset import APASparseMetaDataset, CLASS_NAMES
 from loader.collate import voxels_collate_fn, voxels_label_collate_fn
-from metrics_monitor import MetricsMonitor
+from legacy.metrics_monitor import MetricsMonitor
 
 
 # ---------------------------------------------------------------------------
