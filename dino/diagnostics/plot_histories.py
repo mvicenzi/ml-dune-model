@@ -79,7 +79,7 @@ def plot_loss(data: dict, out_dir: Path):
     if has_components:
         ax_comp = axes[next_row]
         next_row += 1
-        K = 64  # feature dimension (number of softmax categories)
+        K = 128  # feature dimension (number of softmax categories)
         h_max = np.log(K)  # -log(1/K) = log(K): entropy of a uniform distribution over K dims
         ax_comp.plot(t_ent_iters, t_ent_vals, linewidth=1.0, alpha=0.8,
                      color="C2", label="Teacher entropy  H(P_t)")
