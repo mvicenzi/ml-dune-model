@@ -1,8 +1,9 @@
 # loader/apa_sparse_dataset.py
 
+import hashlib
 import h5py
 from pathlib import Path
-from typing import List, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.utils.data import Dataset
@@ -13,28 +14,36 @@ from warpconvnet.geometry.features.cat import CatFeatures
 
 from loader.apa_dataset import APASampleIndex
 
+# Default channel ranges for each wire-plane view.
+# Channels 0-799 → U plane, 800-1599 → V plane, 1600-2649 → W plane.
+DEFAULT_VIEW_RANGES: Dict[str, Tuple[int, int]] = {
+    "U": (0, 800),
+    "V": (800, 1600),
+    "W": (1600, 2650),
+}
+
 
 class APASparseDataset(Dataset):
     """
     Dataset that:
-      - scans recursively for sparse HDF5 files ending with anode<APA>.h5
-      - treats each /<group>/frame_rebinned_reco as an independent sparse sample
+      - scans recursively for sparse HDF5 files matching *anode<APA>.h5
+        (matches both old "…anode3.h5" and new "…pixeldata-anode3.h5" naming)
+      - treats each /<group>/<frame_name> as an independent sparse sample
       - selects only one view (U, V, or W) by filtering on the channel coordinate
       - returns a single-item Voxels object per sample
-      - caches the index to disk
+      - caches the index to disk; cache filename encodes rootdir so different
+        datasets never share the same cache file
 
     Expected sparse HDF5 structure per group:
-        /<group>/frame_rebinned_reco/coords    (N, 2) int32  — (channel, tick)
-        /<group>/frame_rebinned_reco/features  (N,)   float32
+        /<group>/<frame_name>/coords    (N, 2) int32  — (channel, tick)
+        /<group>/<frame_name>/features  (N,)   float32
+
+    Structured-folder layout (new datasets):
+        root_dir/{run}/{subrun}/{event}/out_{basename}/
+            {basename}_pixeldata-anode{N}.h5
+            {basename}_metadata.h5
+    The recursive glob handles arbitrary nesting depth automatically.
     """
-
-    VIEW_RANGES = {
-        "U": (0, 800),
-        "V": (800, 1600),
-        "W": (1600, 2650),
-    }
-
-    FRAME_NAME = "frame_rebinned_reco"
 
     def __init__(
         self,
@@ -43,23 +52,53 @@ class APASparseDataset(Dataset):
         view: str,
         use_cache: bool = True,
         cache_dir: Union[str, Path] = "./data",
+        view_ranges: Optional[Dict[str, Tuple[int, int]]] = None,
+        frame_name: str = "frame_rebinned_reco",
     ):
-        self.rootdir = Path(rootdir)
-        self.apa = int(apa)
+        """
+        Args:
+            rootdir:     Root directory to scan recursively for HDF5 files.
+            apa:         APA number (matched against the filename suffix).
+            view:        Wire-plane view to load — one of the keys in view_ranges
+                         (default: "U", "V", or "W").
+            use_cache:   Load/save the file index from/to a .pt cache file.
+            cache_dir:   Directory for cache files.
+            view_ranges: Mapping from view name → (ch_start, ch_end) channel range.
+                         Defaults to DEFAULT_VIEW_RANGES.  Override this for
+                         detector geometries with different channel assignments.
+            frame_name:  HDF5 group key that holds the sparse frame data
+                         (coords + features).  Defaults to "frame_rebinned_reco".
+                         Other options in new files: "frame_pid_1st",
+                         "frame_trackid_1st", etc.
+        """
+        self.rootdir   = Path(rootdir)
+        self.apa       = int(apa)
+        self.frame_name = frame_name
+
+        self.view_ranges: Dict[str, Tuple[int, int]] = (
+            view_ranges if view_ranges is not None else DEFAULT_VIEW_RANGES
+        )
 
         self.view = view.upper()
-        if self.view not in self.VIEW_RANGES:
-            raise ValueError(f"view must be one of {list(self.VIEW_RANGES)}, got {view}")
+        if self.view not in self.view_ranges:
+            raise ValueError(
+                f"view must be one of {list(self.view_ranges)}, got {view!r}"
+            )
 
-        self.ch_start, self.ch_end = self.VIEW_RANGES[self.view]
+        self.ch_start, self.ch_end = self.view_ranges[self.view]
 
         self.use_cache = use_cache
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
 
+        # Include a short hash of the resolved rootdir so that two datasets
+        # with the same APA/view but different paths never share a cache file.
+        root_hash = hashlib.md5(
+            str(self.rootdir.resolve()).encode()
+        ).hexdigest()[:8]
         self.cache_file = (
             self.cache_dir
-            / f"APASparseDataset_APA{self.apa}_view{self.view}_cache.pt"
+            / f"APASparseDataset_APA{self.apa}_view{self.view}_{root_hash}_cache.pt"
         )
 
         self.samples: List[APASampleIndex] = self._scan()
@@ -104,9 +143,9 @@ class APASparseDataset(Dataset):
                         grp = f[group]
                         if not isinstance(grp, h5py.Group):
                             continue
-                        if self.FRAME_NAME not in grp:
+                        if self.frame_name not in grp:
                             continue
-                        frame_entry = grp[self.FRAME_NAME]
+                        frame_entry = grp[self.frame_name]
                         # Accept only sparse format: subgroup with coords and features
                         if (
                             isinstance(frame_entry, h5py.Group)
@@ -137,7 +176,7 @@ class APASparseDataset(Dataset):
         s = self.samples[idx]
 
         with h5py.File(s.path, "r") as f:
-            frame = f[s.group][self.FRAME_NAME]
+            frame = f[s.group][self.frame_name]
             coords = torch.from_numpy(frame["coords"][()]).to(torch.int32)   # (N, 2)
             feats  = torch.from_numpy(frame["features"][()]).to(torch.float32)  # (N,)
 

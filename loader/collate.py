@@ -31,3 +31,17 @@ def voxels_collate_fn(batch):
         batched_features=CatFeatures(feats_cat, offsets=offsets),
         offsets=offsets,
     )
+
+
+def voxels_label_collate_fn(batch):
+    """
+    Collate a list of (Voxels, int) tuples into (batched_Voxels, LongTensor).
+
+    Used with APASparseMetaDataset for supervised fine-tuning DataLoaders.
+
+    Usage:
+        from loader.collate import voxels_label_collate_fn
+        loader = DataLoader(dataset, batch_size=8, collate_fn=voxels_label_collate_fn)
+    """
+    voxels_list, labels = zip(*batch)
+    return voxels_collate_fn(list(voxels_list)), torch.tensor(labels, dtype=torch.long)

@@ -1,0 +1,7 @@
+__pycache__
+data
+checkpoints*
+metrics
+viz*
+run_*
+*.swp
