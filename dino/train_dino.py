@@ -407,7 +407,7 @@ def from_config(
     # Build kwargs: only keep JSON keys that main() understands
     kwargs = {k: v for k, v in raw.items() if k in valid_params}
 
-    # The JSON stores debug_dir as the fully-nested path (debug_dir/run_name).
+    # The JSON stores debug_dir and output_dir as fully-nested paths (base/run_name).
     # main() will re-append run_name, so we strip the suffix here to avoid
     # double-nesting.  We use the original run_name from the JSON for this,
     # before any CLI override is applied.
@@ -415,6 +415,9 @@ def from_config(
     stored_debug_dir = kwargs.get("debug_dir", "")
     if orig_run_name and stored_debug_dir.endswith("/" + orig_run_name):
         kwargs["debug_dir"] = stored_debug_dir[: -len("/" + orig_run_name)]
+    stored_output_dir = kwargs.get("output_dir", "")
+    if orig_run_name and stored_output_dir.endswith("/" + orig_run_name):
+        kwargs["output_dir"] = stored_output_dir[: -len("/" + orig_run_name)]
 
     # CLI-level overrides always win
     if run_name:
