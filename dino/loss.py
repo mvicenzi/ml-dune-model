@@ -135,9 +135,10 @@ class PixelDINOLoss(nn.Module):
             s = F.normalize(s, dim=-1)
             t = F.normalize(t, dim=-1)
 
-        # teacher_entropy_px and kl_px are only set in the dino branch;
-        # initialize to None so they have a defined value for the other loss types.
+        # teacher_entropy_px, student_entropy_px, and kl_px are only set in the dino
+        # branch; initialize to None so they have a defined value for the other loss types.
         teacher_entropy_px = None
+        student_entropy_px = None
         kl_px = None
 
         # Compute per-pixel loss [N_valid]
@@ -154,7 +155,9 @@ class PixelDINOLoss(nn.Module):
             loss = -(t_prob * s_logp).sum(dim=-1)                  # H(P_t, P_s) [N_valid]
 
             # decompose loss into teacher entropy and KL divergence for diagnostics:
+            s_prob = F.softmax(s / self.student_temp, dim=-1)      # [N_valid, D]
             teacher_entropy_px = -(t_prob * t_logp).sum(dim=-1)    # H(P_t)      [N_valid]
+            student_entropy_px = -(s_prob * s_logp).sum(dim=-1)    # H(P_s)      [N_valid]
             kl_px = loss - teacher_entropy_px                      # KL(P_t|P_s)[N_valid]
 
         # Optional covariance decorrelation penalty on student features
@@ -181,14 +184,19 @@ class PixelDINOLoss(nn.Module):
             per_image_t_ent.scatter_add_(0, batch_idx, teacher_entropy_px)
             t_ent = (per_image_t_ent / counts.clamp(min=1.0))[counts > 0].mean().item()
 
+            per_image_s_ent = torch.zeros(B, device=loss.device, dtype=loss.dtype)
+            per_image_s_ent.scatter_add_(0, batch_idx, student_entropy_px)
+            s_ent = (per_image_s_ent / counts.clamp(min=1.0))[counts > 0].mean().item()
+
             per_image_kl = torch.zeros(B, device=loss.device, dtype=loss.dtype)
             per_image_kl.scatter_add_(0, batch_idx, kl_px)
             kl = (per_image_kl / counts.clamp(min=1.0))[counts > 0].mean().item()
         else:
             t_ent = None
+            s_ent = None
             kl = None
 
-        return scalar_loss, t_ent, kl, cov_penalty_item
+        return scalar_loss, t_ent, s_ent, kl, cov_penalty_item
 
     def _cov_penalty(self, s: Tensor) -> Tensor:
         """

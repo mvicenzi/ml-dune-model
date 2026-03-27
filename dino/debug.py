@@ -27,6 +27,7 @@ class DINODebugger:
     History file (histories.json):
     - loss:            [float, ...]                      per-batch train loss
     - teacher_entropy: [float|null, ...]                 per-batch H(P_t)       (dino only, else null)
+    - student_entropy: [float|null, ...]                 per-batch H(P_s)       (dino only, else null)
     - kl:              [float|null, ...]                 per-batch KL(P_t||P_s) (dino only, else null)
     - cov_penalty:     [float|null, ...]                 per-batch raw covariance penalty (if enabled, else null)
     - val:    {iter: [...], loss: [...]}         per-epoch val loss
@@ -41,6 +42,7 @@ class DINODebugger:
         self.logger = None
         self.loss_history = [] if self.enabled else None
         self.teacher_entropy_history = [] if self.enabled else None
+        self.student_entropy_history = [] if self.enabled else None
         self.kl_history = [] if self.enabled else None
         self.cov_penalty_history = [] if self.enabled else None
 
@@ -118,6 +120,7 @@ class DINODebugger:
         lr: float,
         momentum: float,
         teacher_entropy: float | None = None,
+        student_entropy: float | None = None,
         kl: float | None = None,
         cov_penalty: float | None = None,
     ):
@@ -126,7 +129,7 @@ class DINODebugger:
             return
         extra = ""
         if teacher_entropy is not None and kl is not None:
-            extra = f" teacher_entropy={teacher_entropy:.6f} kl={kl:.6f}"
+            extra = f" teacher_entropy={teacher_entropy:.6f} student_entropy={student_entropy:.6f} kl={kl:.6f}"
         if cov_penalty is not None:
             extra += f" cov_penalty={cov_penalty:.6f}"
         self.logger.info(
@@ -137,6 +140,8 @@ class DINODebugger:
             self.loss_history.append(loss)
         if self.teacher_entropy_history is not None:
             self.teacher_entropy_history.append(teacher_entropy)
+        if self.student_entropy_history is not None:
+            self.student_entropy_history.append(student_entropy)
         if self.kl_history is not None:
             self.kl_history.append(kl)
         if self.cov_penalty_history is not None:
@@ -164,6 +169,7 @@ class DINODebugger:
         JSON structure:
           loss:            [float, ...]                      per-batch train loss
           teacher_entropy: [float|null, ...]                 per-batch H(P_t)       (dino only, else null)
+          student_entropy: [float|null, ...]                 per-batch H(P_s)       (dino only, else null)
           kl:              [float|null, ...]                 per-batch KL(P_t||P_s) (dino only, else null)
           cov_penalty:     [float|null, ...]                 per-batch raw covariance penalty (if enabled, else null)
           val:             {iter: [...], loss: [...]}        per-epoch val loss
@@ -175,6 +181,7 @@ class DINODebugger:
         data = {
             "loss":             self.loss_history             or [],
             "teacher_entropy":  self.teacher_entropy_history  or [],
+            "student_entropy":  self.student_entropy_history  or [],
             "kl":               self.kl_history               or [],
             "cov_penalty":      self.cov_penalty_history      or [],
             "val":              self.val_history               or {},
