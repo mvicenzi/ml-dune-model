@@ -363,6 +363,9 @@ def main(
                 "optimizer": optimizer.state_dict(),
                 "cfg": cfg,
             }
+            if model.student_head is not None:
+                ckpt["student_head"] = model.student_head.state_dict()
+                ckpt["teacher_head"] = model.teacher_head.state_dict()
             ckpt_path = output_dir / f"checkpoint_epoch{epoch}.pt"
             torch.save(ckpt, ckpt_path)
             print(f"Saved checkpoint: {ckpt_path}")

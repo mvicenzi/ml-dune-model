@@ -59,7 +59,7 @@ def _pr(vals: np.ndarray) -> float:
 # Plot 1: covariance + correlation matrices
 # ---------------------------------------------------------------------------
 
-def plot_cov_and_corr(s_cov: np.ndarray, t_cov: np.ndarray, out_dir: Path, tag: str):
+def plot_cov_and_corr(s_cov: np.ndarray, t_cov: np.ndarray, out_dir: Path, tag: str, name: str = "backbone"):
     s_corr = _to_corr(s_cov)
     t_corr = _to_corr(t_cov)
 
@@ -67,25 +67,25 @@ def plot_cov_and_corr(s_cov: np.ndarray, t_cov: np.ndarray, out_dir: Path, tag: 
 
     # Row 0: covariance matrices — each uses its own colour scale so small
     # values (e.g. student) are not crushed by a larger-magnitude counterpart
-    for ax, mat, name in zip(axes[0], [s_cov, t_cov], ["Student", "Teacher"]):
+    for ax, mat, role in zip(axes[0], [s_cov, t_cov], ["Student", "Teacher"]):
         vmax_cov = np.abs(mat).max()
         im = ax.imshow(mat, vmin=-vmax_cov, vmax=vmax_cov, cmap="RdBu_r", aspect="auto")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ax.set_title(f"{name} covariance matrix")
+        ax.set_title(f"{role} covariance matrix")
         ax.set_xlabel("Feature index")
         ax.set_ylabel("Feature index")
 
     # Row 1: correlation matrices
-    for ax, mat, name in zip(axes[1], [s_corr, t_corr], ["Student", "Teacher"]):
+    for ax, mat, role in zip(axes[1], [s_corr, t_corr], ["Student", "Teacher"]):
         im = ax.imshow(mat, vmin=-1, vmax=1, cmap="RdBu_r", aspect="auto")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ax.set_title(f"{name} correlation matrix")
+        ax.set_title(f"{role} correlation matrix")
         ax.set_xlabel("Feature index")
         ax.set_ylabel("Feature index")
 
-    fig.suptitle(f"Feature covariance / correlation  [{tag}]", fontsize=13)
+    fig.suptitle(f"Feature covariance / correlation  [{name}]  [{tag}]", fontsize=13)
     fig.tight_layout()
-    fname = "features_cov_corr.png"
+    fname = f"features_{name}_cov_corr.png"
     fig.savefig(out_dir / fname, dpi=100, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved {fname}")
@@ -95,13 +95,13 @@ def plot_cov_and_corr(s_cov: np.ndarray, t_cov: np.ndarray, out_dir: Path, tag: 
 # Plot 2: eigenvalue spectrum + covariance in eigenbasis
 # ---------------------------------------------------------------------------
 
-def plot_eigen(s_cov: np.ndarray, t_cov: np.ndarray, out_dir: Path, tag: str):
+def plot_eigen(s_cov: np.ndarray, t_cov: np.ndarray, out_dir: Path, tag: str, name: str = "backbone"):
     s_vals, s_vecs = _eigh(s_cov)
     t_vals, t_vecs = _eigh(t_cov)
 
     s_pr = _pr(s_vals)
     t_pr = _pr(t_vals)
-    print(f"  Participation ratio — student: {s_pr:.2f}  teacher: {t_pr:.2f}  (max={s_cov.shape[0]})")
+    print(f"  [{name}] Participation ratio — student: {s_pr:.2f}  teacher: {t_pr:.2f}  (max={s_cov.shape[0]})")
 
     # Covariance in eigenbasis, normalised by the largest eigenvalue so the
     # colour scale is comparable across runs (identical to plot_histories.py)
@@ -111,26 +111,26 @@ def plot_eigen(s_cov: np.ndarray, t_cov: np.ndarray, out_dir: Path, tag: str):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
     # Row 0: eigenvalue spectra
-    for ax, vals, pr, name in zip(axes[0], [s_vals, t_vals], [s_pr, t_pr], ["Student", "Teacher"]):
+    for ax, vals, pr, role in zip(axes[0], [s_vals, t_vals], [s_pr, t_pr], ["Student", "Teacher"]):
         ax.bar(np.arange(len(vals)), vals, width=1.0)
         ax.set_yscale("log")
         ax.set_xlabel("Eigenvalue index (ascending)")
         ax.set_ylabel("Eigenvalue")
-        ax.set_title(f"{name} eigenvalue spectrum  (PR = {pr:.1f})")
+        ax.set_title(f"{role} eigenvalue spectrum  (PR = {pr:.1f})")
         ax.grid(True, alpha=0.3)
 
     # Row 1: covariance in eigenbasis — per-matrix scale for the same reason
-    for ax, mat, name in zip(axes[1], [s_cov_eig, t_cov_eig], ["Student", "Teacher"]):
+    for ax, mat, role in zip(axes[1], [s_cov_eig, t_cov_eig], ["Student", "Teacher"]):
         vmax = np.abs(mat).max()
         im = ax.imshow(mat, vmin=-vmax, vmax=vmax, cmap="RdBu_r", aspect="auto")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ax.set_title(f"{name} covariance in eigenbasis  (normalised)")
+        ax.set_title(f"{role} covariance in eigenbasis  (normalised)")
         ax.set_xlabel("Eigenvector index")
         ax.set_ylabel("Eigenvector index")
 
-    fig.suptitle(f"Eigenvalue decomposition  [{tag}]", fontsize=13)
+    fig.suptitle(f"Eigenvalue decomposition  [{name}]  [{tag}]", fontsize=13)
     fig.tight_layout()
-    fname = "features_eigen.png"
+    fname = f"features_{name}_eigen.png"
     fig.savefig(out_dir / fname, dpi=100, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved {fname}")
@@ -252,9 +252,14 @@ def main():
 
     print(f"Loading {npz_path}")
     data = np.load(npz_path)
-    s_feats = data["student_features"]   # [N_valid, D]
-    t_feats = data["teacher_features"]   # [N_valid, D]
-    print(f"  Valid pixels: {s_feats.shape[0]}   Feature dim: {s_feats.shape[1]}")
+    s_feats = data["student_features"]   # [N_valid, D_bb]
+    t_feats = data["teacher_features"]   # [N_valid, D_bb]
+    print(f"  Valid pixels: {s_feats.shape[0]}   Backbone dim: {s_feats.shape[1]}")
+
+    s_head_feats = data["student_head_features"] if "student_head_features" in data else None
+    t_head_feats = data["teacher_head_features"] if "teacher_head_features" in data else None
+    if s_head_feats is not None:
+        print(f"  Head dim: {s_head_feats.shape[1]}")
 
     tag = npz_path.stem   # e.g. "features_ep10"
 
@@ -263,8 +268,14 @@ def main():
     t_cov = _compute_cov(t_feats)
 
     print(f"Saving plots to {out_dir}/")
-    plot_cov_and_corr(s_cov, t_cov, out_dir, tag)
-    plot_eigen(s_cov, t_cov, out_dir, tag)
+    plot_cov_and_corr(s_cov, t_cov, out_dir, tag, name="backbone")
+    plot_eigen(s_cov, t_cov, out_dir, tag, name="backbone")
+
+    if s_head_feats is not None:
+        s_head_cov = _compute_cov(s_head_feats)
+        t_head_cov = _compute_cov(t_head_feats)
+        plot_cov_and_corr(s_head_cov, t_head_cov, out_dir, tag, name="head")
+        plot_eigen(s_head_cov, t_head_cov, out_dir, tag, name="head")
 
     if "positions" in data and "offsets" in data and "labels" in data:
         positions = data["positions"]   # [N_valid, 2]
