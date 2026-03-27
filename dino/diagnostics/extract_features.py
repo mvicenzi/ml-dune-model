@@ -30,6 +30,7 @@ from loader.dataset import DUNEImageDataset
 from loader.splits import Subset
 from models import BACKBONE_REGISTRY
 from dino.config import DINOConfig
+from warpconvnet.geometry.types.voxels import Voxels
 
 
 def _load_backbone(ckpt: dict, key: str, device: torch.device):
@@ -47,32 +48,33 @@ def _run_loader(student, teacher, loader, device):
     """
     Run both student and teacher over the loader.
 
-    Returns three flat arrays: student_features, teacher_features, labels,
+    Returns flat arrays: student_features, teacher_features, labels,
     positions — one row per valid (non-zero) pixel across the whole dataset.
     """
     s_feats_all, t_feats_all, labels_all, pos_all, offsets = [], [], [], [], [0]
 
     for images, labels in loader:
         images = images.to(device)          # [B, 1, H, W]
-        active = images.squeeze(1) != 0     # [B, H, W]  — valid pixel mask
 
-        s_out = student(images)             # [B, D, H, W]
-        t_out = teacher(images)
+        # Convert dense → sparse; coords are (row, col) for active pixels
+        xs = Voxels.from_dense(images)      # Voxels: N_active voxels across batch
 
-        # [B, H, W, D] — easier to index by spatial mask
-        s_hwc = s_out.permute(0, 2, 3, 1).float()
-        t_hwc = t_out.permute(0, 2, 3, 1).float()
+        s_out = student(xs)                 # Voxels [N_active, D]
+        t_out = teacher(xs)                 # Voxels [N_active, D]
 
-        # Flatten across batch: collect each image's valid pixels
+        coords   = xs.coordinate_tensor.cpu()              # [N_active, 2]
+        s_feats  = s_out.feature_tensor.float().cpu()      # [N_active, D]
+        t_feats  = t_out.feature_tensor.float().cpu()      # [N_active, D]
+        img_offs = xs.offsets.cpu()                        # [B+1]
+
         for b in range(images.shape[0]):
-            m = active[b]                                    # [H, W]
-            n = m.sum().item()
+            start = int(img_offs[b])
+            end   = int(img_offs[b + 1])
+            n     = end - start
 
-            s_feats_all.append(s_hwc[b][m].cpu().numpy())   # [n, D]
-            t_feats_all.append(t_hwc[b][m].cpu().numpy())
-
-            rows, cols = m.nonzero(as_tuple=True)
-            pos_all.append(torch.stack([rows, cols], dim=1).cpu().numpy())  # [n, 2]
+            s_feats_all.append(s_feats[start:end].numpy())   # [n, D]
+            t_feats_all.append(t_feats[start:end].numpy())
+            pos_all.append(coords[start:end].numpy())         # [n, 2]
             labels_all.append(labels[b].item())
             offsets.append(offsets[-1] + n)
 
