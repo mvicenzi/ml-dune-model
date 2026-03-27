@@ -28,7 +28,13 @@ class DINOConfig:
     epochs: int = 100                # total training epochs
 
     # ============ Loss ============
-    loss_type: str = "cosine"  # "cosine" or "mse"
+    loss_type: str = "cosine"    # "cosine", "mse", or "dino"
+    center_momentum: float = 0.9  # EMA decay for teacher centering
+    use_centering: bool = True    # subtract running center from teacher before loss
+    teacher_temp: float = 1.0    # teacher softmax temperature (only used for "dino")
+    student_temp: float = 1.0    # student softmax temperature (only used for "dino")
+    use_cov_penalty: bool = False    # add VICReg covariance decorrelation penalty
+    cov_penalty_weight: float = 1e-3  # weight for the covariance penalty term
 
     # ============ Data ============
     rootdir: str = "/nfs/data/1/rrazakami/work/data_cvn/data/dune/2023_trainings/latest/dunevd"
@@ -42,6 +48,7 @@ class DINOConfig:
     save_every: int = 10  # save checkpoint every N epochs
 
     # ============ Debug / Visualization ============
-    debug: bool = False               # enable PNG visualizations and detailed logging
-    debug_every: int = 100            # save debug info every N batches
-    debug_dir: str = "./dino_debug"   # directory for debug outputs
+    debug: bool = False               # enable detailed logging and history tracking
+    debug_every: int = 100            # log scalars / stats / grad norms every N batches
+    debug_dir: str = "./dino_debug"   # base directory for debug outputs
+    run_name: str = ""                # optional label; outputs go to debug_dir/run_name/ if set

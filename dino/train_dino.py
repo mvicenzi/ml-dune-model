@@ -7,6 +7,9 @@ Usage:
 """
 
 import fire
+import inspect
+import json
+import sys
 import torch
 import torch.optim as optim
 from pathlib import Path
@@ -23,13 +26,48 @@ from .model import DINODuneModel
 from .debug import DINODebugger
 
 
+@torch.no_grad()
+def validate_epoch(model, val_loader, masker, loss_fn, device):
+    """
+    Compute mean DINO loss on the validation set.
+
+    Student runs in eval mode (no dropout / batchnorm stochasticity) with the
+    same random masking as during training. Teacher is always in eval mode.
+    No gradients are computed. Model is restored to train mode before returning.
+
+    Returns:
+        mean validation loss (0.0 if val_loader is empty)
+    """
+    model.eval()
+    total_loss = 0.0
+    n_batches = 0
+
+    for data, _ in val_loader:
+        data = data.to(device)
+        x_student, mask = masker(data)
+        teacher_feats = model.teacher(data)
+        student_feats = model.student(x_student)
+        loss, _, _, _ = loss_fn(student_feats, teacher_feats, mask, data)
+        total_loss += loss.item()
+        n_batches += 1
+
+    model.train()  # restores student; teacher stays eval via DINODuneModel.train()
+    return total_loss / n_batches if n_batches > 0 else 0.0
+
+
 def main(
     backbone_name: str = "attn_default",
     epochs: int = 100,
-    batch_size: int = 16,
+    batch_size: int = 50,
     lr: float = 1e-4,
     mask_ratio: float = 0.5,
     loss_type: str = "cosine",
+    center_momentum: float = 0.9,
+    use_centering: bool = True,
+    teacher_temp: float = 1.0,
+    student_temp: float = 1.0,
+    use_cov_penalty: bool = False,
+    cov_penalty_weight: float = 1e-3,
     momentum_start: float = 0.996,
     momentum_end: float = 0.9999,
     weight_decay: float = 0.04,
@@ -39,8 +77,9 @@ def main(
     save_every: int = 10,
     device: str = "cuda",
     debug: bool = False,
-    debug_every: int = 10,
+    debug_every: int = 100,
     debug_dir: str = "./dino_debug",
+    run_name: str = "",
     test_mode: bool = False,
     num_workers: int = 4,
 ):
@@ -53,7 +92,13 @@ def main(
         batch_size: Batch size per GPU
         lr: Base learning rate
         mask_ratio: Fraction of active pixels to mask
-        loss_type: "cosine" or "mse"
+        loss_type: "cosine", "mse", or "dino"
+        center_momentum: EMA decay for the teacher center buffer
+        use_centering: subtract running center from teacher features before loss
+        teacher_temp: teacher softmax temperature (only used for "dino")
+        student_temp: student softmax temperature (only used for "dino")
+        use_cov_penalty: add VICReg covariance decorrelation penalty on student features
+        cov_penalty_weight: weight for the covariance penalty term
         momentum_start: Initial EMA momentum
         momentum_end: Final EMA momentum
         weight_decay: L2 regularization
@@ -62,9 +107,10 @@ def main(
         output_dir: Where to save checkpoints
         save_every: Save checkpoint every N epochs
         device: "cuda" or "cpu"
-        debug: Enable debugging and visualization
-        debug_every: Save debug visuals every N batches
-        debug_dir: Directory for debug outputs
+        debug: Enable debugging and history logging
+        debug_every: Log scalars / stats / grad norms every N batches
+        debug_dir: Base directory for debug outputs
+        run_name: Optional label; outputs go to debug_dir/run_name/ if set
         test_mode: Use small subset for quick smoke tests
         num_workers: Number of dataloader workers
     """
@@ -72,11 +118,22 @@ def main(
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
 
+    # If a run name is given, nest outputs under debug_dir/run_name/ and output_dir/run_name/
+    if run_name:
+        debug_dir = f"{debug_dir}/{run_name}"
+        output_dir = f"{output_dir}/{run_name}"
+
     # Build config
     cfg = DINOConfig(
         backbone_name=backbone_name,
         mask_ratio=mask_ratio,
         loss_type=loss_type,
+        center_momentum=center_momentum,
+        use_centering=use_centering,
+        teacher_temp=teacher_temp,
+        student_temp=student_temp,
+        use_cov_penalty=use_cov_penalty,
+        cov_penalty_weight=cov_penalty_weight,
         momentum_start=momentum_start,
         momentum_end=momentum_end,
         lr=lr,
@@ -90,12 +147,18 @@ def main(
         debug=debug,
         debug_every=debug_every,
         debug_dir=debug_dir,
+        run_name=run_name,
         num_workers=num_workers,
     )
 
     print(f"Device: {device}")
     print(f"Config: backbone={cfg.backbone_name}, mask_ratio={cfg.mask_ratio}, "
-          f"lr={cfg.lr}, epochs={cfg.epochs}, batch_size={cfg.batch_size}")
+          f"lr={cfg.lr}, epochs={cfg.epochs}, batch_size={cfg.batch_size}, warmup_epochs={cfg.warmup_epochs}, "
+          f" momentum_start={cfg.momentum_start}, momentum_end={cfg.momentum_end}")
+    print(f'Loss: type={cfg.loss_type}, center_momentum={cfg.center_momentum}, '
+          f'use_centering={cfg.use_centering}, teacher_temp={cfg.teacher_temp}, '
+          f'student_temp={cfg.student_temp}, use_cov_penalty={cfg.use_cov_penalty}, '
+          f'cov_penalty_weight={cfg.cov_penalty_weight}')
 
     # ============ Data ============
     print("\nLoading dataset...")
@@ -107,12 +170,20 @@ def main(
     )
 
     if test_mode:
-        n_subset = 1000
+        n_subset = 100000
         print(f"TEST MODE: using {n_subset} samples")
         subset_indices = torch.randperm(len(dataset))[:n_subset]
         dataset = Subset(dataset, subset_indices)
 
-    train_ds, val_ds, _, _ = train_val_split(dataset, val_fraction=0.2, use_cache=False)
+    train_ds, val_ds, train_idx, val_idx = train_val_split(dataset, val_fraction=0.2, use_cache=False)
+
+    train_set = set(train_idx.tolist())
+    val_set   = set(val_idx.tolist())
+    overlap = train_set & val_set
+    print(f"Train size: {len(train_set)}, Val size: {len(val_set)}")
+    print(f"Overlap: {len(overlap)} samples")                    # should be 0
+    print(f"Union covers full dataset: {len(train_set | val_set) == len(dataset)}")  # should be True
+
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -128,7 +199,6 @@ def main(
         pin_memory=True,
     )
 
-    print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
     epoch_len = len(train_loader)
     total_iters = epochs * epoch_len
     print(f"Total training iterations: {total_iters} (epochs={epochs}, epoch_len={epoch_len})")
@@ -139,7 +209,15 @@ def main(
     optimizer = optim.AdamW(model.student.parameters(), lr=lr, weight_decay=weight_decay)
 
     masker = SparseVoxelMasker(mask_ratio=mask_ratio)
-    loss_fn = PixelDINOLoss(loss_type=loss_type).to(device)
+    loss_fn = PixelDINOLoss(
+        loss_type=cfg.loss_type,
+        center_momentum=cfg.center_momentum,
+        use_centering=cfg.use_centering,
+        teacher_temp=cfg.teacher_temp,
+        student_temp=cfg.student_temp,
+        use_cov_penalty=cfg.use_cov_penalty,
+        cov_penalty_weight=cfg.cov_penalty_weight,
+    ).to(device)
 
     # ============ Schedulers ============
     warmup_iters = min(warmup_epochs * epoch_len, int(0.2 * total_iters))
@@ -198,30 +276,48 @@ def main(
                 param_group["lr"] = lr_val
                 param_group["weight_decay"] = wd_val
 
-            # Masking (for debug visualization)
-            x_student, mask_applied = masker(data)
-
             # Forward + backward
             optimizer.zero_grad()
-            loss_val, s_feats, t_feats, _ = model.forward_backward(data, masker, loss_fn)
+            loss_val, teacher_entropy, kl, cov_penalty, s_feats, t_feats, mask_fwd = model.forward_backward(data, masker, loss_fn)
             optimizer.step()
 
             # EMA teacher update
             model.update_teacher(mom_val)
 
-            # Logging
-            n_valid = (~mask_applied & (data != 0)).sum().item()
-            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val)
+            # Centering: update teacher center for next iteration
+            loss_fn.update_center(t_feats, data)
+            debugger.log_center_stats(iteration, loss_fn)
 
-            # Debug visualizations
+            # Scalar logging
+            n_valid = (~mask_fwd & (data != 0)).sum().item()
+            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, kl, cov_penalty)
+
+            # Gradient norms per backbone module (.grad still populated before next zero_grad)
+            debugger.log_gradient_norms(iteration, model.student)
+
+            # Representation-quality statistics (variance, covariance, norm)
+            debugger.log_feature_stats(iteration, s_feats, t_feats, mask_fwd, data)
+
+            # First batch: log tensor shapes
             if first_batch:
-                debugger.log_shapes(data, x_student, mask_applied, s_feats, t_feats)
+                debugger.log_shapes(data, data, mask_fwd, s_feats, t_feats)
                 first_batch = False
-            debugger.maybe_save_visuals(iteration, data, x_student, mask_applied, s_feats, t_feats)
+
+            # Periodically persist histories to disk
+            debugger.maybe_save_histories(iteration)
+
+            # Explicitly free feature tensors: each is ~1.9 GB on GPU.
+            # Dropping them here lets CUDA reclaim memory before the next forward pass.
+            del s_feats, t_feats
 
             if (batch_idx + 1) % 50 == 0 or batch_idx == 0:
                 print(f"[{epoch}/{epochs}] iter {iteration}: loss={loss_val:.6f}, "
                       f"lr={lr_val:.2e}, mom={mom_val:.6f}")
+
+        # Validation
+        val_loss = validate_epoch(model, val_loader, masker, loss_fn, device)
+        print(f"[{epoch}/{epochs}] val_loss={val_loss:.6f}")
+        debugger.log_val_epoch(epoch, iteration, val_loss)
 
         # Save checkpoint
         if epoch % save_every == 0 or epoch == epochs:
@@ -236,9 +332,74 @@ def main(
             torch.save(ckpt, ckpt_path)
             print(f"Saved checkpoint: {ckpt_path}")
 
+    debugger.save_histories()
+
     print("\nTraining complete!")
     print(f"Checkpoints saved to: {output_dir}")
 
 
+def from_config(
+    config_path: str,
+    run_name: str = "",
+    device: str = "cuda",
+    test_mode: bool = False,
+    **overrides,
+):
+    """
+    Start training from a saved run_config.json file.
+
+    Loads training parameters from a previously saved run_config.json (e.g. from
+    ./dino_debug/<run_name>/run_config.json).  Any JSON field that does not match
+    a parameter of main() is silently ignored, so old configs with stale or missing
+    keys work without errors — missing fields fall back to main()'s defaults.
+
+    The `run_name`, `device`, and `test_mode` arguments override the corresponding
+    values from the config file.  Any other parameter accepted by main() can also
+    be overridden via CLI (e.g. --use_cov_penalty=True --cov_penalty_weight=1e-2).
+    Providing a new run_name is recommended when re-running a config so outputs
+    don't overwrite the original run.
+
+    Args:
+        config_path: Path to the run_config.json file
+        run_name: Override run name (determines output sub-directories)
+        device: Override device ("cuda" or "cpu")
+        test_mode: Override test_mode flag
+        **overrides: Any additional main() parameter to override (e.g. use_cov_penalty=True)
+    """
+    with open(config_path) as f:
+        raw = json.load(f)
+
+    # Discover which parameters main() accepts (names + defaults)
+    sig = inspect.signature(main)
+    valid_params = set(sig.parameters)
+
+    # Build kwargs: only keep JSON keys that main() understands
+    kwargs = {k: v for k, v in raw.items() if k in valid_params}
+
+    # The JSON stores debug_dir as the fully-nested path (debug_dir/run_name).
+    # main() will re-append run_name, so we strip the suffix here to avoid
+    # double-nesting.  We use the original run_name from the JSON for this,
+    # before any CLI override is applied.
+    orig_run_name = kwargs.get("run_name", "")
+    stored_debug_dir = kwargs.get("debug_dir", "")
+    if orig_run_name and stored_debug_dir.endswith("/" + orig_run_name):
+        kwargs["debug_dir"] = stored_debug_dir[: -len("/" + orig_run_name)]
+
+    # CLI-level overrides always win
+    if run_name:
+        kwargs["run_name"] = run_name
+    kwargs["device"] = device
+    kwargs["test_mode"] = test_mode
+    for k, v in overrides.items():
+        if k in valid_params:
+            kwargs[k] = v
+
+    main(**kwargs)
+
+
 if __name__ == "__main__":
-    fire.Fire(main)
+    if len(sys.argv) > 1 and sys.argv[1] == "from_config":
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+        fire.Fire(from_config)
+    else:
+        fire.Fire(main)
