@@ -108,12 +108,18 @@ class DINODuneModel(nn.Module):
             out = self.teacher_head(out)
         return out
 
-    def encode_student(self, xs: Voxels) -> Voxels:
-        """Run the student backbone (+ head if present)."""
-        out = self.student(xs)
+    def encode_student(self, xs: Voxels) -> tuple[Voxels, Voxels]:
+        """
+        Run the student backbone (+ head if present).
+
+        Returns:
+            backbone_out: raw 64-dim backbone output (before head)
+            final_out:    head output if head present, else same as backbone_out
+        """
+        backbone_out = self.student(xs)
         if self.student_head is not None:
-            out = self.student_head(out)
-        return out
+            return backbone_out, self.student_head(backbone_out)
+        return backbone_out, backbone_out
 
     def forward_backward(self, x: Tensor, masker, loss_fn):
         """
@@ -144,10 +150,10 @@ class DINODuneModel(nn.Module):
             teacher_out = self.encode_teacher(xs)
 
         # Student forward (masked Voxels, trainable)
-        student_out = self.encode_student(xs_student)
+        student_backbone_out, student_out = self.encode_student(xs_student)
 
         # Compute loss and backprop
-        loss, teacher_entropy, student_entropy, kl, cov_penalty = loss_fn(student_out, teacher_out, kept_indices)
+        loss, teacher_entropy, student_entropy, kl, cov_penalty = loss_fn(student_out, student_backbone_out, teacher_out, kept_indices)
         loss.backward()
 
         return loss.item(), teacher_entropy, student_entropy, kl, cov_penalty, student_out, teacher_out

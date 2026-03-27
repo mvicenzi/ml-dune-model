@@ -47,8 +47,8 @@ def validate_epoch(model, val_loader, masker, loss_fn, device):
         xs = model.from_dense(data)
         xs_student, kept_indices = masker(xs)
         teacher_out = model.encode_teacher(xs)
-        student_out = model.encode_student(xs_student)
-        loss, _, _, _, _ = loss_fn(student_out, teacher_out, kept_indices)
+        student_backbone_out, student_out = model.encode_student(xs_student)
+        loss, _, _, _, _ = loss_fn(student_out, student_backbone_out, teacher_out, kept_indices)
         total_loss += loss.item()
         n_batches += 1
 

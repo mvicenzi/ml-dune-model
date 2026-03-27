@@ -72,9 +72,10 @@ class PixelDINOLoss(nn.Module):
 
     def forward(
         self,
-        student_out: Voxels,         # sparse student output
-        teacher_out: Voxels,         # sparse teacher output (should be detached)
-        kept_indices: List[Tensor],  # per-batch-item indices mapping student→teacher positions
+        student_out: Voxels,          # sparse student output (after head if present)
+        student_backbone: Voxels,     # raw backbone output (before head); used for cov penalty
+        teacher_out: Voxels,          # sparse teacher output (should be detached)
+        kept_indices: List[Tensor],   # per-batch-item indices mapping student→teacher positions
     ) -> Tensor:
         """
         Compute per-voxel DINO loss at the positions the student processed.
@@ -83,9 +84,10 @@ class PixelDINOLoss(nn.Module):
         corresponding teacher voxel: teacher[t_start + kept_indices[b][i]].
 
         Args:
-            student_out:   Student backbone output (Voxels)
-            teacher_out:   Teacher backbone output (Voxels), pre-detached
-            kept_indices:  List of B index tensors from SparseVoxelMasker
+            student_out:      Student output (Voxels) — head output if head present, else backbone
+            student_backbone: Raw backbone output (Voxels) — always 64-dim; used for cov penalty
+            teacher_out:      Teacher backbone output (Voxels), pre-detached
+            kept_indices:     List of B index tensors from SparseVoxelMasker
 
         Returns:
             Scalar loss value
@@ -167,10 +169,12 @@ class PixelDINOLoss(nn.Module):
             student_entropy_px = -(s_prob * s_logp).sum(dim=-1)    # H(P_s)      [N_valid]
             kl_px = loss - teacher_entropy_px                      # KL(P_t|P_s)[N_valid]
 
-        # Optional covariance decorrelation penalty on student features
+        # Optional covariance decorrelation penalty on raw backbone features (64-dim).
+        # Computed before the projection head and before L2-normalization so the
+        # penalty sees the actual feature scale and covariance structure.
         cov_penalty = None
         if self.use_cov_penalty:
-            cov_penalty = self._cov_penalty(s)
+            cov_penalty = self._cov_penalty(student_backbone.feature_tensor)
 
         # Two-stage reduction: sum per image via scatter, divide by count, then mean.
         # Mirrors DINOv2: sum(loss * mask) / mask.sum() per image, then .mean()
@@ -214,8 +218,7 @@ class PixelDINOLoss(nn.Module):
         across the full feature space.
 
         Args:
-            s: Student features [N, D] (valid pixels only, already centered/normalized
-               by the main loss branch if applicable)
+            s: Raw backbone features [N, D] (valid pixels only, before head and L2-norm)
 
         Returns:
             Scalar penalty: sum of squared off-diagonal covariance entries, divided by D
