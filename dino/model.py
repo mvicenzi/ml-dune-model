@@ -135,9 +135,10 @@ class DINODuneModel(nn.Module):
             teacher_entropy: H(P_t) per batch (dino loss only, else None)
             student_entropy: H(P_s) per batch (dino loss only, else None)
             kl:              KL(P_t||P_s) per batch (dino loss only, else None)
-            cov_penalty:     covariance penalty (if enabled, else None)
-            student_out:     student Voxels output (after head if present)
-            teacher_out:     teacher Voxels output (after head if present)
+            cov_penalty:          covariance penalty (if enabled, else None)
+            student_backbone_out: raw 64-dim backbone output (before head)
+            student_out:          student Voxels output (after head if present)
+            teacher_out:          teacher Voxels output (after head if present)
         """
         # FIXME FIXME: TEMPORARY
         xs = self.from_dense(x)
@@ -156,4 +157,4 @@ class DINODuneModel(nn.Module):
         loss, teacher_entropy, student_entropy, kl, cov_penalty = loss_fn(student_out, student_backbone_out, teacher_out, kept_indices)
         loss.backward()
 
-        return loss.item(), teacher_entropy, student_entropy, kl, cov_penalty, student_out, teacher_out
+        return loss.item(), teacher_entropy, student_entropy, kl, cov_penalty, student_backbone_out, student_out, teacher_out

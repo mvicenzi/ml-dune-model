@@ -310,7 +310,7 @@ def main(
 
             # Forward + backward
             optimizer.zero_grad()
-            loss_val, teacher_entropy, student_entropy, kl, cov_penalty, student_out, teacher_out = model.forward_backward(data, masker, loss_fn)
+            loss_val, teacher_entropy, student_entropy, kl, cov_penalty, student_backbone_out, student_out, teacher_out = model.forward_backward(data, masker, loss_fn)
             optimizer.step()
 
             # EMA teacher update
@@ -328,11 +328,11 @@ def main(
             debugger.log_gradient_norms(iteration, model.student)
 
             # Representation-quality statistics (variance, covariance, norm)
-            debugger.log_feature_stats(iteration, student_out.feature_tensor, teacher_out.feature_tensor)
+            debugger.log_feature_stats(iteration, student_backbone_out.feature_tensor, teacher_out.feature_tensor)
 
             # First batch: log tensor shapes
             if first_batch:
-                debugger.log_shapes(data, student_out.feature_tensor, teacher_out.feature_tensor)
+                debugger.log_shapes(data, student_backbone_out.feature_tensor, teacher_out.feature_tensor)
                 first_batch = False
 
             # Periodically persist histories to disk
