@@ -51,6 +51,8 @@ class DINODebugger:
             {"iter": [],
              "s_norm_min": [], "s_norm_max": [], "s_norm_median": [],
              "t_norm_min": [], "t_norm_max": [], "t_norm_median": [],
+             "s_head_norm_min": [], "s_head_norm_max": [], "s_head_norm_median": [],
+             "t_head_norm_min": [], "t_head_norm_max": [], "t_head_norm_median": [],
              "s_cov_mat": [], "t_cov_mat": [],
              "s_head_cov_mat": [], "t_head_cov_mat": [],
              "center_norm": [], "center_var": []}
@@ -234,8 +236,10 @@ class DINODebugger:
             s_norms = s_flat.norm(dim=-1)
             t_norms = t_flat.norm(dim=-1)
 
-            s_head_cov = torch.cov(s_head_flat.T) if s_head_flat is not None else None
-            t_head_cov = torch.cov(t_head_flat.T) if t_head_flat is not None else None
+            s_head_cov   = torch.cov(s_head_flat.T) if s_head_flat is not None else None
+            t_head_cov   = torch.cov(t_head_flat.T) if t_head_flat is not None else None
+            s_head_norms = s_head_flat.norm(dim=-1)  if s_head_flat is not None else None
+            t_head_norms = t_head_flat.norm(dim=-1)  if t_head_flat is not None else None
 
         self.logger.info(
             f"[iter {iteration:6d}] FEAT_STATS: "
@@ -250,6 +254,12 @@ class DINODebugger:
         h["t_norm_min"].append(t_norms.min().item())
         h["t_norm_max"].append(t_norms.max().item())
         h["t_norm_median"].append(t_norms.median().item())
+        h["s_head_norm_min"].append(s_head_norms.min().item()    if s_head_norms is not None else float("nan"))
+        h["s_head_norm_max"].append(s_head_norms.max().item()    if s_head_norms is not None else float("nan"))
+        h["s_head_norm_median"].append(s_head_norms.median().item() if s_head_norms is not None else float("nan"))
+        h["t_head_norm_min"].append(t_head_norms.min().item()    if t_head_norms is not None else float("nan"))
+        h["t_head_norm_max"].append(t_head_norms.max().item()    if t_head_norms is not None else float("nan"))
+        h["t_head_norm_median"].append(t_head_norms.median().item() if t_head_norms is not None else float("nan"))
         h["s_cov_mat"].append(s_cov_mat.cpu().tolist())
         h["t_cov_mat"].append(t_cov_mat.cpu().tolist())
         h["s_head_cov_mat"].append(s_head_cov.cpu().tolist() if s_head_cov is not None else [])

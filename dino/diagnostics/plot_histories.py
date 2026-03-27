@@ -174,12 +174,12 @@ def plot_stats(data: dict, out_dir: Path, label: str = "backbone", mat_key: str 
 
     # Row 0: per-pixel L2 norm — median line with min/max band
     for col, (prefix, color, name) in enumerate([
-        ("s_norm", "C0", "Student"), ("t_norm", "C1", "Teacher")
+        (f"s_{mat_key}norm", "C0", "Student"), (f"t_{mat_key}norm", "C1", "Teacher")
     ]):
         ax = axes[0, col]
-        mins    = h[f"{prefix}_min"]
-        maxs    = h[f"{prefix}_max"]
-        medians = h[f"{prefix}_median"]
+        mins    = h.get(f"{prefix}_min",    [])
+        maxs    = h.get(f"{prefix}_max",    [])
+        medians = h.get(f"{prefix}_median", [])
         ax.fill_between(iters, mins, maxs, alpha=0.3, color=color, label="Min–Max")
         ax.plot(iters, medians, linewidth=1.5, color=color, label="Median")
         ax.set_ylabel("Per-pixel L2 norm")
