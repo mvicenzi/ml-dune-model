@@ -58,9 +58,14 @@ class SparseVoxelMasker:
             N     = end - start
 
             if N == 0:
+                # Image was already empty (no active voxels). Append an empty index
+                # tensor so kept_indices stays length-B and offsets reflect 0 voxels
+                # for this image. Nothing is added to coords_list/feats_list.
                 kept_indices.append(torch.zeros(0, dtype=torch.long, device=device))
                 continue
 
+            # max(1, ...) guarantees at least one voxel is always kept, so a
+            # non-empty image can never be fully dropped by the masker.
             n_keep = max(1, N - int(N * self.mask_ratio))
             perm   = torch.randperm(N, device=device)
             keep   = perm[:n_keep].sort().values   # sorted to preserve spatial order
