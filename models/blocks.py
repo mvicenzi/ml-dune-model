@@ -60,15 +60,15 @@ class DenseOutput(nn.Module):
 class ConvBlock2D(Sequential):
     """
     Sparse 2D convolutional block based on WarpConvNet functions.
-    Composition: 
-        SparseConv2d -> BatchNorm1d -> ReLU
-    - this is the main conv layer in base resnet block  
+    Composition:
+        SparseConv2d -> LayerNorm -> ReLU
+    - this is the main conv layer in base resnet block
     - note: relu activation needs to be disabled in some cases!
     """
     def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, bias=False, relu=True):
         super().__init__(
             SparseConv2d(in_ch, out_ch, kernel_size=kernel_size, stride=stride, bias=bias),
-            nn.BatchNorm1d(out_ch),
+            LayerNorm(out_ch),
             ReLU(inplace=True) if relu is True else nn.Identity(),
         )  
 
@@ -90,7 +90,7 @@ class ConvTrBlock2D(nn.Module):
             transposed=True, bias=bias
         )
         self.norm_act = Sequential(
-            nn.BatchNorm1d(out_ch),
+            LayerNorm(out_ch),
             ReLU(inplace=True),
         )
 
@@ -105,10 +105,10 @@ class ResidualSparseBlock2D(nn.Module):
     """
     Sparse residual block (the core computation unit of the encoder/decoder).
     This is the ResNet "BasicBlock" from mink_unet.py:
-        Conv → BN → ReLU
-        Conv → BN
+        Conv → LN → ReLU
+        Conv → LN
         Add residual
-        ReLU 
+        ReLU
     - Sparse convolution layers based on ConvBlock2D 
     - "stride" parameter always at 1: size downsampling is external!
     - 'relu=False' makes the second layer without activation
@@ -125,11 +125,11 @@ class ResidualSparseBlock2D(nn.Module):
         if stride!= 1 or in_ch != out_ch:
             self.downsample = ConvBlock2D(in_ch, out_ch, kernel_size=1, stride=stride, relu=False)
 
-        # First convolution: SparseConv2d + BatchNorm1d + ReLU
+        # First convolution: SparseConv2d + LayerNorm + ReLU
         # if downsampling, it happens here
         self.conv1 = ConvBlock2D(in_ch, out_ch, kernel_size=kernel_size, stride=stride)
 
-        # Second convolution: SparseConv2d + BatchNorm1d
+        # Second convolution: SparseConv2d + LayerNorm
         self.conv2 = ConvBlock2D(out_ch, out_ch, kernel_size=kernel_size, stride=1, relu=False)
 
         # Final activation (after skip addition)
