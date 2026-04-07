@@ -7,6 +7,7 @@ from typing import List, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from warpconvnet.geometry.types.voxels import Voxels
@@ -181,6 +182,35 @@ class SparseCropper:
     def __init__(self, config: CropConfig):
         self.cfg = config
         self._n_crops = config.n_global + config.n_local
+        self._init_blur_kernel(config.blur_sigma_px)
+
+    def _init_blur_kernel(self, sigma: float):
+        """Pre-compute a separable Gaussian kernel for GPU blurring."""
+        if sigma <= 0:
+            self._blur_kernel_h = None
+            self._blur_kernel_v = None
+            self._blur_pad = 0
+            return
+        radius = int(3 * sigma + 0.5)
+        x = torch.arange(-radius, radius + 1, dtype=torch.float32)
+        k1d = torch.exp(-0.5 * (x / sigma) ** 2)
+        k1d = k1d / k1d.sum()
+        self._blur_kernel_h = k1d.reshape(1, 1, 1, -1)
+        self._blur_kernel_v = k1d.reshape(1, 1, -1, 1)
+        self._blur_pad = radius
+
+    def _gpu_blur(self, A_batch: Tensor) -> Tensor:
+        """Gaussian blur a [B, H, W] activity tensor on GPU (separable conv)."""
+        if self._blur_kernel_h is None:
+            return A_batch.clone()
+        x = A_batch.unsqueeze(1)  # [B, 1, H, W]
+        kh = self._blur_kernel_h.to(x.device, x.dtype)
+        kv = self._blur_kernel_v.to(x.device, x.dtype)
+        x = F.pad(x, (self._blur_pad, self._blur_pad, 0, 0), mode="reflect")
+        x = F.conv2d(x, kh)
+        x = F.pad(x, (0, 0, self._blur_pad, self._blur_pad), mode="reflect")
+        x = F.conv2d(x, kv)
+        return x.squeeze(1)  # [B, H, W]
 
     def _sample_box_for_image(
         self,
@@ -217,7 +247,22 @@ class SparseCropper:
         B = len(voxels.offsets) - 1
         device = voxels.coordinate_tensor.device
 
-        # Per-crop accumulators: coords, feats, indices, and offset counts
+        # --- Build activity arrays and heatmaps on GPU in one batch ----------
+        A_batch = torch.zeros(B, cfg.image_h, cfg.image_w, device=device)
+        for b in range(B):
+            start = int(voxels.offsets[b])
+            end   = int(voxels.offsets[b + 1])
+            if end > start:
+                c = voxels.coordinate_tensor[start:end]
+                A_batch[b, c[:, 1].long(), c[:, 0].long()] = 1.0
+
+        H_batch = self._gpu_blur(A_batch)                  # [B, H, W] on GPU
+
+        # Single transfer to CPU for the sampling loop
+        A_np = A_batch.cpu().numpy()                        # one GPU→CPU sync
+        H_np = H_batch.cpu().numpy()
+
+        # --- Per-image, per-crop: sample boxes and filter voxels -------------
         crop_coords  = [[] for _ in range(self._n_crops)]
         crop_feats   = [[] for _ in range(self._n_crops)]
         crop_kidx    = [[] for _ in range(self._n_crops)]
@@ -228,14 +273,12 @@ class SparseCropper:
             end   = int(voxels.offsets[b + 1])
 
             coords_b = voxels.coordinate_tensor[start:end]  # [N, 2]
-            feats_b  = voxels.feature_tensor[start:end]     # [N, C]
+            feats_b  = voxels.feature_tensor[start:end]      # [N, C]
             N = end - start
 
-            # Build activity array and heatmap once per image
-            A = _build_activity_array(coords_b, cfg.image_h, cfg.image_w)
-            H = _gaussian_blur_np(A, cfg.blur_sigma_px)
+            A = A_np[b]
+            H = H_np[b]
 
-            # Sample one box per crop
             for k in range(self._n_crops):
                 if k < cfg.n_global:
                     scale_range = cfg.global_scale
@@ -243,14 +286,12 @@ class SparseCropper:
                     scale_range = cfg.local_scale
 
                 if N == 0:
-                    # Empty image: keep zero voxels for this crop
                     kidx = torch.zeros(0, dtype=torch.long, device=device)
                 else:
                     box = self._sample_box_for_image(A, H, scale_range)
                     left, top, right, bottom = box
 
-                    # Select voxels inside the box
-                    xy = coords_b  # [N, 2], col 0 = x, col 1 = y
+                    xy = coords_b
                     mask = (
                         (xy[:, 0] >= left)  &
                         (xy[:, 0] <  right) &
@@ -260,8 +301,6 @@ class SparseCropper:
                     kidx = mask.nonzero(as_tuple=False).squeeze(1)
 
                     if kidx.numel() == 0:
-                        # Fallback: include at least the nearest voxel so the
-                        # batch item is never empty (avoids BatchNorm edge case)
                         kidx = torch.zeros(1, dtype=torch.long, device=device)
 
                 crop_kidx[k].append(kidx)
@@ -273,7 +312,7 @@ class SparseCropper:
                 else:
                     crop_counts[k].append(0)
 
-        # Assemble one Voxels object per crop
+        # --- Assemble one Voxels object per crop ----------------------------
         crops = []
         for k in range(self._n_crops):
             counts_k = torch.tensor(crop_counts[k], dtype=torch.int64)
@@ -293,8 +332,7 @@ class SparseCropper:
             )
             crops.append(crop_voxels)
 
-        # Build lookup tables for global (teacher) crops: for each teacher crop g
-        # and batch item b, map full-image voxel index → local position in the crop.
+        # --- Build teacher LUTs for fast intersection matching ---------------
         teacher_luts = []
         for g in range(cfg.n_global):
             luts_g = []
