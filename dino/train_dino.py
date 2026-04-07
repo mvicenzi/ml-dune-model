@@ -11,6 +11,7 @@ import inspect
 import json
 import sys
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from pathlib import Path
 from torch.utils.data import DataLoader
@@ -451,9 +452,25 @@ def main(
             loss_fn.update_center(teacher_out)
             debugger.log_center_stats(iteration, loss_fn)
 
+            # Backbone entropy (diagnostic: are backbone features already sharp before the head?)
+            # Only meaningful when a projection head is active and loss is dino.
+            backbone_teacher_entropy = None
+            backbone_student_entropy = None
+            if model.student_head is not None and loss_fn.loss_type == "dino":
+                with torch.no_grad():
+                    # L2-normalize backbone features before softmax: backbone features are
+                    # raw/unnormalized, so dividing by the head temperatures (≈0.04) without
+                    # normalization would make softmax a near-hard-argmax → entropy ≈ 0 always.
+                    s_bb = F.normalize(student_backbone_out.feature_tensor.float(), dim=-1)
+                    t_bb = F.normalize(teacher_backbone_out.feature_tensor.float(), dim=-1)
+                    t_prob_bb = F.softmax(t_bb / loss_fn.teacher_temp, dim=-1)
+                    s_prob_bb = F.softmax(s_bb / loss_fn.student_temp, dim=-1)
+                    backbone_teacher_entropy = -(t_prob_bb * t_prob_bb.log().clamp(min=-100)).sum(dim=-1).mean().item()
+                    backbone_student_entropy = -(s_prob_bb * s_prob_bb.log().clamp(min=-100)).sum(dim=-1).mean().item()
+
             # Scalar logging
             n_valid = student_out.feature_tensor.shape[0]
-            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, student_entropy, kl, cov_penalty, var_penalty)
+            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, student_entropy, kl, cov_penalty, var_penalty, backbone_teacher_entropy, backbone_student_entropy)
 
             # Gradient norms per backbone module (.grad still populated before next zero_grad)
             debugger.log_gradient_norms(iteration, model.student)
@@ -483,9 +500,9 @@ def main(
                       f"lr={lr_val:.2e}, mom={mom_val:.6f}{cov_str}{var_str}")
 
         # Validation
-        val_loss = validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_mode)
-        print(f"[{epoch}/{epochs}] val_loss={val_loss:.6f}")
-        debugger.log_val_epoch(epoch, iteration, val_loss)
+        #val_loss = validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_mode)
+        #print(f"[{epoch}/{epochs}] val_loss={val_loss:.6f}")
+        #debugger.log_val_epoch(epoch, iteration, val_loss)
 
         # Save checkpoint
         if epoch % save_every == 0 or epoch == epochs:
