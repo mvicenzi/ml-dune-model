@@ -32,7 +32,7 @@ class PixelDINOLoss(nn.Module):
 
     def __init__(
         self,
-        loss_type: str = "cosine",
+        loss_type: str = "dino",
         center_momentum: float = 0.9,
         use_centering: bool = True,
         teacher_temp: float = 1.0,
