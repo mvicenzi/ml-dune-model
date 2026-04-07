@@ -198,7 +198,7 @@ class SparseCropper:
         # Fallback to centred crop
         return _fallback_centre_box(cfg.image_w, cfg.image_h, scale_range, cfg.aspect_ratio)
 
-    def __call__(self, voxels: Voxels) -> Tuple[List[Voxels], List[List[Tensor]]]:
+    def __call__(self, voxels: Voxels) -> Tuple[List[Voxels], List[List[Tensor]], List[List[Tensor]]]:
         """
         Args:
             voxels: Batched Voxels (full image, B items) — teacher's view.
@@ -207,6 +207,11 @@ class SparseCropper:
             crops:        List of n_crops Voxels objects (each batched over B images).
             kept_indices: List of n_crops lists; kept_indices[k][b] indexes into the
                           per-batch-item slice [offsets[b]:offsets[b+1]] of voxels.
+            teacher_luts: List of n_global lists; teacher_luts[g][b] is a tensor of
+                          size N_b mapping full-image voxel index → local position
+                          within teacher crop g (or -1 if absent). Pre-built here so
+                          that intersection matching in the training loop is a single
+                          O(N) gather instead of O(N log N) isin + searchsorted.
         """
         cfg = self.cfg
         B = len(voxels.offsets) - 1
@@ -288,4 +293,18 @@ class SparseCropper:
             )
             crops.append(crop_voxels)
 
-        return crops, crop_kidx
+        # Build lookup tables for global (teacher) crops: for each teacher crop g
+        # and batch item b, map full-image voxel index → local position in the crop.
+        teacher_luts = []
+        for g in range(cfg.n_global):
+            luts_g = []
+            for b in range(B):
+                N_b = int(voxels.offsets[b + 1] - voxels.offsets[b])
+                lut = torch.full((N_b,), -1, dtype=torch.long, device=device)
+                T_g_b = crop_kidx[g][b]
+                if T_g_b.numel() > 0:
+                    lut[T_g_b] = torch.arange(T_g_b.numel(), device=device)
+                luts_g.append(lut)
+            teacher_luts.append(luts_g)
+
+        return crops, crop_kidx, teacher_luts

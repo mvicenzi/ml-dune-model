@@ -57,7 +57,7 @@ def validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_m
             B        = len(xs.offsets) - 1
             device_  = xs.coordinate_tensor.device
 
-            crops, kept_indices_list = augmenter(xs)
+            crops, kept_indices_list, teacher_luts = augmenter(xs)
             n_crops = len(crops)
 
             teacher_encoded = [model.encode_teacher(crops[g]) for g in range(n_global)]
@@ -74,23 +74,21 @@ def validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_m
                     s_local_idx_list, t_local_idx_list = [], []
                     for b in range(B):
                         S_k_b = kept_indices_list[k][b]
-                        T_g_b = kept_indices_list[g][b]
-                        if S_k_b.numel() == 0 or T_g_b.numel() == 0:
+                        lut = teacher_luts[g][b]
+                        if S_k_b.numel() == 0:
                             empty = torch.zeros(0, dtype=torch.long, device=device_)
                             s_local_idx_list.append(empty)
                             t_local_idx_list.append(empty)
                             continue
-                        mask_s  = torch.isin(S_k_b, T_g_b)
-                        s_local = mask_s.nonzero(as_tuple=False).squeeze(1)
+                        t_local_raw = lut[S_k_b]
+                        valid = t_local_raw >= 0
+                        s_local = valid.nonzero(as_tuple=False).squeeze(1)
                         if s_local.numel() == 0:
                             empty = torch.zeros(0, dtype=torch.long, device=device_)
                             s_local_idx_list.append(empty)
                             t_local_idx_list.append(empty)
                             continue
-                        intersection_global = S_k_b[mask_s]
-                        T_g_sorted, T_g_order = T_g_b.sort()
-                        pos     = torch.searchsorted(T_g_sorted, intersection_global)
-                        t_local = T_g_order[pos]
+                        t_local = t_local_raw[valid]
                         s_local_idx_list.append(s_local)
                         t_local_idx_list.append(t_local)
 

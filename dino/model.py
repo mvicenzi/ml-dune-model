@@ -194,8 +194,8 @@ class DINODuneModel(nn.Module):
         B        = len(xs.offsets) - 1
         device   = xs.coordinate_tensor.device
 
-        # Produce all crops and their full-image voxel indices
-        crops, kept_indices_list = cropper(xs)
+        # Produce all crops, their full-image voxel indices, and teacher LUTs
+        crops, kept_indices_list, teacher_luts = cropper(xs)
         n_crops = len(crops)
 
         # Teacher forward — global crops only, no gradient
@@ -217,26 +217,26 @@ class DINODuneModel(nn.Module):
                 teacher_backbone_g, teacher_out_g = teacher_encoded[g]
 
                 # ------------------------------------------------------------------
-                # Spatial intersection: find voxels that belong to both crop k
-                # (student) and global crop g (teacher), using full-image indices.
-                # kept_indices_list[*][b] are indices into the original xs voxels.
+                # Spatial intersection via LUT gather: look up each student
+                # voxel in the teacher crop's pre-built lookup table.  O(N)
+                # gather replaces O(N log N) isin + searchsorted.
                 # ------------------------------------------------------------------
-                s_local_idx_list = []  # local index within student crop k, per batch item
-                t_local_idx_list = []  # local index within teacher crop g, per batch item
+                s_local_idx_list = []
+                t_local_idx_list = []
 
                 for b in range(B):
-                    S_k_b = kept_indices_list[k][b]  # full-image indices for student crop k
-                    T_g_b = kept_indices_list[g][b]  # full-image indices for teacher crop g
+                    S_k_b = kept_indices_list[k][b]
+                    lut = teacher_luts[g][b]
 
-                    if S_k_b.numel() == 0 or T_g_b.numel() == 0:
+                    if S_k_b.numel() == 0:
                         empty = torch.zeros(0, dtype=torch.long, device=device)
                         s_local_idx_list.append(empty)
                         t_local_idx_list.append(empty)
                         continue
 
-                    # Boolean mask: which student voxels are inside teacher crop g
-                    mask_s  = torch.isin(S_k_b, T_g_b)
-                    s_local = mask_s.nonzero(as_tuple=False).squeeze(1)
+                    t_local_raw = lut[S_k_b]          # -1 where not in teacher crop
+                    valid = t_local_raw >= 0
+                    s_local = valid.nonzero(as_tuple=False).squeeze(1)
 
                     if s_local.numel() == 0:
                         empty = torch.zeros(0, dtype=torch.long, device=device)
@@ -244,12 +244,7 @@ class DINODuneModel(nn.Module):
                         t_local_idx_list.append(empty)
                         continue
 
-                    # Map intersection full-image indices → local positions in T_g_b
-                    intersection_global = S_k_b[mask_s]
-                    T_g_sorted, T_g_order = T_g_b.sort()
-                    pos     = torch.searchsorted(T_g_sorted, intersection_global)
-                    t_local = T_g_order[pos]
-
+                    t_local = t_local_raw[valid]
                     s_local_idx_list.append(s_local)
                     t_local_idx_list.append(t_local)
 
