@@ -12,8 +12,21 @@ class DINOConfig:
     feature_dim: int = 64             # backbone output channels; must match model's output
     image_size: int = 500             # spatial resolution (H = W)
 
+    # ============ Augmentation mode ============
+    augmentation_mode: str = "masking"  # "masking" or "cropping"
+
     # ============ Masking ============
-    mask_ratio: float = 0.5  # fraction of active pixels to mask for student
+    mask_ratio: float = 0.5  # fraction of active pixels to mask for student (masking mode only)
+
+    # ============ Cropping ============
+    crop_n_global: int = 2               # number of global crops per image
+    crop_n_local: int = 4                # number of local crops per image
+    crop_global_scale: tuple = (0.4, 1.0)  # global crop area as fraction of image area
+    crop_local_scale: tuple = (0.05, 0.2)  # local crop area as fraction of image area
+    crop_aspect_ratio: tuple = (0.75, 1.333)  # width-to-height aspect ratio range
+    crop_blur_sigma_px: float = 10.0     # Gaussian blur sigma for activity heatmap (px)
+    crop_heatmap_power: float = 1.0      # exponent applied to heatmap before sampling
+    crop_min_active_pixels: int = 10     # minimum active voxels required inside a crop
 
     # ============ EMA teacher ============
     momentum_start: float = 0.996      # EMA momentum schedule start (slow teacher update)
