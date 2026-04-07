@@ -31,6 +31,22 @@ def pr_from_eigen(vals: np.ndarray) -> float:
     return float(v.sum() ** 2 / denom) if denom > 0 else 1.0
 
 
+def infer_feature_dim(data: dict) -> int:
+    """
+    Infer the feature dimension used in the DINO loss from the stored covariance matrices.
+
+    Prefers the head covariance (present when a projection head was used) over the
+    backbone covariance, since the head output is what feeds into the loss.
+    Falls back to 128 if no covariance data is available.
+    """
+    stats = data.get("stats", {})
+    for key in ("s_head_cov_mat", "s_cov_mat"):
+        mats = stats.get(key, [])
+        if mats and mats[0]:
+            return len(mats[0])
+    return 128
+
+
 def plot_loss(data: dict, out_dir: Path):
     loss = data.get("loss", [])
     if not loss:
@@ -56,7 +72,14 @@ def plot_loss(data: dict, out_dir: Path):
     cov_vals  = [raw_cov[i] for i in cov_iters]
     has_cov = bool(cov_vals)
 
-    n_rows = 1 + int(has_components) + int(has_cov)
+    # Extract non-null variance penalty values.
+    raw_var = data.get("var_penalty", [])
+    var_iters = [i for i, v in enumerate(raw_var) if v is not None]
+    var_vals  = [raw_var[i] for i in var_iters]
+    has_var = bool(var_vals)
+
+    has_vicreg = has_cov or has_var
+    n_rows = 1 + int(has_components) + int(has_vicreg)
     fig, axes = plt.subplots(n_rows, 1, figsize=(10, 4 + 4 * (n_rows - 1)), sharex=False)
     if n_rows == 1:
         axes = [axes]
@@ -79,7 +102,7 @@ def plot_loss(data: dict, out_dir: Path):
     if has_components:
         ax_comp = axes[next_row]
         next_row += 1
-        K = 128  # feature dimension (number of softmax categories)
+        K = infer_feature_dim(data)  # feature dimension (number of softmax categories)
         h_max = np.log(K)  # -log(1/K) = log(K): entropy of a uniform distribution over K dims
         ax_comp.plot(t_ent_iters, t_ent_vals, linewidth=1.0, alpha=0.8,
                      color="C2", label="Teacher entropy  H(P_t)")
@@ -97,15 +120,20 @@ def plot_loss(data: dict, out_dir: Path):
         ax_comp.legend()
         ax_comp.grid(True, alpha=0.3)
 
-    if has_cov:
-        ax_cov = axes[next_row]
-        ax_cov.plot(cov_iters, cov_vals, linewidth=1.0, alpha=0.8,
-                    color="C4", label="Covariance penalty (raw, unweighted)")
-        ax_cov.set_xlabel("Iteration")
-        ax_cov.set_ylabel("Penalty")
-        ax_cov.set_title("VICReg covariance decorrelation penalty  (low → less dimensional correlation)")
-        ax_cov.legend()
-        ax_cov.grid(True, alpha=0.3)
+    if has_vicreg:
+        ax_reg = axes[next_row]
+        next_row += 1
+        if has_cov:
+            ax_reg.plot(cov_iters, cov_vals, linewidth=1.0, alpha=0.8,
+                        color="C0", label="Covariance penalty (raw, unweighted)")
+        if has_var:
+            ax_reg.plot(var_iters, var_vals, linewidth=1.0, alpha=0.8,
+                        color="C1", label="Variance penalty (raw, unweighted)")
+        ax_reg.set_xlabel("Iteration")
+        ax_reg.set_ylabel("Penalty")
+        ax_reg.set_title("VICReg penalties  (cov: low → less correlation | var: low → std above gamma)")
+        ax_reg.legend()
+        ax_reg.grid(True, alpha=0.3)
 
     fig.tight_layout()
     fig.savefig(out_dir / "loss_curve.png", dpi=100, bbox_inches="tight")

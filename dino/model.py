@@ -204,7 +204,7 @@ class DINODuneModel(nn.Module):
             # teacher_encoded[g] = (backbone_out_g, head_out_g)
 
         total_loss = None
-        sum_t_ent = sum_s_ent = sum_kl = sum_cov = 0.0
+        sum_t_ent = sum_s_ent = sum_kl = sum_cov = sum_var = 0.0
         n_metric = n_pairs = 0
 
         for k in range(n_crops):
@@ -257,7 +257,7 @@ class DINODuneModel(nn.Module):
                 student_out_kg      = _filter_voxels(student_out_k,      s_local_idx_list)
                 student_backbone_kg = _filter_voxels(student_backbone_k, s_local_idx_list)
 
-                loss_kg, t_ent, s_ent, kl, cov = loss_fn(
+                loss_kg, t_ent, s_ent, kl, cov, var = loss_fn(
                     student_out_kg, student_backbone_kg, teacher_out_g, t_local_idx_list
                 )
 
@@ -271,6 +271,8 @@ class DINODuneModel(nn.Module):
                     n_metric  += 1
                 if cov is not None:
                     sum_cov += cov
+                if var is not None:
+                    sum_var += var
 
         total_loss = total_loss / n_pairs
         total_loss.backward()
@@ -279,12 +281,13 @@ class DINODuneModel(nn.Module):
         avg_s_ent = sum_s_ent / n_metric if n_metric > 0 else None
         avg_kl    = sum_kl    / n_metric if n_metric > 0 else None
         avg_cov   = sum_cov   / n_pairs  if sum_cov != 0.0 else None
+        avg_var   = sum_var   / n_pairs  if sum_var != 0.0 else None
 
         # Logging: last student crop, first teacher global crop
         teacher_backbone_log, teacher_out_log = teacher_encoded[0]
         return (
             total_loss.item(),
-            avg_t_ent, avg_s_ent, avg_kl, avg_cov,
+            avg_t_ent, avg_s_ent, avg_kl, avg_cov, avg_var,
             student_backbone_k, teacher_backbone_log,
             student_out_k, teacher_out_log,
         )
@@ -322,7 +325,7 @@ class DINODuneModel(nn.Module):
         student_backbone_out, student_out = self.encode_student(xs_student)
 
         # Compute loss and backprop
-        loss, teacher_entropy, student_entropy, kl, cov_penalty = loss_fn(student_out, student_backbone_out, teacher_out, kept_indices)
+        loss, teacher_entropy, student_entropy, kl, cov_penalty, var_penalty = loss_fn(student_out, student_backbone_out, teacher_out, kept_indices)
         loss.backward()
 
-        return loss.item(), teacher_entropy, student_entropy, kl, cov_penalty, student_backbone_out, teacher_backbone_out, student_out, teacher_out
+        return loss.item(), teacher_entropy, student_entropy, kl, cov_penalty, var_penalty, student_backbone_out, teacher_backbone_out, student_out, teacher_out

@@ -95,7 +95,7 @@ def validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_m
 
                     student_out_kg      = _filter_voxels(student_out_k,      s_local_idx_list)
                     student_backbone_kg = _filter_voxels(student_backbone_k, s_local_idx_list)
-                    loss_k, _, _, _, _  = loss_fn(student_out_kg, student_backbone_kg, teacher_out_g, t_local_idx_list)
+                    loss_k, _, _, _, _, _  = loss_fn(student_out_kg, student_backbone_kg, teacher_out_g, t_local_idx_list)
                     batch_loss = loss_k if batch_loss is None else batch_loss + loss_k
                     n_pairs += 1
             loss_val = (batch_loss / n_pairs).item()
@@ -103,7 +103,7 @@ def validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_m
             xs_student, kept_indices = augmenter(xs)
             _, teacher_out = model.encode_teacher(xs)
             student_backbone_out, student_out = model.encode_student(xs_student)
-            loss, _, _, _, _ = loss_fn(student_out, student_backbone_out, teacher_out, kept_indices)
+            loss, _, _, _, _, _ = loss_fn(student_out, student_backbone_out, teacher_out, kept_indices)
             loss_val = loss.item()
 
         total_loss += loss_val
@@ -139,6 +139,9 @@ def main(
     proj_head_n_layers: int = 2,
     use_cov_penalty: bool = True,
     cov_penalty_weight: float = 10.0,
+    use_var_penalty: bool = False,
+    var_penalty_weight: float = 1.0,
+    var_gamma: float = 1.0,
     momentum_start: float = 0.996,
     momentum_end: float = 0.9999,
     weight_decay: float = 0.04,
@@ -183,6 +186,9 @@ def main(
         proj_head_n_layers: number of MLP layers before the final FC
         use_cov_penalty: add VICReg covariance decorrelation penalty on student features
         cov_penalty_weight: weight for the covariance penalty term
+        use_var_penalty: add VICReg variance penalty (hinge on per-dim std >= var_gamma)
+        var_penalty_weight: weight for the variance penalty term
+        var_gamma: target minimum std per feature dimension
         momentum_start: Initial EMA momentum
         momentum_end: Final EMA momentum
         weight_decay: L2 regularization
@@ -236,6 +242,9 @@ def main(
         student_temp=student_temp,
         use_cov_penalty=use_cov_penalty,
         cov_penalty_weight=cov_penalty_weight,
+        use_var_penalty=use_var_penalty,
+        var_penalty_weight=var_penalty_weight,
+        var_gamma=var_gamma,
         momentum_start=momentum_start,
         momentum_end=momentum_end,
         lr=lr,
@@ -268,7 +277,8 @@ def main(
     print(f'Loss: type={cfg.loss_type}, center_momentum={cfg.center_momentum}, '
           f'use_centering={cfg.use_centering}, teacher_temp={cfg.teacher_temp}, '
           f'student_temp={cfg.student_temp}, use_cov_penalty={cfg.use_cov_penalty}, '
-          f'cov_penalty_weight={cfg.cov_penalty_weight}')
+          f'cov_penalty_weight={cfg.cov_penalty_weight}, use_var_penalty={cfg.use_var_penalty}, '
+          f'var_penalty_weight={cfg.var_penalty_weight}, var_gamma={cfg.var_gamma}')
 
     # ============ Data ============
     print("\nLoading dataset...")
@@ -358,6 +368,9 @@ def main(
         student_temp=cfg.student_temp,
         use_cov_penalty=cfg.use_cov_penalty,
         cov_penalty_weight=cfg.cov_penalty_weight,
+        use_var_penalty=cfg.use_var_penalty,
+        var_penalty_weight=cfg.var_penalty_weight,
+        var_gamma=cfg.var_gamma,
     ).to(device)
 
     # ============ Schedulers ============
@@ -421,12 +434,12 @@ def main(
             optimizer.zero_grad()
             if augmentation_mode == "cropping":
                 (loss_val, teacher_entropy, student_entropy,
-                 kl, cov_penalty,
+                 kl, cov_penalty, var_penalty,
                  student_backbone_out, teacher_backbone_out,
                  student_out, teacher_out) = model.forward_backward_crops(data, augmenter, loss_fn)
             else:
                 (loss_val, teacher_entropy, student_entropy,
-                 kl, cov_penalty,
+                 kl, cov_penalty, var_penalty,
                  student_backbone_out, teacher_backbone_out,
                  student_out, teacher_out) = model.forward_backward(data, augmenter, loss_fn)
             optimizer.step()
@@ -440,7 +453,7 @@ def main(
 
             # Scalar logging
             n_valid = student_out.feature_tensor.shape[0]
-            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, student_entropy, kl, cov_penalty)
+            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, student_entropy, kl, cov_penalty, var_penalty)
 
             # Gradient norms per backbone module (.grad still populated before next zero_grad)
             debugger.log_gradient_norms(iteration, model.student)
@@ -464,8 +477,10 @@ def main(
             del student_backbone_out, student_out, teacher_backbone_out, teacher_out
 
             if (batch_idx + 1) % 50 == 0 or batch_idx == 0:
+                cov_str = f", cov={cov_penalty:.4f}" if cov_penalty is not None else ""
+                var_str = f", var={var_penalty:.4f}" if var_penalty is not None else ""
                 print(f"[{epoch}/{epochs}] iter {iteration}: loss={loss_val:.6f}, "
-                      f"lr={lr_val:.2e}, mom={mom_val:.6f}")
+                      f"lr={lr_val:.2e}, mom={mom_val:.6f}{cov_str}{var_str}")
 
         # Validation
         val_loss = validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_mode)

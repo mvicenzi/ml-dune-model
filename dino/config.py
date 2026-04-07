@@ -55,6 +55,9 @@ class DINOConfig:
     normalize_features: bool = False  # L2-normalise student+teacher features before loss; set to False when use_proj_head=True (head normalises internally)
     use_cov_penalty: bool = True      # add VICReg covariance decorrelation penalty
     cov_penalty_weight: float = 10  # weight for the covariance penalty term
+    use_var_penalty: bool = False     # add VICReg variance penalty (hinge on per-dim std)
+    var_penalty_weight: float = 1.0  # weight for the variance penalty term
+    var_gamma: float = 1.0           # target minimum std per feature dimension
 
     # ============ Data ============
     rootdir: str = "/nfs/data/1/rrazakami/work/data_cvn/data/dune/2023_trainings/latest/dunevd"
