@@ -4,8 +4,9 @@ Vertex-focused k-NN analysis of DINO features.
 For each image the neutrino interaction vertex is estimated in two steps:
   1. Restrict active pixels to a coarse **search region** around the known
      approximate vertex position (time ≈ 0, wire ≈ 250).
-  2. Within that region, pick the pixel with the highest count of active
-     neighbours (from the whole image) within radius `--density_r`.
+  2. Within that region, apply a charge threshold, then find the earliest-time
+     pixel that has at least `--min_neighbors` neighbours within radius
+     `--neighbor_r` (Option A — earliest connected pixel).
 
 An evaluation box of size `(2*box_h) × (2*box_w)` is centred on that refined
 vertex.  Two analyses are run on those box pixels:
@@ -33,7 +34,8 @@ Produces (in --out_dir):
 Usage:
     python -m dino.diagnostics.plot_knn_vertex path/to/features_ep10.npz
     python -m dino.diagnostics.plot_knn_vertex path/to/features_ep10.npz \\
-        --search_h=80 --search_w=100 --density_r=10 \\
+        --search_h=100 --search_w=100 --charge_threshold=100 \\
+        --neighbor_r=3 --min_neighbors=5 \\
         --box_h=30 --box_w=30 --n_images=2000 --device=cuda
 """
 
@@ -61,40 +63,53 @@ from dino.diagnostics.plot_knn import (
 
 def _find_vertex(
     pos: np.ndarray,
+    chg: np.ndarray,
     search_row: int,
     search_col: int,
     search_h: int,
     search_w: int,
-    density_r: float,
+    charge_threshold: float,
+    neighbor_r: float,
+    min_neighbors: int,
 ) -> tuple:
     """
-    Find the local density maximum inside the search region.
+    Option A — earliest pixel with minimum local support.
 
-    pos        : [N, 2] float32  (row, col) of all active pixels in one image
-    search_row : top row of the search region
-    search_col : centre column of the search region
-    search_h   : height of the search region  (rows [search_row, search_row+search_h))
-    search_w   : half-width of the search region (cols [search_col±search_w))
-    density_r  : neighbour-counting radius (pixels, L2)
+    pos              : [N, 2]  float32  (row, col) of all active pixels
+    chg              : [N, 1]  float32  raw pixel charge (ADC)
+    search_row       : top row of the search region
+    search_col       : centre column of the search region
+    search_h         : height of the search region
+    search_w         : half-width of the search region
+    charge_threshold : minimum ADC value; pixels below are ignored
+    neighbor_r       : radius (pixels, L2) for neighbour counting
+    min_neighbors    : minimum neighbours required to not be a blip
 
     Returns (vertex_row, vertex_col) as floats.
     Falls back to (search_row, search_col) if the search region is empty.
     """
     rows, cols = pos[:, 0], pos[:, 1]
+    chg_vals   = chg[:, 0] if chg.ndim == 2 else chg
+
     mask = (
         (rows >= search_row) & (rows < search_row + search_h) &
-        (cols >= search_col - search_w) & (cols < search_col + search_w)
+        (cols >= search_col - search_w) & (cols < search_col + search_w) &
+        (chg_vals >= charge_threshold)
     )
     candidates = pos[mask]   # [C, 2]
 
     if len(candidates) == 0:
         return float(search_row), float(search_col)
 
-    # Count neighbours from the full image within density_r
-    diff   = candidates[:, None, :] - pos[None, :, :]                  # [C, N, 2]
-    counts = (np.linalg.norm(diff, axis=-1) < density_r).sum(axis=1)  # [C]
+    # Neighbour counts within the search region only (excludes shower activity outside)
+    diff   = candidates[:, None, :] - candidates[None, :, :]   # [C, C, 2]
+    counts = (np.linalg.norm(diff, axis=-1) < neighbor_r).sum(axis=1) - 1  # exclude self
 
-    best = candidates[counts.argmax()]
+    connected = candidates[counts >= min_neighbors]
+    if len(connected) == 0:
+        connected = candidates[[counts.argmax()]]   # fallback: best-connected pixel
+
+    best = connected[connected[:, 0].argmin()]
     return float(best[0]), float(best[1])
 
 
@@ -106,6 +121,7 @@ def _collect(
     s_feats: np.ndarray,
     t_feats: np.ndarray,
     positions: np.ndarray,
+    charges: np.ndarray,
     offsets: np.ndarray,
     labels: np.ndarray,
     n_images: int,
@@ -113,7 +129,9 @@ def _collect(
     search_col: int,
     search_h: int,
     search_w: int,
-    density_r: float,
+    charge_threshold: float,
+    neighbor_r: float,
+    min_neighbors: int,
     box_h: int,
     box_w: int,
     seed: int = 42,
@@ -155,9 +173,11 @@ def _collect(
     for img_idx in img_indices:
         sl  = slice(offsets[img_idx], offsets[img_idx + 1])
         pos = positions[sl].astype(np.float32)
+        chg = charges[sl]
 
         vr, vc = _find_vertex(
-            pos, search_row, search_col, search_h, search_w, density_r
+            pos, chg, search_row, search_col, search_h, search_w,
+            charge_threshold, neighbor_r, min_neighbors,
         )
 
         rows, cols = pos[:, 0], pos[:, 1]
@@ -347,7 +367,9 @@ def run(
     search_col: int,
     search_h: int,
     search_w: int,
-    density_r: float,
+    charge_threshold: float,
+    neighbor_r: float,
+    min_neighbors: int,
     box_h: int,
     box_w: int,
     ks: list,
@@ -364,24 +386,27 @@ def run(
     labels    = data["labels"].astype(int)
     offsets   = data["offsets"]
     positions = data["positions"]
+    charges   = data["charges"]
 
     print(f"  Valid pixels : {s_feats.shape[0]}   Feature dim: {s_feats.shape[1]}")
     print(f"  Images       : {len(labels)}")
     print(f"  Class counts : { {CLASS_NAMES[c]: int((labels==c).sum()) for c in np.unique(labels)} }")
     print(f"\n  Search region : rows [{search_row}, {search_row+search_h})  "
           f"cols [{search_col-search_w}, {search_col+search_w})")
-    print(f"  Density radius: {density_r} px")
+    print(f"  Charge threshold : {charge_threshold}  neighbor_r : {neighbor_r}  min_neighbors : {min_neighbors}")
     print(f"  Eval box      : ±{box_h} rows × ±{box_w} cols around refined vertex")
     print(f"  Images to use : {n_images}")
     print(f"  Device        : {device}")
 
     print("\nCollecting vertex pixels ...")
     s_img, t_img, img_lbls, s_pix, t_pix, pix_lbls, n_zero = _collect(
-        s_feats, t_feats, positions, offsets, labels,
+        s_feats, t_feats, positions, charges, offsets, labels,
         n_images=n_images,
         search_row=search_row, search_col=search_col,
         search_h=search_h, search_w=search_w,
-        density_r=density_r,
+        charge_threshold=charge_threshold,
+        neighbor_r=neighbor_r,
+        min_neighbors=min_neighbors,
         box_h=box_h, box_w=box_w,
         seed=seed,
     )
@@ -424,15 +449,19 @@ def main():
                         help="Top row of the vertex search region (default: 0)")
     parser.add_argument("--search_col", type=int, default=250,
                         help="Centre column of the vertex search region (default: 250)")
-    parser.add_argument("--search_h", type=int, default=80,
-                        help="Height of the search region in rows (default: 80)")
+    parser.add_argument("--search_h", type=int, default=100,
+                        help="Height of the search region in rows (default: 100)")
     parser.add_argument("--search_w", type=int, default=100,
                         help="Half-width of the search region in columns (default: 100)")
-    parser.add_argument("--density_r", type=float, default=10.0,
-                        help="Neighbour-counting radius for density estimate (default: 10)")
+    parser.add_argument("--charge_threshold", type=float, default=100.0,
+                        help="Minimum pixel ADC to be considered (default: 100)")
+    parser.add_argument("--neighbor_r", type=float, default=3.0,
+                        help="Radius for neighbour counting to filter blips (default: 3)")
+    parser.add_argument("--min_neighbors", type=int, default=5,
+                        help="Minimum neighbours required to not be a blip (default: 5)")
 
     # Evaluation box
-    parser.add_argument("--box_h", type=int, default=30,
+    parser.add_argument("--box_h", type=int, default=50,
                         help="Half-height of the evaluation box (default: 30)")
     parser.add_argument("--box_w", type=int, default=30,
                         help="Half-width of the evaluation box (default: 30)")
@@ -481,7 +510,9 @@ def main():
         search_col=args.search_col,
         search_h=args.search_h,
         search_w=args.search_w,
-        density_r=args.density_r,
+        charge_threshold=args.charge_threshold,
+        neighbor_r=args.neighbor_r,
+        min_neighbors=args.min_neighbors,
         box_h=args.box_h,
         box_w=args.box_w,
         ks=[int(k) for k in args.ks.split(",")],

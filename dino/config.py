@@ -11,6 +11,7 @@ class DINOConfig:
     backbone_name: str = "attn_default"  # key into BACKBONE_REGISTRY (e.g., "base", "attn_default")
     feature_dim: int = 64             # backbone output channels; must match model's output
     image_size: int = 500             # spatial resolution (H = W)
+    encoding_range: float = 125.0     # sinusoidal positional encoding range (bottleneck coordinate extent)
 
     # ============ Augmentation mode ============
     augmentation_mode: str = "masking"  # "masking" or "cropping"
