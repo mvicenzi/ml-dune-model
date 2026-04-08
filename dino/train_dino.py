@@ -114,6 +114,7 @@ def validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_m
 
 def main(
     backbone_name: str = "attn_default",
+    encoding_range: float = 125.0,
     epochs: int = 100,
     batch_size: int = 50,
     lr: float = 1e-4,
@@ -219,6 +220,7 @@ def main(
 
     cfg = DINOConfig(
         backbone_name=backbone_name,
+        encoding_range=encoding_range,
         augmentation_mode=augmentation_mode,
         mask_ratio=mask_ratio,
         crop_n_global=crop_n_global,
@@ -262,9 +264,9 @@ def main(
     )
 
     print(f"Device: {device}")
-    print(f"Model: backbone_name={cfg.backbone_name}, use_proj_head={cfg.use_proj_head}, "
-          f"proj_head_hidden_dim={cfg.proj_head_hidden_dim}, proj_head_output_dim={cfg.proj_head_output_dim}, "
-          f"proj_head_n_layers={cfg.proj_head_n_layers}")
+    print(f"Model: backbone_name={cfg.backbone_name}, encoding_range={cfg.encoding_range}, "
+          f"use_proj_head={cfg.use_proj_head}, proj_head_hidden_dim={cfg.proj_head_hidden_dim}, "
+          f"proj_head_output_dim={cfg.proj_head_output_dim}, proj_head_n_layers={cfg.proj_head_n_layers}")
     print(f"Config: epochs={cfg.epochs}, lr={cfg.lr}, batch_size={cfg.batch_size}, "
           f"warmup_epochs={cfg.warmup_epochs}, momentum_start={cfg.momentum_start}, "
           f"momentum_end={cfg.momentum_end}")
@@ -326,6 +328,7 @@ def main(
     print("\nBuilding model...")
     model = DINODuneModel(
         backbone_name=backbone_name,
+        encoding_range=cfg.encoding_range,
         use_proj_head=use_proj_head,
         proj_head_hidden_dim=proj_head_hidden_dim,
         proj_head_output_dim=proj_head_output_dim,

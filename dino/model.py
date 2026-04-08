@@ -1,5 +1,6 @@
 """DINO training model: student + teacher with EMA update."""
 
+import inspect
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -67,6 +68,7 @@ class DINODuneModel(nn.Module):
         proj_head_hidden_dim: int = 256,
         proj_head_output_dim: int = 256,
         proj_head_n_layers: int = 4,
+        encoding_range: float = 125.0,
     ):
         """
         Args:
@@ -75,6 +77,7 @@ class DINODuneModel(nn.Module):
             proj_head_hidden_dim: Inner MLP width (DINO paper uses 2048)
             proj_head_output_dim: Output dimension of the final FC layer
             proj_head_n_layers:   Number of MLP layers before the final FC
+            encoding_range:       Sinusoidal positional encoding range passed to the backbone
         """
         super().__init__()
 
@@ -82,11 +85,15 @@ class DINODuneModel(nn.Module):
         self.from_dense = DenseInput()
 
         # Instantiate both backbones (sparse: Voxels → Voxels)
+        # Only pass encoding_range to backbones that accept it (attn_* variants).
         backbone_cls = BACKBONE_REGISTRY[backbone_name]
+        backbone_kwargs = {}
+        if "encoding_range" in inspect.signature(backbone_cls.__init__).parameters:
+            backbone_kwargs["encoding_range"] = encoding_range
         print("Initializing STUDENT backbone:")
-        self.student = backbone_cls()
+        self.student = backbone_cls(**backbone_kwargs)
         print("Initializing TEACHER backbone:")
-        self.teacher = backbone_cls()
+        self.teacher = backbone_cls(**backbone_kwargs)
 
         # Initialize teacher with student weights
         self.teacher.load_state_dict(self.student.state_dict())
