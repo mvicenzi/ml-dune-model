@@ -10,7 +10,6 @@ class DINOConfig:
     # ============ Backbone ============
     backbone_name: str = "attn_default"  # key into BACKBONE_REGISTRY (e.g., "base", "attn_default")
     feature_dim: int = 64             # backbone output channels; must match model's output
-    image_size: int = 500             # spatial resolution (H = W)
     encoding_range: float = 125.0     # sinusoidal positional encoding range (bottleneck coordinate extent)
 
     # ============ Augmentation mode ============
@@ -67,6 +66,8 @@ class DINOConfig:
     n_subset: int = -1               # -1 = full dataset; otherwise use first N samples for testing
     batch_size: int = 16
     num_workers: int = 4
+    image_h: int = 1500               # spatial resolution: height (time ticks)
+    image_w: int = 1050               # spatial resolution: width (wire channels)
 
     # ============ Checkpointing ============
     output_dir: str = "./dino_checkpoints"

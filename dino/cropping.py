@@ -42,9 +42,9 @@ class CropConfig:
     # Maximum attempts to find a valid crop before falling back to centred crop
     max_attempts: int = 50
 
-    # Image spatial dimensions (must match dataset; 500×500 for DUNE)
-    image_h: int = 500
-    image_w: int = 500
+    # Image spatial dimensions (must match dataset; 1500 ticks × 1050 wires for DUNE)
+    image_h: int = 1500
+    image_w: int = 1050
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +254,9 @@ class SparseCropper:
             end   = int(voxels.offsets[b + 1])
             if end > start:
                 c = voxels.coordinate_tensor[start:end]
-                A_batch[b, c[:, 1].long(), c[:, 0].long()] = 1.0
+                cx = c[:, 0].long().clamp(0, cfg.image_w - 1)
+                cy = c[:, 1].long().clamp(0, cfg.image_h - 1)
+                A_batch[b, cy, cx] = 1.0
 
         H_batch = self._gpu_blur(A_batch)                  # [B, H, W] on GPU
 

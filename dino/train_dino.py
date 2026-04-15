@@ -354,8 +354,8 @@ def main(
             blur_sigma_px=cfg.crop_blur_sigma_px,
             heatmap_power=cfg.crop_heatmap_power,
             min_active_pixels=cfg.crop_min_active_pixels,
-            image_h=cfg.image_size,
-            image_w=cfg.image_size,
+            image_h=cfg.image_h,
+            image_w=cfg.image_w,
         )
         cropper = SparseCropper(crop_cfg)
         augmenter = cropper
