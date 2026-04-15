@@ -32,7 +32,7 @@ class PixelDINOLoss(nn.Module):
 
     def __init__(
         self,
-        loss_type: str = "cosine",
+        loss_type: str = "dino",
         center_momentum: float = 0.9,
         use_centering: bool = True,
         teacher_temp: float = 1.0,
@@ -40,6 +40,9 @@ class PixelDINOLoss(nn.Module):
         normalize_features: bool = True,
         use_cov_penalty: bool = False,
         cov_penalty_weight: float = 1e-3,
+        use_var_penalty: bool = False,
+        var_penalty_weight: float = 1.0,
+        var_gamma: float = 1.0,
     ):
         """
         Args:
@@ -55,6 +58,10 @@ class PixelDINOLoss(nn.Module):
             use_cov_penalty:     if True, add a VICReg-style covariance decorrelation penalty on
                                  student features to prevent dimensional collapse
             cov_penalty_weight:  scalar weight for the covariance penalty term (default 1e-3)
+            use_var_penalty:     if True, add a VICReg-style variance penalty on student features
+                                 to prevent dimensional collapse by keeping per-dim std >= var_gamma
+            var_penalty_weight:  scalar weight for the variance penalty term (default 1.0)
+            var_gamma:           target minimum std per feature dimension (default 1.0)
         """
         super().__init__()
         assert loss_type in ("cosine", "mse", "dino"), f"Unknown loss_type: {loss_type}"
@@ -66,6 +73,9 @@ class PixelDINOLoss(nn.Module):
         self.normalize_features = normalize_features
         self.use_cov_penalty = use_cov_penalty
         self.cov_penalty_weight = cov_penalty_weight
+        self.use_var_penalty = use_var_penalty
+        self.var_penalty_weight = var_penalty_weight
+        self.var_gamma = var_gamma
         # Lazily initialized on first forward call once feature dim D is known.
         # register_buffer ensures it moves with .to(device) and is saved in checkpoints.
         self.register_buffer("center", None)
@@ -176,6 +186,10 @@ class PixelDINOLoss(nn.Module):
         if self.use_cov_penalty:
             cov_penalty = self._cov_penalty(student_backbone.feature_tensor)
 
+        var_penalty = None
+        if self.use_var_penalty:
+            var_penalty = self._var_penalty(student_backbone.feature_tensor)
+
         # Two-stage reduction: sum per image via scatter, divide by count, then mean.
         # Mirrors DINOv2: sum(loss * mask) / mask.sum() per image, then .mean()
         student_counts = (student_out.offsets[1:] - student_out.offsets[:-1]).to(device)
@@ -187,8 +201,11 @@ class PixelDINOLoss(nn.Module):
 
         if self.use_cov_penalty:
             scalar_loss = scalar_loss + self.cov_penalty_weight * cov_penalty
+        if self.use_var_penalty:
+            scalar_loss = scalar_loss + self.var_penalty_weight * var_penalty
 
         cov_penalty_item = cov_penalty.item() if cov_penalty is not None else None
+        var_penalty_item = var_penalty.item() if var_penalty is not None else None
 
         if teacher_entropy_px is not None:
             per_image_t_ent = torch.zeros(B, device=loss.device, dtype=loss.dtype)
@@ -207,7 +224,7 @@ class PixelDINOLoss(nn.Module):
             s_ent = None
             kl = None
 
-        return scalar_loss, t_ent, s_ent, kl, cov_penalty_item
+        return scalar_loss, t_ent, s_ent, kl, cov_penalty_item, var_penalty_item
 
     def _cov_penalty(self, s: Tensor) -> Tensor:
         """
@@ -231,6 +248,26 @@ class PixelDINOLoss(nn.Module):
         # penalize only off-diagonal entries
         off_diag_sq = C.pow(2).sum() - C.diagonal().pow(2).sum()
         return off_diag_sq / D
+
+    def _var_penalty(self, s: Tensor) -> Tensor:
+        """
+        VICReg-style variance penalty.
+
+        Hinge loss that pushes the per-dimension std (over the batch of voxels) to
+        stay above var_gamma, preventing any single feature dimension from collapsing
+        to a constant.
+
+        Args:
+            s: Raw backbone features [N, D] (valid pixels only, before head and L2-norm)
+
+        Returns:
+            Scalar penalty: mean over dimensions of max(0, gamma - std_j)
+        """
+        N, D = s.shape
+        if N < 2:
+            return s.new_tensor(0.0)
+        std = torch.sqrt(s.var(dim=0) + 1e-4)  # [D], std per feature dimension
+        return torch.mean(torch.clamp(self.var_gamma - std, min=0.0))
 
     @torch.no_grad()
     def update_center(self, teacher_out: Voxels) -> None:

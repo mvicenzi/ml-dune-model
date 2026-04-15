@@ -31,6 +31,22 @@ def pr_from_eigen(vals: np.ndarray) -> float:
     return float(v.sum() ** 2 / denom) if denom > 0 else 1.0
 
 
+def infer_feature_dim(data: dict) -> int:
+    """
+    Infer the feature dimension used in the DINO loss from the stored covariance matrices.
+
+    Prefers the head covariance (present when a projection head was used) over the
+    backbone covariance, since the head output is what feeds into the loss.
+    Falls back to 128 if no covariance data is available.
+    """
+    stats = data.get("stats", {})
+    for key in ("s_head_cov_mat", "s_cov_mat"):
+        mats = stats.get(key, [])
+        if mats and mats[0]:
+            return len(mats[0])
+    return 128
+
+
 def plot_loss(data: dict, out_dir: Path):
     loss = data.get("loss", [])
     if not loss:
@@ -50,13 +66,29 @@ def plot_loss(data: dict, out_dir: Path):
     kl_vals     = [raw_kl[i] for i in kl_iters]
     has_components = bool(t_ent_vals and kl_vals)
 
+    # Backbone entropies (only present when a projection head was used).
+    raw_bb_t_ent = data.get("backbone_teacher_entropy", [])
+    raw_bb_s_ent = data.get("backbone_student_entropy", [])
+    bb_t_ent_iters = [i for i, v in enumerate(raw_bb_t_ent) if v is not None]
+    bb_t_ent_vals  = [raw_bb_t_ent[i] for i in bb_t_ent_iters]
+    bb_s_ent_iters = [i for i, v in enumerate(raw_bb_s_ent) if v is not None]
+    bb_s_ent_vals  = [raw_bb_s_ent[i] for i in bb_s_ent_iters]
+    has_backbone_entropy = bool(bb_t_ent_vals)
+
     # Extract non-null covariance penalty values.
     raw_cov = data.get("cov_penalty", [])
     cov_iters = [i for i, v in enumerate(raw_cov) if v is not None]
     cov_vals  = [raw_cov[i] for i in cov_iters]
     has_cov = bool(cov_vals)
 
-    n_rows = 1 + int(has_components) + int(has_cov)
+    # Extract non-null variance penalty values.
+    raw_var = data.get("var_penalty", [])
+    var_iters = [i for i, v in enumerate(raw_var) if v is not None]
+    var_vals  = [raw_var[i] for i in var_iters]
+    has_var = bool(var_vals)
+
+    has_vicreg = has_cov or has_var
+    n_rows = 1 + int(has_components) + int(has_vicreg)
     fig, axes = plt.subplots(n_rows, 1, figsize=(10, 4 + 4 * (n_rows - 1)), sharex=False)
     if n_rows == 1:
         axes = [axes]
@@ -79,36 +111,52 @@ def plot_loss(data: dict, out_dir: Path):
     if has_components:
         ax_comp = axes[next_row]
         next_row += 1
-        K = 128  # feature dimension (number of softmax categories)
+        K = infer_feature_dim(data)  # head feature dimension (number of softmax categories)
         h_max = np.log(K)  # -log(1/K) = log(K): entropy of a uniform distribution over K dims
         ax_comp.plot(t_ent_iters, t_ent_vals, linewidth=1.0, alpha=0.8,
-                     color="C2", label="Teacher entropy  H(P_t)")
+                     color="C2", label="Teacher entropy  H(P_t)  [head]")
         if s_ent_vals:
             ax_comp.plot(s_ent_iters, s_ent_vals, linewidth=1.0, alpha=0.8,
-                         color="C0", label="Student entropy  H(P_s)")
+                         color="C0", label="Student entropy  H(P_s)  [head]")
         ax_comp.plot(kl_iters, kl_vals, linewidth=1.0, alpha=0.8,
                      color="C3", label="KL divergence  KL(P_t|P_s)")
         ax_comp.axhline(h_max, color="C2", linewidth=1.2, linestyle="--", alpha=0.7,
-                        label=f"H_max = log({K})")
+                        label=f"H_max = log({K})  [head]")
+        if has_backbone_entropy:
+            # Backbone dim from backbone covariance matrix (falls back to 64 if not available)
+            bb_mats = data.get("stats", {}).get("s_cov_mat", [])
+            K_bb = len(bb_mats[0]) if bb_mats and bb_mats[0] else 64
+            h_max_bb = np.log(K_bb)
+            ax_comp.plot(bb_t_ent_iters, bb_t_ent_vals, linewidth=1.0, alpha=0.5,
+                         color="C2", linestyle=":", label="Teacher entropy  H(P_t)  [backbone]")
+            ax_comp.plot(bb_s_ent_iters, bb_s_ent_vals, linewidth=1.0, alpha=0.5,
+                         color="C0", linestyle=":", label="Student entropy  H(P_s)  [backbone]")
+            ax_comp.axhline(h_max_bb, color="grey", linewidth=1.0, linestyle="--", alpha=0.5,
+                            label=f"H_max = log({K_bb})  [backbone]")
         ax_comp.set_xlabel("Iteration")
         ax_comp.set_ylabel("Nats")
         ax_comp.set_title("Loss decomposition: H(P_t, P_s) = H(P_t) + KL(P_t|P_s)  |  H(P_s)")
         #ax_comp.set_yscale("log")
-        ax_comp.legend()
+        ax_comp.legend(loc="upper right")
         ax_comp.grid(True, alpha=0.3)
 
-    if has_cov:
-        ax_cov = axes[next_row]
-        ax_cov.plot(cov_iters, cov_vals, linewidth=1.0, alpha=0.8,
-                    color="C4", label="Covariance penalty (raw, unweighted)")
-        ax_cov.set_xlabel("Iteration")
-        ax_cov.set_ylabel("Penalty")
-        ax_cov.set_title("VICReg covariance decorrelation penalty  (low → less dimensional correlation)")
-        ax_cov.legend()
-        ax_cov.grid(True, alpha=0.3)
+    if has_vicreg:
+        ax_reg = axes[next_row]
+        next_row += 1
+        if has_cov:
+            ax_reg.plot(cov_iters, cov_vals, linewidth=1.0, alpha=0.8,
+                        color="C0", label="Covariance penalty (raw, unweighted)")
+        if has_var:
+            ax_reg.plot(var_iters, var_vals, linewidth=1.0, alpha=0.8,
+                        color="C1", label="Variance penalty (raw, unweighted)")
+        ax_reg.set_xlabel("Iteration")
+        ax_reg.set_ylabel("Penalty")
+        ax_reg.set_title("VICReg penalties  (cov: low → less correlation | var: low → std above gamma)")
+        ax_reg.legend()
+        ax_reg.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    fig.savefig(out_dir / "loss_curve.png", dpi=100, bbox_inches="tight")
+    fig.savefig(out_dir / "loss_curve.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved loss_curve.png")
 
@@ -183,22 +231,22 @@ def plot_stats(data: dict, out_dir: Path, label: str = "backbone", mat_key: str 
         ax.fill_between(iters, mins, maxs, alpha=0.3, color=color, label="Min–Max")
         ax.plot(iters, medians, linewidth=1.5, color=color, label="Median")
         ax.set_ylabel("Per-pixel L2 norm")
-        ax.set_title(f"{name} feature magnitude  (high → potential divergence)")
+        ax.set_title(f"{name} feature magnitude")
         ax.legend(fontsize=8)
         ax.set_yscale("log")
         ax.set_xlabel("Iteration")
         ax.grid(True, alpha=0.3)
 
     # Row 1: per-feature variance 2D histogram
-    draw_hist2d(axes[1, 0], [np.diag(m) for m in s_mats], "Per-feature variance", f"Student Variance [{label}]  (low → dimensional collapse)")
-    draw_hist2d(axes[1, 1], [np.diag(m) for m in t_mats], "Per-feature variance", f"Teacher Variance [{label}]  (low → dimensional collapse)")
+    draw_hist2d(axes[1, 0], [np.diag(m) for m in s_mats], "Per-feature variance", f"Student Variance [{label}]")
+    draw_hist2d(axes[1, 1], [np.diag(m) for m in t_mats], "Per-feature variance", f"Teacher Variance [{label}]")
 
     # Row 2: participation ratio (scalar)
     for col, (pr, role) in enumerate([(s_pr, "Student"), (t_pr, "Teacher")]):
         ax = axes[2, col]
         ax.plot(iters, pr, linewidth=1.5, color=f"C{col}")
         ax.set_ylabel("Effective rank  [1, D]")
-        ax.set_title(f"{role} Participation Ratio [{label}]  (low → few dominant channels)")
+        ax.set_title(f"{role} Participation Ratio [{label}]")
         ax.set_xlabel("Iteration")
         ax.grid(True, alpha=0.3)
 
@@ -243,7 +291,7 @@ def plot_cov_heatmap(data: dict, out_dir: Path, label: str = "backbone", mat_key
 
         fig.tight_layout()
         fname = f"cov_heatmap_{label}_{snap}.png"
-        fig.savefig(out_dir / fname, dpi=100, bbox_inches="tight")
+        fig.savefig(out_dir / fname, dpi=200, bbox_inches="tight")
         plt.close(fig)
         print(f"  saved {fname}")
 
@@ -293,7 +341,7 @@ def plot_eigen(data: dict, out_dir: Path, label: str = "backbone", mat_key: str 
 
         fig.tight_layout()
         fname = f"eigen_{label}_{snap}.png"
-        fig.savefig(out_dir / fname, dpi=100, bbox_inches="tight")
+        fig.savefig(out_dir / fname, dpi=200, bbox_inches="tight")
         plt.close(fig)
         print(f"  saved {fname}")
 
@@ -322,7 +370,7 @@ def plot_center_stats(data: dict, out_dir: Path):
     axes[1].grid(True, alpha=0.3)
 
     fig.tight_layout()
-    fig.savefig(out_dir / "center_stats.png", dpi=100, bbox_inches="tight")
+    fig.savefig(out_dir / "center_stats.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved center_stats.png")
 
@@ -394,7 +442,7 @@ def plot_grads(data: dict, out_dir: Path):
 
     fig.suptitle("Gradient Norms per Backbone Module", fontsize=12)
     fig.tight_layout()
-    fig.savefig(out_dir / "grad_norms.png", dpi=100, bbox_inches="tight")
+    fig.savefig(out_dir / "grad_norms.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved grad_norms.png")
 

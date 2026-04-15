@@ -19,10 +19,12 @@ Output (.npz):
     student_head_features  [N_valid, D_hd]   float32   student head features (only if head present)
     labels            [N_images]     int64     class label per image
     positions         [N_valid, 2]   int32     (row, col) pixel coordinates
+    charges           [N_valid, 1]   float32   raw pixel charge (ADC value) at each active pixel
     offsets           [N_images+1]   int64     CSR-style: image i occupies rows offsets[i]:offsets[i+1]
 """
 
 import fire
+import inspect
 import numpy as np
 import torch
 from pathlib import Path
@@ -38,7 +40,11 @@ from warpconvnet.geometry.types.voxels import Voxels
 
 def _load_backbone(ckpt: dict, key: str, device: torch.device):
     cfg = ckpt["cfg"]
-    model = BACKBONE_REGISTRY[cfg.backbone_name]().to(device)
+    backbone_cls = BACKBONE_REGISTRY[cfg.backbone_name]
+    backbone_kwargs = {}
+    if "encoding_range" in inspect.signature(backbone_cls.__init__).parameters:
+        backbone_kwargs["encoding_range"] = cfg.encoding_range
+    model = backbone_cls(**backbone_kwargs).to(device)
     model.load_state_dict(ckpt[key])
     model.eval()
     for p in model.parameters():
@@ -71,9 +77,9 @@ def _run_loader(student, teacher, loader, device, student_head=None, teacher_hea
 
     Returns flat arrays: student_features, teacher_features,
     student_head_features (or None), teacher_head_features (or None),
-    labels, positions — one row per valid (non-zero) pixel.
+    labels, positions, charges — one row per valid (non-zero) pixel.
     """
-    s_feats_all, t_feats_all, labels_all, pos_all, offsets = [], [], [], [], [0]
+    s_feats_all, t_feats_all, labels_all, pos_all, charges_all, offsets = [], [], [], [], [], [0]
     s_head_all, t_head_all = [], []
     have_head = student_head is not None
 
@@ -81,12 +87,16 @@ def _run_loader(student, teacher, loader, device, student_head=None, teacher_hea
         images = images.to(device)          # [B, 1, H, W]
 
         # Convert dense → sparse; coords are (row, col) for active pixels
-        xs = Voxels.from_dense(images)      # Voxels: N_active voxels across batch
+        xs = Voxels.from_dense(images)                  # Voxels: N_active voxels across batch
 
-        s_out = student(xs)                 # Voxels [N_active, D_bb]
-        t_out = teacher(xs)                 # Voxels [N_active, D_bb]
+        # Grab raw pixel charges before the model transforms the features
+        input_charges = xs.feature_tensor.float()       # [N_active, 1]
+
+        s_out = student(xs)                             # Voxels [N_active, D_bb]
+        t_out = teacher(xs)                             # Voxels [N_active, D_bb]
 
         coords   = xs.coordinate_tensor.cpu()              # [N_active, 2]
+        charges  = input_charges.cpu()                     # [N_active, 1]
         s_feats  = s_out.feature_tensor.float().cpu()      # [N_active, D_bb]
         t_feats  = t_out.feature_tensor.float().cpu()      # [N_active, D_bb]
         img_offs = xs.offsets.cpu()                        # [B+1]
@@ -103,6 +113,7 @@ def _run_loader(student, teacher, loader, device, student_head=None, teacher_hea
             s_feats_all.append(s_feats[start:end].numpy())
             t_feats_all.append(t_feats[start:end].numpy())
             pos_all.append(coords[start:end].numpy())
+            charges_all.append(charges[start:end].numpy())
             labels_all.append(labels[b].item())
             offsets.append(offsets[-1] + n)
 
@@ -111,20 +122,21 @@ def _run_loader(student, teacher, loader, device, student_head=None, teacher_hea
                 t_head_all.append(t_hd[start:end].numpy())
 
     return (
-        np.concatenate(s_feats_all, axis=0).astype(np.float32),
-        np.concatenate(t_feats_all, axis=0).astype(np.float32),
-        np.concatenate(s_head_all,  axis=0).astype(np.float32) if have_head else None,
-        np.concatenate(t_head_all,  axis=0).astype(np.float32) if have_head else None,
+        np.concatenate(s_feats_all,  axis=0).astype(np.float32),
+        np.concatenate(t_feats_all,  axis=0).astype(np.float32),
+        np.concatenate(s_head_all,   axis=0).astype(np.float32) if have_head else None,
+        np.concatenate(t_head_all,   axis=0).astype(np.float32) if have_head else None,
         np.array(labels_all, dtype=np.int64),
-        np.concatenate(pos_all,     axis=0).astype(np.int32),
-        np.array(offsets,           dtype=np.int64),
+        np.concatenate(pos_all,      axis=0).astype(np.int32),
+        np.concatenate(charges_all,  axis=0).astype(np.float32),
+        np.array(offsets,            dtype=np.int64),
     )
 
 
 def main(
     checkpoint: str,
     output: str = "",
-    max_images: int = 5000,
+    max_images: int = 10000,
     batch_size: int = 32,
     num_workers: int = 4,
     device: str = "cuda",
@@ -190,7 +202,7 @@ def main(
 
     # Extract
     print("Extracting features ...")
-    s_feats, t_feats, s_head_feats, t_head_feats, labels, positions, offsets = _run_loader(
+    s_feats, t_feats, s_head_feats, t_head_feats, labels, positions, charges, offsets = _run_loader(
         student, teacher, loader, device, student_head, teacher_head
     )
 
@@ -205,6 +217,7 @@ def main(
         teacher_features=t_feats,
         labels=labels,
         positions=positions,
+        charges=charges,
         offsets=offsets,
     )
     if s_head_feats is not None:

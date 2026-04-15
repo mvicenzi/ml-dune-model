@@ -11,9 +11,23 @@ class DINOConfig:
     backbone_name: str = "attn_default"  # key into BACKBONE_REGISTRY (e.g., "base", "attn_default")
     feature_dim: int = 64             # backbone output channels; must match model's output
     image_size: int = 500             # spatial resolution (H = W)
+    encoding_range: float = 125.0     # sinusoidal positional encoding range (bottleneck coordinate extent)
+
+    # ============ Augmentation mode ============
+    augmentation_mode: str = "masking"  # "masking" or "cropping"
 
     # ============ Masking ============
-    mask_ratio: float = 0.5  # fraction of active pixels to mask for student
+    mask_ratio: float = 0.5  # fraction of active pixels to mask for student (masking mode only)
+
+    # ============ Cropping ============
+    crop_n_global: int = 2               # number of global crops per image
+    crop_n_local: int = 4                # number of local crops per image
+    crop_global_scale: tuple = (0.4, 1.0)  # global crop area as fraction of image area
+    crop_local_scale: tuple = (0.05, 0.2)  # local crop area as fraction of image area
+    crop_aspect_ratio: tuple = (0.75, 1.333)  # width-to-height aspect ratio range
+    crop_blur_sigma_px: float = 10.0     # Gaussian blur sigma for activity heatmap (px)
+    crop_heatmap_power: float = 1.0      # exponent applied to heatmap before sampling
+    crop_min_active_pixels: int = 10     # minimum active voxels required inside a crop
 
     # ============ EMA teacher ============
     momentum_start: float = 0.996      # EMA momentum schedule start (slow teacher update)
@@ -42,6 +56,9 @@ class DINOConfig:
     normalize_features: bool = False  # L2-normalise student+teacher features before loss; set to False when use_proj_head=True (head normalises internally)
     use_cov_penalty: bool = True      # add VICReg covariance decorrelation penalty
     cov_penalty_weight: float = 10  # weight for the covariance penalty term
+    use_var_penalty: bool = False     # add VICReg variance penalty (hinge on per-dim std)
+    var_penalty_weight: float = 1.0  # weight for the variance penalty term
+    var_gamma: float = 1.0           # target minimum std per feature dimension
 
     # ============ Data ============
     rootdir: str = "/nfs/data/1/rrazakami/work/data_cvn/data/dune/2023_trainings/latest/dunevd"

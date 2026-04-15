@@ -11,6 +11,7 @@ import inspect
 import json
 import sys
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from pathlib import Path
 from torch.utils.data import DataLoader
@@ -20,20 +21,25 @@ from loader.splits import train_val_split, Subset
 
 from .config import DINOConfig
 from .masking import SparseVoxelMasker
+from .cropping import CropConfig, SparseCropper
 from .loss import PixelDINOLoss
 from .scheduler import CosineScheduler
-from .model import DINODuneModel
+from .model import DINODuneModel, _filter_voxels
 from .debug import DINODebugger
 
 
 @torch.no_grad()
-def validate_epoch(model, val_loader, masker, loss_fn, device):
+def validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_mode="masking"):
     """
     Compute mean DINO loss on the validation set.
 
     Student runs in eval mode (no dropout / batchnorm stochasticity) with the
-    same random masking as during training. Teacher is always in eval mode.
+    same augmentation as during training. Teacher is always in eval mode.
     No gradients are computed. Model is restored to train mode before returning.
+
+    Args:
+        augmenter: SparseVoxelMasker (masking mode) or SparseCropper (cropping mode)
+        augmentation_mode: "masking" or "cropping"
 
     Returns:
         mean validation loss (0.0 if val_loader is empty)
@@ -45,11 +51,61 @@ def validate_epoch(model, val_loader, masker, loss_fn, device):
     for data, _ in val_loader:
         data = data.to(device)
         xs = model.from_dense(data)
-        xs_student, kept_indices = masker(xs)
-        _ , teacher_out = model.encode_teacher(xs)
-        student_backbone_out, student_out = model.encode_student(xs_student)
-        loss, _, _, _, _ = loss_fn(student_out, student_backbone_out, teacher_out, kept_indices)
-        total_loss += loss.item()
+
+        if augmentation_mode == "cropping":
+            n_global = augmenter.cfg.n_global
+            B        = len(xs.offsets) - 1
+            device_  = xs.coordinate_tensor.device
+
+            crops, kept_indices_list, teacher_luts = augmenter(xs)
+            n_crops = len(crops)
+
+            teacher_encoded = [model.encode_teacher(crops[g]) for g in range(n_global)]
+
+            batch_loss = None
+            n_pairs    = 0
+            for k in range(n_crops):
+                student_backbone_k, student_out_k = model.encode_student(crops[k])
+                for g in range(n_global):
+                    if k == g:
+                        continue
+                    _, teacher_out_g = teacher_encoded[g]
+
+                    s_local_idx_list, t_local_idx_list = [], []
+                    for b in range(B):
+                        S_k_b = kept_indices_list[k][b]
+                        lut = teacher_luts[g][b]
+                        if S_k_b.numel() == 0:
+                            empty = torch.zeros(0, dtype=torch.long, device=device_)
+                            s_local_idx_list.append(empty)
+                            t_local_idx_list.append(empty)
+                            continue
+                        t_local_raw = lut[S_k_b]
+                        valid = t_local_raw >= 0
+                        s_local = valid.nonzero(as_tuple=False).squeeze(1)
+                        if s_local.numel() == 0:
+                            empty = torch.zeros(0, dtype=torch.long, device=device_)
+                            s_local_idx_list.append(empty)
+                            t_local_idx_list.append(empty)
+                            continue
+                        t_local = t_local_raw[valid]
+                        s_local_idx_list.append(s_local)
+                        t_local_idx_list.append(t_local)
+
+                    student_out_kg      = _filter_voxels(student_out_k,      s_local_idx_list)
+                    student_backbone_kg = _filter_voxels(student_backbone_k, s_local_idx_list)
+                    loss_k, _, _, _, _, _  = loss_fn(student_out_kg, student_backbone_kg, teacher_out_g, t_local_idx_list)
+                    batch_loss = loss_k if batch_loss is None else batch_loss + loss_k
+                    n_pairs += 1
+            loss_val = (batch_loss / n_pairs).item()
+        else:
+            xs_student, kept_indices = augmenter(xs)
+            _, teacher_out = model.encode_teacher(xs)
+            student_backbone_out, student_out = model.encode_student(xs_student)
+            loss, _, _, _, _, _ = loss_fn(student_out, student_backbone_out, teacher_out, kept_indices)
+            loss_val = loss.item()
+
+        total_loss += loss_val
         n_batches += 1
 
     model.train()  # restores student; teacher stays eval via DINODuneModel.train()
@@ -58,22 +114,35 @@ def validate_epoch(model, val_loader, masker, loss_fn, device):
 
 def main(
     backbone_name: str = "attn_default",
+    encoding_range: float = 125.0,
     epochs: int = 100,
     batch_size: int = 50,
     lr: float = 1e-4,
+    augmentation_mode: str = "masking",
     mask_ratio: float = 0.5,
+    crop_n_global: int = 2,
+    crop_n_local: int = 4,
+    crop_global_scale: tuple = (0.4, 1.0),
+    crop_local_scale: tuple = (0.05, 0.2),
+    crop_aspect_ratio: tuple = (0.75, 1.333),
+    crop_blur_sigma_px: float = 10.0,
+    crop_heatmap_power: float = 1.0,
+    crop_min_active_pixels: int = 10,
     loss_type: str = "dino",
-    center_momentum: float = 0.995,
+    center_momentum: float = 0.9,
     use_centering: bool = True,
-    teacher_temp: float = 0.04,
+    teacher_temp: float = 0.07,
     student_temp: float = 0.1,
     use_proj_head: bool = True,
     proj_head_hidden_dim: int = 256,
     proj_head_output_dim: int = 128,
     proj_head_n_layers: int = 2,
     use_cov_penalty: bool = True,
-    cov_penalty_weight: float = 10.0,
-    momentum_start: float = 0.996,
+    cov_penalty_weight: float = 1.0,
+    use_var_penalty: bool = True,
+    var_penalty_weight: float = 1.0,
+    var_gamma: float = 0.5,
+    momentum_start: float = 0.998,
     momentum_end: float = 0.9999,
     weight_decay: float = 0.04,
     weight_decay_end: float = 0.4,
@@ -81,11 +150,11 @@ def main(
     output_dir: str = "./dino_checkpoints",
     save_every: int = 10,
     device: str = "cuda",
-    debug: bool = False,
+    debug: bool = True,
     debug_every: int = 100,
     debug_dir: str = "./dino_debug",
     run_name: str = "",
-    test_mode: bool = False,
+    test_mode: bool = True,
     num_workers: int = 4,
 ):
     """
@@ -96,7 +165,16 @@ def main(
         epochs: Number of training epochs
         batch_size: Batch size per GPU
         lr: Base learning rate
-        mask_ratio: Fraction of active pixels to mask
+        augmentation_mode: "masking" (default) or "cropping"
+        mask_ratio: Fraction of active pixels to mask (masking mode only)
+        crop_n_global: Number of global crops per image (cropping mode)
+        crop_n_local: Number of local crops per image (cropping mode)
+        crop_global_scale: Global crop area range as fraction of image area
+        crop_local_scale: Local crop area range as fraction of image area
+        crop_aspect_ratio: Crop width-to-height aspect ratio range
+        crop_blur_sigma_px: Gaussian blur sigma for activity heatmap (px)
+        crop_heatmap_power: Exponent applied to heatmap before sampling
+        crop_min_active_pixels: Minimum active voxels required inside a crop
         loss_type: "cosine", "mse", or "dino"
         center_momentum: EMA decay for the teacher center buffer
         use_centering: subtract running center from teacher features before loss
@@ -108,6 +186,9 @@ def main(
         proj_head_n_layers: number of MLP layers before the final FC
         use_cov_penalty: add VICReg covariance decorrelation penalty on student features
         cov_penalty_weight: weight for the covariance penalty term
+        use_var_penalty: add VICReg variance penalty (hinge on per-dim std >= var_gamma)
+        var_penalty_weight: weight for the variance penalty term
+        var_gamma: target minimum std per feature dimension
         momentum_start: Initial EMA momentum
         momentum_end: Final EMA momentum
         weight_decay: L2 regularization
@@ -139,7 +220,17 @@ def main(
 
     cfg = DINOConfig(
         backbone_name=backbone_name,
+        encoding_range=encoding_range,
+        augmentation_mode=augmentation_mode,
         mask_ratio=mask_ratio,
+        crop_n_global=crop_n_global,
+        crop_n_local=crop_n_local,
+        crop_global_scale=crop_global_scale,
+        crop_local_scale=crop_local_scale,
+        crop_aspect_ratio=crop_aspect_ratio,
+        crop_blur_sigma_px=crop_blur_sigma_px,
+        crop_heatmap_power=crop_heatmap_power,
+        crop_min_active_pixels=crop_min_active_pixels,
         use_proj_head=use_proj_head,
         proj_head_hidden_dim=proj_head_hidden_dim,
         proj_head_output_dim=proj_head_output_dim,
@@ -152,6 +243,9 @@ def main(
         student_temp=student_temp,
         use_cov_penalty=use_cov_penalty,
         cov_penalty_weight=cov_penalty_weight,
+        use_var_penalty=use_var_penalty,
+        var_penalty_weight=var_penalty_weight,
+        var_gamma=var_gamma,
         momentum_start=momentum_start,
         momentum_end=momentum_end,
         lr=lr,
@@ -170,16 +264,22 @@ def main(
     )
 
     print(f"Device: {device}")
-    print(f"Model: backbone_name={cfg.backbone_name}, use_proj_head={cfg.use_proj_head}, "
-          f"proj_head_hidden_dim={cfg.proj_head_hidden_dim}, proj_head_output_dim={cfg.proj_head_output_dim}, "
-          f"proj_head_n_layers={cfg.proj_head_n_layers}")
-    print(f"Config: mask_ratio={cfg.mask_ratio}, epochs={cfg.epochs}, "
-          f"lr={cfg.lr}, batch_size={cfg.batch_size}, warmup_epochs={cfg.warmup_epochs}, "
-          f" momentum_start={cfg.momentum_start}, momentum_end={cfg.momentum_end}")
+    print(f"Model: backbone_name={cfg.backbone_name}, encoding_range={cfg.encoding_range}, "
+          f"use_proj_head={cfg.use_proj_head}, proj_head_hidden_dim={cfg.proj_head_hidden_dim}, "
+          f"proj_head_output_dim={cfg.proj_head_output_dim}, proj_head_n_layers={cfg.proj_head_n_layers}")
+    print(f"Config: epochs={cfg.epochs}, lr={cfg.lr}, batch_size={cfg.batch_size}, "
+          f"warmup_epochs={cfg.warmup_epochs}, momentum_start={cfg.momentum_start}, "
+          f"momentum_end={cfg.momentum_end}")
+    print(f"Augmentation: augmentation_mode={cfg.augmentation_mode}, mask_ratio={cfg.mask_ratio}, "
+          f"crop_n_global={cfg.crop_n_global}, crop_n_local={cfg.crop_n_local}, "
+          f"crop_global_scale={cfg.crop_global_scale}, crop_local_scale={cfg.crop_local_scale}, "
+          f"crop_aspect_ratio={cfg.crop_aspect_ratio}, crop_blur_sigma_px={cfg.crop_blur_sigma_px}, "
+          f"crop_heatmap_power={cfg.crop_heatmap_power}, crop_min_active_pixels={cfg.crop_min_active_pixels}")
     print(f'Loss: type={cfg.loss_type}, center_momentum={cfg.center_momentum}, '
           f'use_centering={cfg.use_centering}, teacher_temp={cfg.teacher_temp}, '
           f'student_temp={cfg.student_temp}, use_cov_penalty={cfg.use_cov_penalty}, '
-          f'cov_penalty_weight={cfg.cov_penalty_weight}')
+          f'cov_penalty_weight={cfg.cov_penalty_weight}, use_var_penalty={cfg.use_var_penalty}, '
+          f'var_penalty_weight={cfg.var_penalty_weight}, var_gamma={cfg.var_gamma}')
 
     # ============ Data ============
     print("\nLoading dataset...")
@@ -228,6 +328,7 @@ def main(
     print("\nBuilding model...")
     model = DINODuneModel(
         backbone_name=backbone_name,
+        encoding_range=cfg.encoding_range,
         use_proj_head=use_proj_head,
         proj_head_hidden_dim=proj_head_hidden_dim,
         proj_head_output_dim=proj_head_output_dim,
@@ -240,6 +341,26 @@ def main(
     optimizer = optim.AdamW(student_params, lr=lr, weight_decay=weight_decay)
 
     masker = SparseVoxelMasker(mask_ratio=mask_ratio)
+
+    if augmentation_mode == "cropping":
+        crop_cfg = CropConfig(
+            n_global=cfg.crop_n_global,
+            n_local=cfg.crop_n_local,
+            global_scale=cfg.crop_global_scale,
+            local_scale=cfg.crop_local_scale,
+            aspect_ratio=cfg.crop_aspect_ratio,
+            blur_sigma_px=cfg.crop_blur_sigma_px,
+            heatmap_power=cfg.crop_heatmap_power,
+            min_active_pixels=cfg.crop_min_active_pixels,
+            image_h=cfg.image_size,
+            image_w=cfg.image_size,
+        )
+        cropper = SparseCropper(crop_cfg)
+        augmenter = cropper
+
+    else:
+        augmenter = masker
+
     loss_fn = PixelDINOLoss(
         loss_type=cfg.loss_type,
         normalize_features=cfg.normalize_features,
@@ -249,6 +370,9 @@ def main(
         student_temp=cfg.student_temp,
         use_cov_penalty=cfg.use_cov_penalty,
         cov_penalty_weight=cfg.cov_penalty_weight,
+        use_var_penalty=cfg.use_var_penalty,
+        var_penalty_weight=cfg.var_penalty_weight,
+        var_gamma=cfg.var_gamma,
     ).to(device)
 
     # ============ Schedulers ============
@@ -310,7 +434,16 @@ def main(
 
             # Forward + backward
             optimizer.zero_grad()
-            loss_val, teacher_entropy, student_entropy, kl, cov_penalty, student_backbone_out, teacher_backbone_out, student_out, teacher_out = model.forward_backward(data, masker, loss_fn)
+            if augmentation_mode == "cropping":
+                (loss_val, teacher_entropy, student_entropy,
+                 kl, cov_penalty, var_penalty,
+                 student_backbone_out, teacher_backbone_out,
+                 student_out, teacher_out) = model.forward_backward_crops(data, augmenter, loss_fn)
+            else:
+                (loss_val, teacher_entropy, student_entropy,
+                 kl, cov_penalty, var_penalty,
+                 student_backbone_out, teacher_backbone_out,
+                 student_out, teacher_out) = model.forward_backward(data, augmenter, loss_fn)
             optimizer.step()
 
             # EMA teacher update
@@ -320,9 +453,25 @@ def main(
             loss_fn.update_center(teacher_out)
             debugger.log_center_stats(iteration, loss_fn)
 
+            # Backbone entropy (diagnostic: are backbone features already sharp before the head?)
+            # Only meaningful when a projection head is active and loss is dino.
+            backbone_teacher_entropy = None
+            backbone_student_entropy = None
+            if model.student_head is not None and loss_fn.loss_type == "dino":
+                with torch.no_grad():
+                    # L2-normalize backbone features before softmax: backbone features are
+                    # raw/unnormalized, so dividing by the head temperatures (≈0.04) without
+                    # normalization would make softmax a near-hard-argmax → entropy ≈ 0 always.
+                    s_bb = F.normalize(student_backbone_out.feature_tensor.float(), dim=-1)
+                    t_bb = F.normalize(teacher_backbone_out.feature_tensor.float(), dim=-1)
+                    t_prob_bb = F.softmax(t_bb / loss_fn.teacher_temp, dim=-1)
+                    s_prob_bb = F.softmax(s_bb / loss_fn.student_temp, dim=-1)
+                    backbone_teacher_entropy = -(t_prob_bb * t_prob_bb.log().clamp(min=-100)).sum(dim=-1).mean().item()
+                    backbone_student_entropy = -(s_prob_bb * s_prob_bb.log().clamp(min=-100)).sum(dim=-1).mean().item()
+
             # Scalar logging
             n_valid = student_out.feature_tensor.shape[0]
-            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, student_entropy, kl, cov_penalty)
+            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, student_entropy, kl, cov_penalty, var_penalty, backbone_teacher_entropy, backbone_student_entropy)
 
             # Gradient norms per backbone module (.grad still populated before next zero_grad)
             debugger.log_gradient_norms(iteration, model.student)
@@ -346,13 +495,15 @@ def main(
             del student_backbone_out, student_out, teacher_backbone_out, teacher_out
 
             if (batch_idx + 1) % 50 == 0 or batch_idx == 0:
+                cov_str = f", cov={cov_penalty:.4f}" if cov_penalty is not None else ""
+                var_str = f", var={var_penalty:.4f}" if var_penalty is not None else ""
                 print(f"[{epoch}/{epochs}] iter {iteration}: loss={loss_val:.6f}, "
-                      f"lr={lr_val:.2e}, mom={mom_val:.6f}")
+                      f"lr={lr_val:.2e}, mom={mom_val:.6f}{cov_str}{var_str}")
 
         # Validation
-        val_loss = validate_epoch(model, val_loader, masker, loss_fn, device)
-        print(f"[{epoch}/{epochs}] val_loss={val_loss:.6f}")
-        debugger.log_val_epoch(epoch, iteration, val_loss)
+        #val_loss = validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_mode)
+        #print(f"[{epoch}/{epochs}] val_loss={val_loss:.6f}")
+        #debugger.log_val_epoch(epoch, iteration, val_loss)
 
         # Save checkpoint
         if epoch % save_every == 0 or epoch == epochs:
