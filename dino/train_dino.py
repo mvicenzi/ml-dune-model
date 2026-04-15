@@ -16,7 +16,8 @@ import torch.optim as optim
 from pathlib import Path
 from torch.utils.data import DataLoader
 
-from loader.dataset import DUNEImageDataset
+from loader.apa_sparse_dataset import APASparseDataset
+from loader.collate import voxels_collate_fn
 from loader.splits import train_val_split, Subset
 
 from .config import DINOConfig
@@ -48,9 +49,8 @@ def validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_m
     total_loss = 0.0
     n_batches = 0
 
-    for data, _ in val_loader:
-        data = data.to(device)
-        xs = model.from_dense(data)
+    for xs in val_loader:
+        xs = xs.to(device)
 
         if augmentation_mode == "cropping":
             n_global = augmenter.cfg.n_global
@@ -283,10 +283,10 @@ def main(
 
     # ============ Data ============
     print("\nLoading dataset...")
-    dataset = DUNEImageDataset(
+    dataset = APASparseDataset(
         rootdir=cfg.rootdir,
-        class_names=["numu", "nue", "nutau", "NC"],
-        view_index=cfg.view_index,
+        apa=cfg.apa,
+        view=cfg.view,
         use_cache=True,
     )
 
@@ -311,6 +311,7 @@ def main(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=voxels_collate_fn,
     )
     val_loader = DataLoader(
         val_ds,
@@ -318,6 +319,7 @@ def main(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=voxels_collate_fn,
     )
 
     epoch_len = len(train_loader)
@@ -411,17 +413,9 @@ def main(
     for epoch in range(1, epochs + 1):
         model.train()
 
-        for batch_idx, (data, _) in enumerate(train_loader):
+        for batch_idx, xs in enumerate(train_loader):
             iteration = (epoch - 1) * epoch_len + batch_idx
-            data = data.to(device)
-
-            # Warn about empty images (all-zero pixels) — these can cause warpconvnet
-            # to silently drop batch entries due to bincount trailing-zero truncation.
-            empty = (data.view(data.shape[0], -1) == 0).all(dim=1)
-            if empty.any():
-                empty_idx = empty.nonzero(as_tuple=True)[0].tolist()
-                print(f"WARNING: epoch {epoch}, batch {batch_idx}: "
-                      f"{len(empty_idx)} empty image(s) at batch positions {empty_idx}")
+            xs = xs.to(device)
 
             # Apply schedules
             lr_val = lr_schedule[iteration]
@@ -438,12 +432,12 @@ def main(
                 (loss_val, teacher_entropy, student_entropy,
                  kl, cov_penalty, var_penalty,
                  student_backbone_out, teacher_backbone_out,
-                 student_out, teacher_out) = model.forward_backward_crops(data, augmenter, loss_fn)
+                 student_out, teacher_out) = model.forward_backward_crops(xs, augmenter, loss_fn)
             else:
                 (loss_val, teacher_entropy, student_entropy,
                  kl, cov_penalty, var_penalty,
                  student_backbone_out, teacher_backbone_out,
-                 student_out, teacher_out) = model.forward_backward(data, augmenter, loss_fn)
+                 student_out, teacher_out) = model.forward_backward(xs, augmenter, loss_fn)
             optimizer.step()
 
             # EMA teacher update
@@ -485,7 +479,7 @@ def main(
 
             # First batch: log tensor shapes
             if first_batch:
-                debugger.log_shapes(data, student_backbone_out.feature_tensor, teacher_backbone_out.feature_tensor)
+                debugger.log_shapes(xs.feature_tensor, student_backbone_out.feature_tensor, teacher_backbone_out.feature_tensor)
                 first_batch = False
 
             # Periodically persist histories to disk

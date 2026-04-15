@@ -3,14 +3,12 @@
 import inspect
 import torch
 import torch.nn as nn
-from torch import Tensor
 
 from warpconvnet.geometry.types.voxels import Voxels
 from warpconvnet.geometry.coords.integer import IntCoords
 from warpconvnet.geometry.features.cat import CatFeatures
 
 from models import BACKBONE_REGISTRY
-from models.blocks import DenseInput
 from .projhead import DINOProjectionHead
 
 
@@ -80,9 +78,6 @@ class DINODuneModel(nn.Module):
             encoding_range:       Sinusoidal positional encoding range passed to the backbone
         """
         super().__init__()
-
-        ## FIXME FIXME: TEMPORARY
-        self.from_dense = DenseInput()
 
         # Instantiate both backbones (sparse: Voxels → Voxels)
         # Only pass encoding_range to backbones that accept it (attn_* variants).
@@ -166,7 +161,7 @@ class DINODuneModel(nn.Module):
             return backbone_out, self.student_head(backbone_out)
         return backbone_out, backbone_out
 
-    def forward_backward_crops(self, x: Tensor, cropper, loss_fn):
+    def forward_backward_crops(self, xs: Voxels, cropper, loss_fn):
         """
         Forward pass and backward update using activity-aware multi-crop augmentation.
 
@@ -182,7 +177,7 @@ class DINODuneModel(nn.Module):
         keeping PixelDINOLoss.forward unchanged.
 
         Args:
-            x:       [B, 1, H, W] dense image tensor
+            xs:      batched Voxels (from the sparse dataloader, already on device)
             cropper: SparseCropper instance (provides n_global via cropper.cfg.n_global)
             loss_fn: PixelDINOLoss instance
 
@@ -194,9 +189,6 @@ class DINODuneModel(nn.Module):
             student_out:          head output for the last student crop (logging)
             teacher_out:          head output for the first teacher global crop (logging)
         """
-        # FIXME FIXME: TEMPORARY
-        xs = self.from_dense(x)
-
         n_global = cropper.cfg.n_global
         B        = len(xs.offsets) - 1
         device   = xs.coordinate_tensor.device
@@ -294,12 +286,12 @@ class DINODuneModel(nn.Module):
             student_out_k, teacher_out_log,
         )
 
-    def forward_backward(self, x: Tensor, masker, loss_fn):
+    def forward_backward(self, xs: Voxels, masker, loss_fn):
         """
         Forward pass and backward update.
 
         Args:
-            x: [B, 1, H, W] dense image tensor (from the dense dataloader)
+            xs: batched Voxels (from the sparse dataloader, already on device)
             masker: SparseVoxelMasker instance
             loss_fn: PixelDINOLoss instance
 
@@ -313,9 +305,6 @@ class DINODuneModel(nn.Module):
             student_out:          student Voxels output (after head if present)
             teacher_out:          teacher Voxels output (after head if present)
         """
-        # FIXME FIXME: TEMPORARY
-        xs = self.from_dense(x)
-
         # Masking on Voxels: returns reduced student Voxels + kept_indices
         xs_student, kept_indices = masker(xs)
 

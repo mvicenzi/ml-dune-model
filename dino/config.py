@@ -61,8 +61,9 @@ class DINOConfig:
     var_gamma: float = 1.0           # target minimum std per feature dimension
 
     # ============ Data ============
-    rootdir: str = "/nfs/data/1/rrazakami/work/data_cvn/data/dune/2023_trainings/latest/dunevd"
-    view_index: int = 2              # which wire plane view to use (0, 1, or 2)
+    rootdir: str = "/nfs/data/1/yuhw/cffm-data/prod-jay-100k-truth-2026-02-27"
+    apa: int = 0                    # which APA to train on
+    view: str = "W"                 # which wire plane view to use
     n_subset: int = -1               # -1 = full dataset; otherwise use first N samples for testing
     batch_size: int = 16
     num_workers: int = 4
