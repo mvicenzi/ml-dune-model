@@ -156,7 +156,7 @@ def plot_loss(data: dict, out_dir: Path):
         ax_reg.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    fig.savefig(out_dir / "loss_curve.png", dpi=100, bbox_inches="tight")
+    fig.savefig(out_dir / "loss_curve.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved loss_curve.png")
 
@@ -231,22 +231,22 @@ def plot_stats(data: dict, out_dir: Path, label: str = "backbone", mat_key: str 
         ax.fill_between(iters, mins, maxs, alpha=0.3, color=color, label="Min–Max")
         ax.plot(iters, medians, linewidth=1.5, color=color, label="Median")
         ax.set_ylabel("Per-pixel L2 norm")
-        ax.set_title(f"{name} feature magnitude  (high → potential divergence)")
+        ax.set_title(f"{name} feature magnitude")
         ax.legend(fontsize=8)
         ax.set_yscale("log")
         ax.set_xlabel("Iteration")
         ax.grid(True, alpha=0.3)
 
     # Row 1: per-feature variance 2D histogram
-    draw_hist2d(axes[1, 0], [np.diag(m) for m in s_mats], "Per-feature variance", f"Student Variance [{label}]  (low → dimensional collapse)")
-    draw_hist2d(axes[1, 1], [np.diag(m) for m in t_mats], "Per-feature variance", f"Teacher Variance [{label}]  (low → dimensional collapse)")
+    draw_hist2d(axes[1, 0], [np.diag(m) for m in s_mats], "Per-feature variance", f"Student Variance [{label}]")
+    draw_hist2d(axes[1, 1], [np.diag(m) for m in t_mats], "Per-feature variance", f"Teacher Variance [{label}]")
 
     # Row 2: participation ratio (scalar)
     for col, (pr, role) in enumerate([(s_pr, "Student"), (t_pr, "Teacher")]):
         ax = axes[2, col]
         ax.plot(iters, pr, linewidth=1.5, color=f"C{col}")
         ax.set_ylabel("Effective rank  [1, D]")
-        ax.set_title(f"{role} Participation Ratio [{label}]  (low → few dominant channels)")
+        ax.set_title(f"{role} Participation Ratio [{label}]")
         ax.set_xlabel("Iteration")
         ax.grid(True, alpha=0.3)
 
@@ -291,7 +291,7 @@ def plot_cov_heatmap(data: dict, out_dir: Path, label: str = "backbone", mat_key
 
         fig.tight_layout()
         fname = f"cov_heatmap_{label}_{snap}.png"
-        fig.savefig(out_dir / fname, dpi=100, bbox_inches="tight")
+        fig.savefig(out_dir / fname, dpi=200, bbox_inches="tight")
         plt.close(fig)
         print(f"  saved {fname}")
 
@@ -341,7 +341,7 @@ def plot_eigen(data: dict, out_dir: Path, label: str = "backbone", mat_key: str 
 
         fig.tight_layout()
         fname = f"eigen_{label}_{snap}.png"
-        fig.savefig(out_dir / fname, dpi=100, bbox_inches="tight")
+        fig.savefig(out_dir / fname, dpi=200, bbox_inches="tight")
         plt.close(fig)
         print(f"  saved {fname}")
 
@@ -370,7 +370,7 @@ def plot_center_stats(data: dict, out_dir: Path):
     axes[1].grid(True, alpha=0.3)
 
     fig.tight_layout()
-    fig.savefig(out_dir / "center_stats.png", dpi=100, bbox_inches="tight")
+    fig.savefig(out_dir / "center_stats.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved center_stats.png")
 
@@ -442,7 +442,7 @@ def plot_grads(data: dict, out_dir: Path):
 
     fig.suptitle("Gradient Norms per Backbone Module", fontsize=12)
     fig.tight_layout()
-    fig.savefig(out_dir / "grad_norms.png", dpi=100, bbox_inches="tight")
+    fig.savefig(out_dir / "grad_norms.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved grad_norms.png")
 

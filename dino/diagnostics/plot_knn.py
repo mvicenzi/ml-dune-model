@@ -12,11 +12,13 @@ k-NN similarity is computed in batches on GPU (or CPU) via PyTorch matmuls,
 so the full N×N matrix is never materialised in memory.
 
 Produces:
-  knn_image_purity.png     — per-class k-NN label purity at k=1,5,10,20
-  knn_image_confusion.png  — confusion matrix (k-NN majority vote, k=5)
-  knn_image_scatter.png    — UMAP or t-SNE 2-D scatter, student + teacher
-  knn_pixel_purity.png     — (--pixel_knn) pixel-level purity
-  knn_pixel_scatter.png    — (--pixel_knn) pixel-level scatter
+  knn_image_purity.png      — per-class k-NN label purity at k=1,5,10,20
+  knn_image_purity_hist.png — per-sample purity histograms by class
+  knn_image_confusion.png   — confusion matrix (k-NN majority vote, k=5)
+  knn_image_scatter.png     — UMAP or t-SNE 2-D scatter, student + teacher
+  knn_pixel_purity.png      — (--pixel_knn) pixel-level purity
+  knn_pixel_purity_hist.png — (--pixel_knn) pixel-level purity histograms
+  knn_pixel_scatter.png     — (--pixel_knn) pixel-level scatter
 
 Usage:
     python -m dino.diagnostics.plot_knn path/to/features_ep10.npz
@@ -54,7 +56,10 @@ def _mean_pool(feats: np.ndarray, offsets: np.ndarray) -> np.ndarray:
     out = np.empty((n_images, D), dtype=np.float32)
     for i in range(n_images):
         sl = slice(offsets[i], offsets[i + 1])
-        out[i] = feats[sl].mean(axis=0)
+        if offsets[i] == offsets[i + 1]:
+            out[i] = 0.0  # empty image — fill with zeros to avoid NaN
+        else:
+            out[i] = feats[sl].mean(axis=0)
     return out
 
 
@@ -144,7 +149,7 @@ def _knn_purity_batched(
         per_class = np.full(len(CLASS_NAMES), np.nan)
         for c in np.unique(labels):
             per_class[c] = float(same[lbls == c].mean())
-        results[k] = (overall, per_class)
+        results[k] = (overall, per_class, same.cpu().numpy())
 
     return results
 
@@ -205,7 +210,7 @@ def plot_purity(
 
     for ax, purity_k, name in zip(axes, [s_purity_k, t_purity_k], ["Student", "Teacher"]):
         for ki, k in enumerate(ks):
-            overall, per_class = purity_k[k]
+            overall, per_class, _ = purity_k[k]
             values = list(per_class) + [overall]
             ax.bar(
                 x + ki * width - 0.4 + width / 2,
@@ -225,6 +230,67 @@ def plot_purity(
         ax.grid(axis="y", alpha=0.3)
 
     fig.suptitle(f"{title_prefix} k-NN label purity  [{tag}]", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(out_dir / fname, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {fname}")
+
+
+# ---------------------------------------------------------------------------
+# Plot: per-sample purity histograms
+# ---------------------------------------------------------------------------
+
+def plot_purity_hist(
+    s_purity_k: dict,   # {k: (overall, per_class, same_per_sample)}
+    t_purity_k: dict,
+    labels: np.ndarray,
+    out_dir: Path,
+    tag: str,
+    fname: str,
+    title_prefix: str,
+):
+    ks = sorted(s_purity_k.keys())
+    n_classes = len(CLASS_NAMES)
+    cmap = plt.get_cmap("tab10")
+
+    # One row per k, two columns (student / teacher)
+    fig, axes = plt.subplots(len(ks), 2, figsize=(14, 4 * len(ks)), squeeze=False)
+
+    for row, k in enumerate(ks):
+        # Purity is j/k for j in 0..k — align bin edges to the midpoints between
+        # consecutive discrete values so each bar captures exactly one value.
+        # Edges: -0.5/k, 0.5/k, 1.5/k, ..., (k+0.5)/k
+        bins = (np.arange(k + 2) - 0.5) / k
+        xticks = np.arange(k + 1) / k
+
+        for col, (purity_k, name) in enumerate([(s_purity_k, "Student"), (t_purity_k, "Teacher")]):
+            ax = axes[row, col]
+            _, _, same = purity_k[k]
+
+            for c in range(n_classes):
+                mask = labels == c
+                if mask.sum() == 0:
+                    continue
+                ax.hist(
+                    same[mask],
+                    bins=bins,
+                    histtype="step",
+                    color=cmap(c),
+                    lw=2,
+                    label=f"{CLASS_NAMES[c]} (μ={same[mask].mean():.2f})",
+                    density=True,
+                )
+
+            ax.set_xlim(-0.5 / k, 1 + 0.5 / k)
+            ax.set_xticks(xticks)
+            ax.set_xticklabels([f"{v:.2g}" for v in xticks], fontsize=7, rotation=45)
+            ax.set_xlabel("Per-sample purity")
+            ax.set_ylabel("Density")
+            ax.set_title(f"{name}  k={k}")
+            ax.legend(fontsize=8)
+            ax.grid(axis="y", alpha=0.3)
+
+    fig.suptitle(f"{title_prefix} k-NN purity distribution  [{tag}]", fontsize=13)
     fig.tight_layout()
     fig.savefig(out_dir / fname, dpi=100, bbox_inches="tight")
     plt.close(fig)
@@ -305,6 +371,8 @@ def plot_scatter(
     for ax, emb, name in zip(axes, [s_emb, t_emb], ["Student", "Teacher"]):
         for c in range(n_classes):
             mask = labels == c
+            if mask.sum() == 0:
+                continue
             ax.scatter(emb[mask, 0], emb[mask, 1],
                        color=colors[c], label=CLASS_NAMES[c],
                        alpha=alpha, s=s, linewidths=0)
@@ -316,7 +384,7 @@ def plot_scatter(
 
     fig.suptitle(f"{title_prefix} {reducer_name} scatter  [{tag}]", fontsize=13)
     fig.tight_layout()
-    fig.savefig(out_dir / fname, dpi=120, bbox_inches="tight")
+    fig.savefig(out_dir / fname, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved {fname}")
 
@@ -354,6 +422,8 @@ def run_image_level(
 
     plot_purity(s_purity_k, t_purity_k, out_dir, tag,
                 "knn_image_purity.png", "Image-level")
+    plot_purity_hist(s_purity_k, t_purity_k, labels, out_dir, tag,
+                     "knn_image_purity_hist.png", "Image-level")
 
     k_eff = min(knn_k, len(labels) - 1)
     print(f"  Computing k-NN predictions (k={knn_k}) ...")
@@ -363,10 +433,15 @@ def run_image_level(
                    "knn_image_confusion.png", "Image-level")
 
     print("  Running dimensionality reduction on image embeddings ...")
-    all_feats = np.concatenate([s_img, t_img], axis=0)
+    # Uncomment the block below to exclude nutau from the scatter plot:
+    # nutau_idx = CLASS_NAMES.index("nutau")
+    # scatter_mask = labels != nutau_idx
+    # s_img_plot, t_img_plot, labels_plot = s_img[scatter_mask], t_img[scatter_mask], labels[scatter_mask]
+    s_img_plot, t_img_plot, labels_plot = s_img, t_img, labels
+    all_feats = np.concatenate([s_img_plot, t_img_plot], axis=0)
     emb_all, rname = _reduce_2d(all_feats, method=reducer)
-    N = len(labels)
-    plot_scatter(emb_all[:N], emb_all[N:], labels, rname, out_dir, tag,
+    N = len(s_img_plot)
+    plot_scatter(emb_all[:N], emb_all[N:], labels_plot, rname, out_dir, tag,
                  "knn_image_scatter.png", "Image-level")
 
 
@@ -410,6 +485,8 @@ def run_pixel_level(
 
     plot_purity(s_purity_k, t_purity_k, out_dir, tag,
                 "knn_pixel_purity.png", "Pixel-level")
+    plot_purity_hist(s_purity_k, t_purity_k, pl, out_dir, tag,
+                     "knn_pixel_purity_hist.png", "Pixel-level")
 
     k_eff = min(knn_k, len(pl) - 1)
     print(f"  Computing k-NN predictions (k={knn_k}) ...")
