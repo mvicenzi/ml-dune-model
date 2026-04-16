@@ -159,7 +159,7 @@ def _run_loader(student, teacher, loader, device, student_head=None, teacher_hea
 def main(
     checkpoint: str,
     output: str = "",
-    max_images: int = 10000,
+    max_images: int = 2000,
     batch_size: int = 32,
     num_workers: int = 4,
     device: str = "cuda",
