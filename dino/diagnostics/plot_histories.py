@@ -66,15 +66,6 @@ def plot_loss(data: dict, out_dir: Path):
     kl_vals     = [raw_kl[i] for i in kl_iters]
     has_components = bool(t_ent_vals and kl_vals)
 
-    # Backbone entropies (only present when a projection head was used).
-    raw_bb_t_ent = data.get("backbone_teacher_entropy", [])
-    raw_bb_s_ent = data.get("backbone_student_entropy", [])
-    bb_t_ent_iters = [i for i, v in enumerate(raw_bb_t_ent) if v is not None]
-    bb_t_ent_vals  = [raw_bb_t_ent[i] for i in bb_t_ent_iters]
-    bb_s_ent_iters = [i for i, v in enumerate(raw_bb_s_ent) if v is not None]
-    bb_s_ent_vals  = [raw_bb_s_ent[i] for i in bb_s_ent_iters]
-    has_backbone_entropy = bool(bb_t_ent_vals)
-
     # Extract non-null covariance penalty values.
     raw_cov = data.get("cov_penalty", [])
     cov_iters = [i for i, v in enumerate(raw_cov) if v is not None]
@@ -114,25 +105,14 @@ def plot_loss(data: dict, out_dir: Path):
         K = infer_feature_dim(data)  # head feature dimension (number of softmax categories)
         h_max = np.log(K)  # -log(1/K) = log(K): entropy of a uniform distribution over K dims
         ax_comp.plot(t_ent_iters, t_ent_vals, linewidth=1.0, alpha=0.8,
-                     color="C2", label="Teacher entropy  H(P_t)  [head]")
+                     color="C2", label="Teacher entropy  H(P_t)")
         if s_ent_vals:
             ax_comp.plot(s_ent_iters, s_ent_vals, linewidth=1.0, alpha=0.8,
-                         color="C0", label="Student entropy  H(P_s)  [head]")
+                         color="C0", label="Student entropy  H(P_s)")
         ax_comp.plot(kl_iters, kl_vals, linewidth=1.0, alpha=0.8,
                      color="C3", label="KL divergence  KL(P_t|P_s)")
         ax_comp.axhline(h_max, color="C2", linewidth=1.2, linestyle="--", alpha=0.7,
-                        label=f"H_max = log({K})  [head]")
-        if has_backbone_entropy:
-            # Backbone dim from backbone covariance matrix (falls back to 64 if not available)
-            bb_mats = data.get("stats", {}).get("s_cov_mat", [])
-            K_bb = len(bb_mats[0]) if bb_mats and bb_mats[0] else 64
-            h_max_bb = np.log(K_bb)
-            ax_comp.plot(bb_t_ent_iters, bb_t_ent_vals, linewidth=1.0, alpha=0.5,
-                         color="C2", linestyle=":", label="Teacher entropy  H(P_t)  [backbone]")
-            ax_comp.plot(bb_s_ent_iters, bb_s_ent_vals, linewidth=1.0, alpha=0.5,
-                         color="C0", linestyle=":", label="Student entropy  H(P_s)  [backbone]")
-            ax_comp.axhline(h_max_bb, color="grey", linewidth=1.0, linestyle="--", alpha=0.5,
-                            label=f"H_max = log({K_bb})  [backbone]")
+                        label=f"H_max = log({K})")
         ax_comp.set_xlabel("Iteration")
         ax_comp.set_ylabel("Nats")
         ax_comp.set_title("Loss decomposition: H(P_t, P_s) = H(P_t) + KL(P_t|P_s)  |  H(P_s)")

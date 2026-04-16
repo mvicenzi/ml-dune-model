@@ -31,8 +31,6 @@ class DINODebugger:
     - kl:              [float|null, ...]                 per-batch KL(P_t||P_s) (dino only, else null)
     - cov_penalty:              [float|null, ...]  per-batch raw covariance penalty (if enabled, else null)
     - var_penalty:              [float|null, ...]  per-batch raw variance penalty (if enabled, else null)
-    - backbone_teacher_entropy: [float|null, ...]  per-batch H(P_t) on backbone features (proj head only, else null)
-    - backbone_student_entropy: [float|null, ...]  per-batch H(P_s) on backbone features (proj head only, else null)
     - val:    {iter: [...], loss: [...]}         per-epoch val loss
     - stats:  {iter: [...], s_var: [...], ...}  feature statistics
     - grad:   {module: {iter: [...], norm: [...]}, ...}
@@ -49,8 +47,6 @@ class DINODebugger:
         self.kl_history = [] if self.enabled else None
         self.cov_penalty_history = [] if self.enabled else None
         self.var_penalty_history = [] if self.enabled else None
-        self.backbone_teacher_entropy_history = [] if self.enabled else None
-        self.backbone_student_entropy_history = [] if self.enabled else None
 
         # Histories for offline plotting
         self.stats_history = (
@@ -133,8 +129,6 @@ class DINODebugger:
         kl: float | None = None,
         cov_penalty: float | None = None,
         var_penalty: float | None = None,
-        backbone_teacher_entropy: float | None = None,
-        backbone_student_entropy: float | None = None,
     ):
         """Log per-batch scalar information (every batch)."""
         if not self.enabled or self.logger is None:
@@ -162,10 +156,6 @@ class DINODebugger:
             self.cov_penalty_history.append(cov_penalty)
         if self.var_penalty_history is not None:
             self.var_penalty_history.append(var_penalty)
-        if self.backbone_teacher_entropy_history is not None:
-            self.backbone_teacher_entropy_history.append(backbone_teacher_entropy)
-        if self.backbone_student_entropy_history is not None:
-            self.backbone_student_entropy_history.append(backbone_student_entropy)
 
     def log_val_epoch(self, epoch: int, iteration: int, val_loss: float):
         """
@@ -193,8 +183,6 @@ class DINODebugger:
           kl:              [float|null, ...]                 per-batch KL(P_t||P_s) (dino only, else null)
           cov_penalty:              [float|null, ...]  per-batch raw covariance penalty (if enabled, else null)
           var_penalty:              [float|null, ...]  per-batch raw variance penalty (if enabled, else null)
-          backbone_teacher_entropy: [float|null, ...]  per-batch H(P_t) on backbone features (proj head only)
-          backbone_student_entropy: [float|null, ...]  per-batch H(P_s) on backbone features (proj head only)
           val:             {iter: [...], loss: [...]}        per-epoch val loss
           stats:           {iter: [...], s_var: [...], ...}  feature statistics
           grad:            {module: {iter: [...], norm: [...]}, ...}
@@ -207,9 +195,7 @@ class DINODebugger:
             "student_entropy":  self.student_entropy_history  or [],
             "kl":               self.kl_history               or [],
             "cov_penalty":      self.cov_penalty_history      or [],
-            "var_penalty":                  self.var_penalty_history              or [],
-            "backbone_teacher_entropy":     self.backbone_teacher_entropy_history or [],
-            "backbone_student_entropy":     self.backbone_student_entropy_history or [],
+            "var_penalty":      self.var_penalty_history      or [],
             "val":              self.val_history               or {},
             "stats":            self.stats_history             or {},
             "grad":             self.grad_history              or {},
