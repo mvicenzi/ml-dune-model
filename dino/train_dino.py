@@ -24,7 +24,7 @@ from .masking import SparseVoxelMasker
 from .cropping import CropConfig, SparseCropper
 from .loss import PixelDINOLoss
 from .scheduler import CosineScheduler
-from .model import DINODuneModel, _filter_voxels
+from .model import DINODuneModel, match_and_gather
 from .debug import DINODebugger
 
 
@@ -53,10 +53,7 @@ def validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_m
 
         if augmentation_mode == "cropping":
             n_global = augmenter.cfg.n_global
-            B        = len(xs.offsets) - 1
-            device_  = xs.coordinate_tensor.device
-
-            crops, kept_indices_list, teacher_luts = augmenter(xs)
+            crops = augmenter(xs)
             n_crops = len(crops)
 
             teacher_encoded = [model.encode_teacher(crops[g]) for g in range(n_global)]
@@ -69,39 +66,21 @@ def validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_m
                     if k == g:
                         continue
                     _, teacher_out_g = teacher_encoded[g]
-
-                    s_local_idx_list, t_local_idx_list = [], []
-                    for b in range(B):
-                        S_k_b = kept_indices_list[k][b]
-                        lut = teacher_luts[g][b]
-                        if S_k_b.numel() == 0:
-                            empty = torch.zeros(0, dtype=torch.long, device=device_)
-                            s_local_idx_list.append(empty)
-                            t_local_idx_list.append(empty)
-                            continue
-                        t_local_raw = lut[S_k_b]
-                        valid = t_local_raw >= 0
-                        s_local = valid.nonzero(as_tuple=False).squeeze(1)
-                        if s_local.numel() == 0:
-                            empty = torch.zeros(0, dtype=torch.long, device=device_)
-                            s_local_idx_list.append(empty)
-                            t_local_idx_list.append(empty)
-                            continue
-                        t_local = t_local_raw[valid]
-                        s_local_idx_list.append(s_local)
-                        t_local_idx_list.append(t_local)
-
-                    student_out_kg      = _filter_voxels(student_out_k,      s_local_idx_list)
-                    student_backbone_kg = _filter_voxels(student_backbone_k, s_local_idx_list)
-                    loss_k, _, _, _, _, _  = loss_fn(student_out_kg, student_backbone_kg, teacher_out_g, t_local_idx_list)
+                    s_feats, s_bb_feats, t_feats, counts = match_and_gather(
+                        student_out_k, student_backbone_k, teacher_out_g,
+                    )
+                    loss_k, _, _, _, _, _ = loss_fn(s_feats, s_bb_feats, t_feats, counts)
                     batch_loss = loss_k if batch_loss is None else batch_loss + loss_k
                     n_pairs += 1
             loss_val = (batch_loss / n_pairs).item()
         else:
-            xs_student, kept_indices = augmenter(xs)
+            xs_student, _ = augmenter(xs)
             _, teacher_out = model.encode_teacher(xs)
             student_backbone_out, student_out = model.encode_student(xs_student)
-            loss, _, _, _, _, _ = loss_fn(student_out, student_backbone_out, teacher_out, kept_indices)
+            s_feats, s_bb_feats, t_feats, counts = match_and_gather(
+                student_out, student_backbone_out, teacher_out,
+            )
+            loss, _, _, _, _, _ = loss_fn(s_feats, s_bb_feats, t_feats, counts)
             loss_val = loss.item()
 
         total_loss += loss_val

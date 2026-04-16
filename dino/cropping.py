@@ -168,14 +168,12 @@ class SparseCropper:
       - Builds a binary activity array from the voxel coordinates.
       - Applies a Gaussian blur to create a sampling heatmap.
       - Samples n_global + n_local crop boxes biased toward active regions.
-      - Returns one sub-Voxels object per crop, plus kept_indices aligned to
-        the teacher's full-image voxel slice — the same contract as
-        SparseVoxelMasker.
+      - Returns one sub-Voxels object per crop.
 
     Important: selected voxels keep their original (x, y) coordinates (no
-    translation to a crop-local origin). This is required so that kept_indices
-    directly index the teacher's voxel slice without any offset correction, and
-    it is safe because sparse convolutions compute positions as coord // stride
+    translation to a crop-local origin). This allows spatial intersection
+    between crops to be found by coordinate matching on the backbone outputs,
+    and it is safe because sparse convolutions compute positions as coord // stride
     regardless of the coordinate origin.
     """
 
@@ -228,20 +226,16 @@ class SparseCropper:
         # Fallback to centred crop
         return _fallback_centre_box(cfg.image_w, cfg.image_h, scale_range, cfg.aspect_ratio)
 
-    def __call__(self, voxels: Voxels) -> Tuple[List[Voxels], List[List[Tensor]], List[List[Tensor]]]:
+    def __call__(self, voxels: Voxels) -> List[Voxels]:
         """
         Args:
             voxels: Batched Voxels (full image, B items) — teacher's view.
 
         Returns:
-            crops:        List of n_crops Voxels objects (each batched over B images).
-            kept_indices: List of n_crops lists; kept_indices[k][b] indexes into the
-                          per-batch-item slice [offsets[b]:offsets[b+1]] of voxels.
-            teacher_luts: List of n_global lists; teacher_luts[g][b] is a tensor of
-                          size N_b mapping full-image voxel index → local position
-                          within teacher crop g (or -1 if absent). Pre-built here so
-                          that intersection matching in the training loop is a single
-                          O(N) gather instead of O(N log N) isin + searchsorted.
+            crops: List of n_crops Voxels objects (each batched over B images).
+                   Voxels retain their original (x, y) coordinates, so spatial
+                   intersection between crops can be found by coordinate matching
+                   on the backbone outputs.
         """
         cfg = self.cfg
         B = len(voxels.offsets) - 1
@@ -267,7 +261,6 @@ class SparseCropper:
         # --- Per-image, per-crop: sample boxes and filter voxels -------------
         crop_coords  = [[] for _ in range(self._n_crops)]
         crop_feats   = [[] for _ in range(self._n_crops)]
-        crop_kidx    = [[] for _ in range(self._n_crops)]
         crop_counts  = [[] for _ in range(self._n_crops)]
 
         for b in range(B):
@@ -305,8 +298,6 @@ class SparseCropper:
                     if kidx.numel() == 0:
                         kidx = torch.zeros(1, dtype=torch.long, device=device)
 
-                crop_kidx[k].append(kidx)
-
                 if kidx.numel() > 0:
                     crop_coords[k].append(coords_b[kidx])
                     crop_feats[k].append(feats_b[kidx])
@@ -334,17 +325,4 @@ class SparseCropper:
             )
             crops.append(crop_voxels)
 
-        # --- Build teacher LUTs for fast intersection matching ---------------
-        teacher_luts = []
-        for g in range(cfg.n_global):
-            luts_g = []
-            for b in range(B):
-                N_b = int(voxels.offsets[b + 1] - voxels.offsets[b])
-                lut = torch.full((N_b,), -1, dtype=torch.long, device=device)
-                T_g_b = crop_kidx[g][b]
-                if T_g_b.numel() > 0:
-                    lut[T_g_b] = torch.arange(T_g_b.numel(), device=device)
-                luts_g.append(lut)
-            teacher_luts.append(luts_g)
-
-        return crops, crop_kidx, teacher_luts
+        return crops

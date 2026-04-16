@@ -1,7 +1,5 @@
 """Per-pixel DINO-style loss for self-supervised training."""
 
-from typing import List
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -82,52 +80,30 @@ class PixelDINOLoss(nn.Module):
 
     def forward(
         self,
-        student_out: Voxels,          # sparse student output (after head if present)
-        student_backbone: Voxels,     # raw backbone output (before head); used for cov penalty
-        teacher_out: Voxels,          # sparse teacher output (should be detached)
-        kept_indices: List[Tensor],   # per-batch-item indices mapping student→teacher positions
+        s: Tensor,            # [N_matched, D] pre-aligned student head features
+        s_backbone: Tensor,   # [N_matched, D_bb] pre-aligned student backbone features
+        t: Tensor,            # [N_matched, D] pre-aligned teacher head features
+        counts: Tensor,       # [B] per-image matched voxel counts
     ) -> Tensor:
         """
-        Compute per-voxel DINO loss at the positions the student processed.
+        Compute per-voxel DINO loss on pre-aligned student/teacher features.
 
-        For each batch item b, kept_indices[b] maps student voxel i to the
-        corresponding teacher voxel: teacher[t_start + kept_indices[b][i]].
+        The caller is responsible for spatial matching (by coordinates) and
+        gathering aligned feature pairs.  This method receives flat tensors
+        concatenated over the batch, plus per-image counts for the two-stage
+        (per-image mean, then batch mean) reduction.
 
         Args:
-            student_out:      Student output (Voxels) — head output if head present, else backbone
-            student_backbone: Raw backbone output (Voxels) — always 64-dim; used for cov penalty
-            teacher_out:      Teacher backbone output (Voxels), pre-detached
-            kept_indices:     List of B index tensors from SparseVoxelMasker
+            s:          [N_matched, D] student features (head output or backbone)
+            s_backbone: [N_matched, D_bb] student backbone features (for cov/var penalty)
+            t:          [N_matched, D] teacher features (detached)
+            counts:     [B] int64 tensor — number of matched voxels per image
 
         Returns:
-            Scalar loss value
+            Scalar loss value, plus diagnostic scalars
         """
-        B      = len(student_out.offsets) - 1
-        device = student_out.feature_tensor.device
-
-        # Align student and teacher features using kept_indices
-        s_parts, t_parts = [], []
-        for b in range(B):
-            # for each image, find pixels in student/teacher
-            t_start = int(teacher_out.offsets[b])
-            t_end   = int(teacher_out.offsets[b + 1])
-            s_start = int(student_out.offsets[b])
-            s_end   = int(student_out.offsets[b + 1])
-
-            t_b = teacher_out.feature_tensor[t_start:t_end]           # [N_teacher, D]
-            s_b = student_out.feature_tensor[s_start:s_end]           # [N_student, D]
-
-            # select teacher pixels only if originnaly kept for the student 
-            t_at_student = t_b[kept_indices[b].to(device)]            # [N_student, D]
-
-            s_parts.append(s_b)
-            t_parts.append(t_at_student)
-
-        s = torch.cat(s_parts, dim=0)  # [N_total, D]
-        t = torch.cat(t_parts, dim=0)  # [N_total, D]
-
-        # Per-image voxel counts (from student offsets, which reflect unmasked voxels)
-        counts = (student_out.offsets[1:] - student_out.offsets[:-1]).float().to(device)  # [B]
+        B      = counts.shape[0]
+        device = s.device
 
         # Lazy-initialize center on first forward call
         if self.center is None:
@@ -184,20 +160,21 @@ class PixelDINOLoss(nn.Module):
         # penalty sees the actual feature scale and covariance structure.
         cov_penalty = None
         if self.use_cov_penalty:
-            cov_penalty = self._cov_penalty(student_backbone.feature_tensor)
+            cov_penalty = self._cov_penalty(s_backbone)
 
         var_penalty = None
         if self.use_var_penalty:
-            var_penalty = self._var_penalty(student_backbone.feature_tensor)
+            var_penalty = self._var_penalty(s_backbone)
 
         # Two-stage reduction: sum per image via scatter, divide by count, then mean.
         # Mirrors DINOv2: sum(loss * mask) / mask.sum() per image, then .mean()
-        student_counts = (student_out.offsets[1:] - student_out.offsets[:-1]).to(device)
-        batch_idx = torch.repeat_interleave(torch.arange(B, device=device), student_counts)
+        counts_dev = counts.to(device)
+        batch_idx = torch.repeat_interleave(torch.arange(B, device=device), counts_dev)
         per_image_loss = torch.zeros(B, device=loss.device, dtype=loss.dtype)
         per_image_loss.scatter_add_(0, batch_idx, loss)
-        per_image_loss = per_image_loss / counts.clamp(min=1.0)
-        scalar_loss = per_image_loss[counts > 0].mean()
+        counts_f = counts_dev.float()
+        per_image_loss = per_image_loss / counts_f.clamp(min=1.0)
+        scalar_loss = per_image_loss[counts_f > 0].mean()
 
         if self.use_cov_penalty:
             scalar_loss = scalar_loss + self.cov_penalty_weight * cov_penalty
@@ -210,15 +187,15 @@ class PixelDINOLoss(nn.Module):
         if teacher_entropy_px is not None:
             per_image_t_ent = torch.zeros(B, device=loss.device, dtype=loss.dtype)
             per_image_t_ent.scatter_add_(0, batch_idx, teacher_entropy_px)
-            t_ent = (per_image_t_ent / counts.clamp(min=1.0))[counts > 0].mean().item()
+            t_ent = (per_image_t_ent / counts_f.clamp(min=1.0))[counts_f > 0].mean().item()
 
             per_image_s_ent = torch.zeros(B, device=loss.device, dtype=loss.dtype)
             per_image_s_ent.scatter_add_(0, batch_idx, student_entropy_px)
-            s_ent = (per_image_s_ent / counts.clamp(min=1.0))[counts > 0].mean().item()
+            s_ent = (per_image_s_ent / counts_f.clamp(min=1.0))[counts_f > 0].mean().item()
 
             per_image_kl = torch.zeros(B, device=loss.device, dtype=loss.dtype)
             per_image_kl.scatter_add_(0, batch_idx, kl_px)
-            kl = (per_image_kl / counts.clamp(min=1.0))[counts > 0].mean().item()
+            kl = (per_image_kl / counts_f.clamp(min=1.0))[counts_f > 0].mean().item()
         else:
             t_ent = None
             s_ent = None
