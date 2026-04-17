@@ -20,10 +20,9 @@ def match_and_gather(
     Match student and teacher output voxels by spatial coordinates and
     return pre-aligned feature tensors ready for the loss.
 
-    Fully vectorized — no Python loop over batch items.  Batch items are kept
-    separate by encoding the batch index into the flat coordinate key:
-    ``batch_idx * HW + y * W + x``.  One sort + one searchsorted handles
-    all batch items at once.
+    Uses flat coordinate keys (y * W + x) with searchsorted for efficient
+    intersection.  No LUTs or index bookkeeping from the cropper are needed —
+    coordinates are intrinsic to the backbone output.
 
     Args:
         s_out:      Student head output (Voxels).
@@ -38,58 +37,76 @@ def match_and_gather(
     """
     B = len(s_out.offsets) - 1
     device = s_out.feature_tensor.device
-    N_s = s_out.coordinate_tensor.shape[0]
-    N_t = t_out.coordinate_tensor.shape[0]
 
-    # Early exit when either side is empty
-    if N_s == 0 or N_t == 0:
+    # Flat key = y * W + x maps each 2D coordinate to a unique integer.
+    # W must exceed the max x-coordinate across both inputs.
+    W = 1
+    if s_out.coordinate_tensor.shape[0] > 0:
+        W = max(W, int(s_out.coordinate_tensor[:, 0].max().item()) + 1)
+    if t_out.coordinate_tensor.shape[0] > 0:
+        W = max(W, int(t_out.coordinate_tensor[:, 0].max().item()) + 1)
+
+    # Collect global indices (into the flat batched feature tensors) for all
+    # matched voxels across all batch items.
+    s_global_idx = []
+    t_global_idx = []
+    counts_list = []
+
+    for b in range(B):
+        s_start, s_end = int(s_out.offsets[b]), int(s_out.offsets[b + 1])
+        t_start, t_end = int(t_out.offsets[b]), int(t_out.offsets[b + 1])
+
+        s_coords = s_out.coordinate_tensor[s_start:s_end]
+        t_coords = t_out.coordinate_tensor[t_start:t_end]
+
+        if s_coords.shape[0] == 0 or t_coords.shape[0] == 0:
+            counts_list.append(0)
+            continue
+
+        s_keys = s_coords[:, 1].long() * W + s_coords[:, 0].long()
+        t_keys = t_coords[:, 1].long() * W + t_coords[:, 0].long()
+
+        # Sort teacher keys so we can binary-search student keys into them
+        t_sorted, t_order = t_keys.sort()
+
+        # For each student key, find its insertion point in the sorted teacher keys
+        pos = torch.searchsorted(t_sorted, s_keys)
+        # Clamp so we can safely index t_sorted; out-of-range means no match
+        pos = pos.clamp(max=t_sorted.shape[0] - 1)
+        # A student key is matched iff t_sorted[pos] equals it exactly
+        valid = t_sorted[pos] == s_keys
+
+        # s_local: which student voxels (local to this batch item) have a match
+        s_local = valid.nonzero(as_tuple=False).squeeze(1)
+        if s_local.numel() == 0:
+            counts_list.append(0)
+            continue
+
+        # t_order maps sorted positions back to original teacher ordering;
+        # pos[valid] gives the sorted positions of matched keys
+        t_local = t_order[pos[valid]]
+
+        # Shift local indices to global positions in the flat feature tensors
+        s_global_idx.append(s_local + s_start)
+        t_global_idx.append(t_local + t_start)
+        counts_list.append(s_local.shape[0])
+
+    counts = torch.tensor(counts_list, dtype=torch.int64, device=device)
+
+    # Single gather over the concatenated feature tensors — no intermediate
+    # Voxels objects needed.
+    if s_global_idx:
+        s_idx = torch.cat(s_global_idx)
+        t_idx = torch.cat(t_global_idx)
+        s_feats    = s_out.feature_tensor[s_idx]
+        s_bb_feats = s_backbone.feature_tensor[s_idx]  # same coords as s_out
+        t_feats    = t_out.feature_tensor[t_idx]
+    else:
         D_head = s_out.feature_tensor.shape[1]
         D_bb   = s_backbone.feature_tensor.shape[1]
-        return (s_out.feature_tensor.new_zeros(0, D_head),
-                s_backbone.feature_tensor.new_zeros(0, D_bb),
-                t_out.feature_tensor.new_zeros(0, D_head),
-                torch.zeros(B, dtype=torch.int64, device=device))
-
-    # --- Build unique flat keys: batch_idx * HW + y * W + x ---------------
-    # W must exceed the max x-coord so that y * W + x is unique per pixel.
-    # HW = (max_y + 1) * W is the key range per batch item; prepending
-    # batch_idx * HW guarantees no collisions across batch items.
-    W = max(int(s_out.coordinate_tensor[:, 0].max().item()),
-            int(t_out.coordinate_tensor[:, 0].max().item())) + 1
-    HW = (max(int(s_out.coordinate_tensor[:, 1].max().item()),
-              int(t_out.coordinate_tensor[:, 1].max().item())) + 1) * W
-
-    # Expand per-item counts into per-voxel batch indices
-    s_counts = (s_out.offsets[1:] - s_out.offsets[:-1]).to(device)
-    t_counts = (t_out.offsets[1:] - t_out.offsets[:-1]).to(device)
-    s_batch = torch.repeat_interleave(torch.arange(B, device=device), s_counts)
-    t_batch = torch.repeat_interleave(torch.arange(B, device=device), t_counts)
-
-    # Batch-prefixed flat keys — prevents cross-batch matching
-    s_keys = s_batch * HW + s_out.coordinate_tensor[:, 1].long() * W + s_out.coordinate_tensor[:, 0].long()
-    t_keys = t_batch * HW + t_out.coordinate_tensor[:, 1].long() * W + t_out.coordinate_tensor[:, 0].long()
-
-    # --- Sort teacher keys, binary-search student keys into them -----------
-    t_sorted, t_order = t_keys.sort()
-    pos = torch.searchsorted(t_sorted, s_keys)
-    pos = pos.clamp(max=N_t - 1)           # clamp for safe indexing
-    valid = t_sorted[pos] == s_keys         # exact match required
-
-    # --- Gather matched features ------------------------------------------
-    # s_idx: global indices of matched student voxels in the flat feature tensor
-    # t_idx: corresponding teacher indices (via t_order to undo the sort)
-    s_idx = valid.nonzero(as_tuple=False).squeeze(1)
-    t_idx = t_order[pos[valid]]
-
-    s_feats    = s_out.feature_tensor[s_idx]
-    s_bb_feats = s_backbone.feature_tensor[s_idx]
-    t_feats    = t_out.feature_tensor[t_idx]
-
-    # --- Per-image matched counts via scatter_add -------------------------
-    counts = torch.zeros(B, dtype=torch.int64, device=device)
-    if s_idx.numel() > 0:
-        matched_batch = s_batch[s_idx]
-        counts.scatter_add_(0, matched_batch, torch.ones_like(matched_batch, dtype=torch.int64))
+        s_feats    = s_out.feature_tensor.new_zeros(0, D_head)
+        s_bb_feats = s_backbone.feature_tensor.new_zeros(0, D_bb)
+        t_feats    = t_out.feature_tensor.new_zeros(0, D_head)
 
     return s_feats, s_bb_feats, t_feats, counts
 
