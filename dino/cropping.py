@@ -5,7 +5,6 @@ import random
 from dataclasses import dataclass
 from typing import List, Tuple
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -48,55 +47,8 @@ class CropConfig:
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers (ported from wc_dino2/dinov2/data/augmentations.py)
+# Internal helpers
 # ---------------------------------------------------------------------------
-
-def _build_activity_array(
-    coords: Tensor,
-    image_h: int,
-    image_w: int,
-) -> np.ndarray:
-    """
-    Build a float32 binary activity array of shape [image_h, image_w].
-
-    coords: [N, 2] integer tensor with col-0 = x (channel axis) and col-1 = y (tick axis).
-    Active positions are set to 1.0; all others remain 0.0.
-    """
-    A = np.zeros((image_h, image_w), dtype=np.float32)
-    if coords.shape[0] == 0:
-        return A
-    xy = coords.cpu().numpy()
-    xs = xy[:, 0].astype(int)
-    ys = xy[:, 1].astype(int)
-    # Clamp to valid bounds (safety guard)
-    xs = np.clip(xs, 0, image_w - 1)
-    ys = np.clip(ys, 0, image_h - 1)
-    A[ys, xs] = 1.0
-    return A
-
-
-def _gaussian_blur_np(A: np.ndarray, sigma_px: float) -> np.ndarray:
-    """Apply a Gaussian blur via scipy to a 2-D float array."""
-    if sigma_px <= 0:
-        return A.copy()
-    from scipy.ndimage import gaussian_filter
-    return gaussian_filter(A, sigma=sigma_px)
-
-
-def _sample_anchor(H: np.ndarray, power: float) -> Tuple[int, int]:
-    """Sample (x, y) from heatmap proportional to H**power."""
-    Hp = np.clip(H, 0.0, None)
-    if power != 1.0:
-        Hp = Hp ** power
-    total = float(Hp.sum())
-    h, w = Hp.shape
-    if total <= 1e-12:
-        return random.randrange(w), random.randrange(h)
-    p = (Hp / total).ravel()
-    idx = int(np.random.choice(p.size, p=p))
-    y, x = divmod(idx, w)
-    return int(x), int(y)
-
 
 def _sample_crop_wh(
     img_w: int,
@@ -134,16 +86,6 @@ def _propose_box(
     return left, top, left + crop_w, top + crop_h
 
 
-def _box_has_enough_hits(
-    A: np.ndarray,
-    box: Tuple[int, int, int, int],
-    min_active: int,
-) -> bool:
-    left, top, right, bottom = box
-    patch = A[top:bottom, left:right]
-    return patch.size > 0 and int((patch > 0).sum()) >= min_active
-
-
 def _fallback_centre_box(
     img_w: int,
     img_h: int,
@@ -169,6 +111,9 @@ class SparseCropper:
       - Applies a Gaussian blur to create a sampling heatmap.
       - Samples n_global + n_local crop boxes biased toward active regions.
       - Returns one sub-Voxels object per crop.
+
+    Anchor-point sampling and hit-checking are done on GPU to avoid expensive
+    CPU transfers of the dense activity/heatmap arrays.
 
     Important: selected voxels keep their original (x, y) coordinates (no
     translation to a crop-local origin). This allows spatial intersection
@@ -210,22 +155,6 @@ class SparseCropper:
         x = F.conv2d(x, kv)
         return x.squeeze(1)  # [B, H, W]
 
-    def _sample_box_for_image(
-        self,
-        A: np.ndarray,
-        H: np.ndarray,
-        scale_range: Tuple[float, float],
-    ) -> Tuple[int, int, int, int]:
-        cfg = self.cfg
-        for _ in range(cfg.max_attempts):
-            anchor = _sample_anchor(H, cfg.heatmap_power)
-            crop_w, crop_h = _sample_crop_wh(cfg.image_w, cfg.image_h, scale_range, cfg.aspect_ratio)
-            box = _propose_box(anchor, crop_w, crop_h, cfg.image_w, cfg.image_h)
-            if _box_has_enough_hits(A, box, cfg.min_active_pixels):
-                return box
-        # Fallback to centred crop
-        return _fallback_centre_box(cfg.image_w, cfg.image_h, scale_range, cfg.aspect_ratio)
-
     def __call__(self, voxels: Voxels) -> List[Voxels]:
         """
         Args:
@@ -241,7 +170,7 @@ class SparseCropper:
         B = len(voxels.offsets) - 1
         device = voxels.coordinate_tensor.device
 
-        # --- Build activity arrays and heatmaps on GPU in one batch ----------
+        # --- Build activity array on GPU and blur to get heatmap -------------
         A_batch = torch.zeros(B, cfg.image_h, cfg.image_w, device=device)
         for b in range(B):
             start = int(voxels.offsets[b])
@@ -253,12 +182,29 @@ class SparseCropper:
                 A_batch[b, cy, cx] = 1.0
 
         H_batch = self._gpu_blur(A_batch)                  # [B, H, W] on GPU
+        del A_batch                                         # no longer needed
 
-        # Single transfer to CPU for the sampling loop
-        A_np = A_batch.cpu().numpy()                        # one GPU→CPU sync
-        H_np = H_batch.cpu().numpy()
+        # --- Pre-sample all anchor points on GPU via multinomial -------------
+        # This replaces per-attempt np.random.choice (which recomputes a 1.575M
+        # cumsum each call).  One multinomial call per image is ~150× faster.
+        Hp = H_batch.clamp(min=0)
+        if cfg.heatmap_power != 1.0:
+            Hp = Hp ** cfg.heatmap_power
+        Hp_flat = Hp.view(B, -1)                            # [B, H*W]
 
-        # --- Per-image, per-crop: sample boxes and filter voxels -------------
+        # For images with zero activity, fall back to uniform sampling
+        row_sums = Hp_flat.sum(dim=1, keepdim=True)
+        uniform = torch.ones(1, Hp_flat.shape[1], device=device) / Hp_flat.shape[1]
+        Hp_flat = torch.where(row_sums > 1e-12, Hp_flat, uniform)
+
+        n_samples = self._n_crops * cfg.max_attempts
+        # anchor_flat[b, i] is a flat index into the H×W grid
+        anchor_flat = torch.multinomial(Hp_flat, n_samples, replacement=True)  # [B, n_samples]
+        anchor_x = (anchor_flat % cfg.image_w).cpu()        # small transfer
+        anchor_y = (anchor_flat // cfg.image_w).cpu()
+        del H_batch, Hp, Hp_flat, anchor_flat
+
+        # --- Per-image, per-crop: propose boxes and filter voxels ------------
         crop_coords  = [[] for _ in range(self._n_crops)]
         crop_feats   = [[] for _ in range(self._n_crops)]
         crop_counts  = [[] for _ in range(self._n_crops)]
@@ -267,36 +213,57 @@ class SparseCropper:
             start = int(voxels.offsets[b])
             end   = int(voxels.offsets[b + 1])
 
-            coords_b = voxels.coordinate_tensor[start:end]  # [N, 2]
+            coords_b = voxels.coordinate_tensor[start:end]  # [N, 2] on GPU
             feats_b  = voxels.feature_tensor[start:end]      # [N, C]
             N = end - start
 
-            A = A_np[b]
-            H = H_np[b]
+            sample_cursor = 0  # walks through pre-sampled anchors for this image
 
             for k in range(self._n_crops):
-                if k < cfg.n_global:
-                    scale_range = cfg.global_scale
-                else:
-                    scale_range = cfg.local_scale
+                scale_range = cfg.global_scale if k < cfg.n_global else cfg.local_scale
 
                 if N == 0:
                     kidx = torch.zeros(0, dtype=torch.long, device=device)
                 else:
-                    box = self._sample_box_for_image(A, H, scale_range)
-                    left, top, right, bottom = box
+                    found = False
+                    for _ in range(cfg.max_attempts):
+                        ax = int(anchor_x[b, sample_cursor])
+                        ay = int(anchor_y[b, sample_cursor])
+                        sample_cursor += 1
 
-                    xy = coords_b
-                    mask = (
-                        (xy[:, 0] >= left)  &
-                        (xy[:, 0] <  right) &
-                        (xy[:, 1] >= top)   &
-                        (xy[:, 1] <  bottom)
-                    )
-                    kidx = mask.nonzero(as_tuple=False).squeeze(1)
+                        crop_w, crop_h = _sample_crop_wh(
+                            cfg.image_w, cfg.image_h, scale_range, cfg.aspect_ratio,
+                        )
+                        box = _propose_box((ax, ay), crop_w, crop_h, cfg.image_w, cfg.image_h)
+                        left, top, right, bottom = box
 
-                    if kidx.numel() == 0:
-                        kidx = torch.zeros(1, dtype=torch.long, device=device)
+                        # Hit-check directly on sparse coords (avoids dense CPU array)
+                        mask = (
+                            (coords_b[:, 0] >= left)  &
+                            (coords_b[:, 0] <  right) &
+                            (coords_b[:, 1] >= top)   &
+                            (coords_b[:, 1] <  bottom)
+                        )
+                        n_hits = mask.sum().item()
+                        if n_hits >= cfg.min_active_pixels:
+                            kidx = mask.nonzero(as_tuple=False).squeeze(1)
+                            found = True
+                            break
+
+                    if not found:
+                        box = _fallback_centre_box(
+                            cfg.image_w, cfg.image_h, scale_range, cfg.aspect_ratio,
+                        )
+                        left, top, right, bottom = box
+                        mask = (
+                            (coords_b[:, 0] >= left)  &
+                            (coords_b[:, 0] <  right) &
+                            (coords_b[:, 1] >= top)   &
+                            (coords_b[:, 1] <  bottom)
+                        )
+                        kidx = mask.nonzero(as_tuple=False).squeeze(1)
+                        if kidx.numel() == 0:
+                            kidx = torch.zeros(1, dtype=torch.long, device=device)
 
                 if kidx.numel() > 0:
                     crop_coords[k].append(coords_b[kidx])
