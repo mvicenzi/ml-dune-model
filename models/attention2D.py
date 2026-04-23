@@ -176,8 +176,7 @@ class SpatialFeatureAttention2D(Attention):
 
             attn = (q @ k.transpose(-2, -1)) * self.scale
             if mask is not None:
-                #  attn = attn + mask
-                #  assert mask.device == attn.device
+                assert mask.device == attn.device
                 attn_bias = torch.zeros(mask.shape, dtype = attn.dtype, device = attn.device)
                 attn_bias.masked_fill_(mask.logical_not(), float("-1e9"))
                 attn = attn + attn_bias
