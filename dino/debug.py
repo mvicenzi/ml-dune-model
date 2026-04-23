@@ -62,6 +62,12 @@ class DINODebugger:
         )
         # grad_history: module_group -> {"iter": [...], "norm": [...]}
         self.grad_history = {} if self.enabled else None
+        self.last_peak_alloc_gib: float = 0.0
+        # gpu_memory_history: per-iteration peak allocated/reserved GiB
+        self.gpu_memory_history = (
+            {"iter": [], "peak_alloc_gib": [], "peak_reserved_gib": []}
+            if self.enabled else None
+        )
         # cached norm-module prefixes, built once on first log_gradient_norms call
         self._norm_prefixes: tuple | None = None
         # val_history: iteration index at end of each epoch -> val loss
@@ -186,6 +192,7 @@ class DINODebugger:
           val:             {iter: [...], loss: [...]}        per-epoch val loss
           stats:           {iter: [...], s_var: [...], ...}  feature statistics
           grad:            {module: {iter: [...], norm: [...]}, ...}
+          gpu_memory:      {iter: [...], peak_alloc_gib: [...], peak_reserved_gib: [...]}
         """
         if not self.enabled:
             return
@@ -199,6 +206,7 @@ class DINODebugger:
             "val":              self.val_history               or {},
             "stats":            self.stats_history             or {},
             "grad":             self.grad_history              or {},
+            "gpu_memory":       self.gpu_memory_history        or {},
         }
         try:
             with open(self.debug_dir / "histories.json", "w") as f:
@@ -350,6 +358,22 @@ class DINODebugger:
             if data["iter"] and data["iter"][-1] == iteration
         )
         self.logger.info(f"[iter {iteration:6d}] GRAD_NORMS: {msg}")
+
+    def log_gpu_memory(self, iteration: int):
+        """Log peak GPU memory (allocated and reserved) since last call, then reset the peak counter."""
+        if not self.enabled or not torch.cuda.is_available():
+            return
+        alloc_gib = torch.cuda.max_memory_allocated() / 1024**3
+        reserved_gib = torch.cuda.max_memory_reserved() / 1024**3
+        self.last_peak_alloc_gib = alloc_gib
+        torch.cuda.reset_peak_memory_stats()
+        self.logger.info(
+            f"[iter {iteration:6d}] GPU_MEM: peak_alloc={alloc_gib:.2f} GiB  peak_reserved={reserved_gib:.2f} GiB"
+        )
+        h = self.gpu_memory_history
+        h["iter"].append(iteration)
+        h["peak_alloc_gib"].append(alloc_gib)
+        h["peak_reserved_gib"].append(reserved_gib)
 
     def maybe_save_histories(self, iteration: int):
         """Persist histories to disk every `debug_every` iterations."""

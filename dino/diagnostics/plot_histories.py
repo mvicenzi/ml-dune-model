@@ -427,6 +427,29 @@ def plot_grads(data: dict, out_dir: Path):
     print(f"  saved grad_norms.png")
 
 
+def plot_gpu_memory(data: dict, out_dir: Path):
+    h = data.get("gpu_memory", {})
+    iters = h.get("iter", [])
+    alloc = h.get("peak_alloc_gib", [])
+    reserved = h.get("peak_reserved_gib", [])
+    if not iters or not alloc:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(iters, alloc, linewidth=1.5, color="C0", label="Peak allocated")
+    ax.plot(iters, reserved, linewidth=1.5, color="C1", alpha=0.7, label="Peak reserved")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("GiB")
+    ax.set_title("Peak GPU memory per iteration")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(out_dir / "gpu_memory.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved gpu_memory.png")
+
+
 def main():
     if len(sys.argv) != 2:
         print("Usage: python dino/plot_histories.py path/to/histories.json")
@@ -453,6 +476,7 @@ def main():
     plot_eigen(data, out_dir, label="backbone", mat_key="")
     plot_eigen(data, out_dir, label="head", mat_key="head_")
     plot_grads(data, out_dir)
+    plot_gpu_memory(data, out_dir)
 
     print("Done.")
 

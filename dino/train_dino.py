@@ -430,6 +430,7 @@ def main(
             # raw backbone otherwise), so no separate backbone-entropy diagnostic is needed.
             n_valid = student_out.feature_tensor.shape[0]
             debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, student_entropy, kl, cov_penalty, var_penalty)
+            debugger.log_gpu_memory(iteration)
 
             # Gradient norms per backbone module (.grad still populated before next zero_grad)
             debugger.log_gradient_norms(iteration, model.student)
@@ -455,8 +456,9 @@ def main(
             if (batch_idx + 1) % 50 == 0 or batch_idx == 0:
                 cov_str = f", cov={cov_penalty:.4f}" if cov_penalty is not None else ""
                 var_str = f", var={var_penalty:.4f}" if var_penalty is not None else ""
+                mem_str = f", gpu={debugger.last_peak_alloc_gib:.2f}GiB"
                 print(f"[{epoch}/{epochs}] iter {iteration}: loss={loss_val:.6f}, "
-                      f"lr={lr_val:.2e}, mom={mom_val:.6f}{cov_str}{var_str}")
+                      f"lr={lr_val:.2e}, mom={mom_val:.6f}{cov_str}{var_str}{mem_str}")
 
         # Validation
         #val_loss = validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_mode)
