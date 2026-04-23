@@ -6,7 +6,7 @@ from warpconvnet.nn.modules.base_module import BaseSpatialModule
 from warpconvnet.nn.encodings import SinusoidalEncoding
 from warpconvnet.geometry.features.ops.convert import cat_to_pad_tensor
 
-from warpconvnet.nn.modules.attention import offset_to_mask
+from warpconvnet.nn.modules.attention import offset_to_mask, zero_out_points
 from warpconvnet.nn.modules.attention import Attention, ToSpatialFeatures
 
 try:
