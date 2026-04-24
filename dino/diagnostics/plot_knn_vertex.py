@@ -50,6 +50,7 @@ import torch
 # Re-use plot functions from the sibling module
 from dino.diagnostics.plot_knn import (
     CLASS_NAMES,
+    _filter_valid,
     _reduce_2d,
     plot_purity,
     plot_confusion,
@@ -388,8 +389,15 @@ def run(
     positions = data["positions"]
     charges   = data["charges"]
 
+    # Drop images with label == -1 (nutau CC / missing metadata).
+    n_before = len(labels)
+    labels, offsets, s_feats, t_feats, positions, charges = _filter_valid(
+        labels, offsets, s_feats, t_feats, positions, charges,
+    )
+    n_dropped = n_before - len(labels)
+
     print(f"  Valid pixels : {s_feats.shape[0]}   Feature dim: {s_feats.shape[1]}")
-    print(f"  Images       : {len(labels)}")
+    print(f"  Images       : {len(labels)}  ({n_dropped} dropped, label==-1)")
     print(f"  Class counts : { {CLASS_NAMES[c]: int((labels==c).sum()) for c in np.unique(labels)} }")
     print(f"\n  Search region : rows [{search_row}, {search_row+search_h})  "
           f"cols [{search_col-search_w}, {search_col+search_w})")

@@ -45,3 +45,39 @@ def voxels_label_collate_fn(batch):
     """
     voxels_list, labels = zip(*batch)
     return voxels_collate_fn(list(voxels_list)), torch.tensor(labels, dtype=torch.long)
+
+
+def voxels_meta_collate_fn(batch):
+    """
+    Collate a list of (Voxels, meta_dict) tuples into (batched_Voxels, meta_dict).
+
+    Used with APASparseMetaDataset(return_full_metadata=True). Numeric dict fields
+    are stacked into batched tensors; `event_key` stays a list of strings.
+
+    Expected dict keys (as produced by APASparseMetaDataset._read_full_metadata):
+        label, nu_pdg, nu_ccnc, nu_intType  →  LongTensor[B]
+        nu_energy                           →  FloatTensor[B]
+        vertex_xyz                          →  FloatTensor[B, 3]
+        event_key                           →  list[str] of length B
+        pid_labels (optional)               →  list of B np.ndarray[N_i] int32
+                                               (present only with return_pixel_truth=True)
+
+    Usage:
+        from loader.collate import voxels_meta_collate_fn
+        loader = DataLoader(dataset, batch_size=8, collate_fn=voxels_meta_collate_fn)
+    """
+    voxels_list, metas = zip(*batch)
+    batched_voxels = voxels_collate_fn(list(voxels_list))
+
+    out = {
+        "label":      torch.tensor([m["label"]      for m in metas], dtype=torch.long),
+        "nu_pdg":     torch.tensor([m["nu_pdg"]     for m in metas], dtype=torch.long),
+        "nu_ccnc":    torch.tensor([m["nu_ccnc"]    for m in metas], dtype=torch.long),
+        "nu_intType": torch.tensor([m["nu_intType"] for m in metas], dtype=torch.long),
+        "nu_energy":  torch.tensor([m["nu_energy"]  for m in metas], dtype=torch.float32),
+        "vertex_xyz": torch.stack([m["vertex_xyz"]  for m in metas], dim=0),
+        "event_key":  [m["event_key"] for m in metas],
+    }
+    if "pid_labels" in metas[0]:
+        out["pid_labels"] = [m["pid_labels"] for m in metas]
+    return batched_voxels, out

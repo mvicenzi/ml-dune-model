@@ -11,12 +11,12 @@ import inspect
 import json
 import sys
 import torch
-import torch.nn.functional as F
 import torch.optim as optim
 from pathlib import Path
 from torch.utils.data import DataLoader
 
-from loader.dataset import DUNEImageDataset
+from loader.apa_sparse_dataset import APASparseDataset
+from loader.collate import voxels_collate_fn
 from loader.splits import train_val_split, Subset
 
 from .config import DINOConfig
@@ -24,7 +24,7 @@ from .masking import SparseVoxelMasker
 from .cropping import CropConfig, SparseCropper
 from .loss import PixelDINOLoss
 from .scheduler import CosineScheduler
-from .model import DINODuneModel, _filter_voxels
+from .model import DINODuneModel, match_and_gather
 from .debug import DINODebugger
 
 
@@ -48,16 +48,12 @@ def validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_m
     total_loss = 0.0
     n_batches = 0
 
-    for data, _ in val_loader:
-        data = data.to(device)
-        xs = model.from_dense(data)
+    for xs in val_loader:
+        xs = xs.to(device)
 
         if augmentation_mode == "cropping":
             n_global = augmenter.cfg.n_global
-            B        = len(xs.offsets) - 1
-            device_  = xs.coordinate_tensor.device
-
-            crops, kept_indices_list, teacher_luts = augmenter(xs)
+            crops = augmenter(xs)
             n_crops = len(crops)
 
             teacher_encoded = [model.encode_teacher(crops[g]) for g in range(n_global)]
@@ -70,39 +66,21 @@ def validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_m
                     if k == g:
                         continue
                     _, teacher_out_g = teacher_encoded[g]
-
-                    s_local_idx_list, t_local_idx_list = [], []
-                    for b in range(B):
-                        S_k_b = kept_indices_list[k][b]
-                        lut = teacher_luts[g][b]
-                        if S_k_b.numel() == 0:
-                            empty = torch.zeros(0, dtype=torch.long, device=device_)
-                            s_local_idx_list.append(empty)
-                            t_local_idx_list.append(empty)
-                            continue
-                        t_local_raw = lut[S_k_b]
-                        valid = t_local_raw >= 0
-                        s_local = valid.nonzero(as_tuple=False).squeeze(1)
-                        if s_local.numel() == 0:
-                            empty = torch.zeros(0, dtype=torch.long, device=device_)
-                            s_local_idx_list.append(empty)
-                            t_local_idx_list.append(empty)
-                            continue
-                        t_local = t_local_raw[valid]
-                        s_local_idx_list.append(s_local)
-                        t_local_idx_list.append(t_local)
-
-                    student_out_kg      = _filter_voxels(student_out_k,      s_local_idx_list)
-                    student_backbone_kg = _filter_voxels(student_backbone_k, s_local_idx_list)
-                    loss_k, _, _, _, _, _  = loss_fn(student_out_kg, student_backbone_kg, teacher_out_g, t_local_idx_list)
+                    s_feats, s_bb_feats, t_feats, counts = match_and_gather(
+                        student_out_k, student_backbone_k, teacher_out_g,
+                    )
+                    loss_k, _, _, _, _, _ = loss_fn(s_feats, s_bb_feats, t_feats, counts)
                     batch_loss = loss_k if batch_loss is None else batch_loss + loss_k
                     n_pairs += 1
             loss_val = (batch_loss / n_pairs).item()
         else:
-            xs_student, kept_indices = augmenter(xs)
+            xs_student, _ = augmenter(xs)
             _, teacher_out = model.encode_teacher(xs)
             student_backbone_out, student_out = model.encode_student(xs_student)
-            loss, _, _, _, _, _ = loss_fn(student_out, student_backbone_out, teacher_out, kept_indices)
+            s_feats, s_bb_feats, t_feats, counts = match_and_gather(
+                student_out, student_backbone_out, teacher_out,
+            )
+            loss, _, _, _, _, _ = loss_fn(s_feats, s_bb_feats, t_feats, counts)
             loss_val = loss.item()
 
         total_loss += loss_val
@@ -283,10 +261,10 @@ def main(
 
     # ============ Data ============
     print("\nLoading dataset...")
-    dataset = DUNEImageDataset(
+    dataset = APASparseDataset(
         rootdir=cfg.rootdir,
-        class_names=["numu", "nue", "nutau", "NC"],
-        view_index=cfg.view_index,
+        apa=cfg.apa,
+        view=cfg.view,
         use_cache=True,
     )
 
@@ -311,6 +289,7 @@ def main(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=voxels_collate_fn,
     )
     val_loader = DataLoader(
         val_ds,
@@ -318,6 +297,7 @@ def main(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=voxels_collate_fn,
     )
 
     epoch_len = len(train_loader)
@@ -352,8 +332,8 @@ def main(
             blur_sigma_px=cfg.crop_blur_sigma_px,
             heatmap_power=cfg.crop_heatmap_power,
             min_active_pixels=cfg.crop_min_active_pixels,
-            image_h=cfg.image_size,
-            image_w=cfg.image_size,
+            image_h=cfg.image_h,
+            image_w=cfg.image_w,
         )
         cropper = SparseCropper(crop_cfg)
         augmenter = cropper
@@ -411,17 +391,9 @@ def main(
     for epoch in range(1, epochs + 1):
         model.train()
 
-        for batch_idx, (data, _) in enumerate(train_loader):
+        for batch_idx, xs in enumerate(train_loader):
             iteration = (epoch - 1) * epoch_len + batch_idx
-            data = data.to(device)
-
-            # Warn about empty images (all-zero pixels) — these can cause warpconvnet
-            # to silently drop batch entries due to bincount trailing-zero truncation.
-            empty = (data.view(data.shape[0], -1) == 0).all(dim=1)
-            if empty.any():
-                empty_idx = empty.nonzero(as_tuple=True)[0].tolist()
-                print(f"WARNING: epoch {epoch}, batch {batch_idx}: "
-                      f"{len(empty_idx)} empty image(s) at batch positions {empty_idx}")
+            xs = xs.to(device)
 
             # Apply schedules
             lr_val = lr_schedule[iteration]
@@ -438,12 +410,12 @@ def main(
                 (loss_val, teacher_entropy, student_entropy,
                  kl, cov_penalty, var_penalty,
                  student_backbone_out, teacher_backbone_out,
-                 student_out, teacher_out) = model.forward_backward_crops(data, augmenter, loss_fn)
+                 student_out, teacher_out) = model.forward_backward_crops(xs, augmenter, loss_fn)
             else:
                 (loss_val, teacher_entropy, student_entropy,
                  kl, cov_penalty, var_penalty,
                  student_backbone_out, teacher_backbone_out,
-                 student_out, teacher_out) = model.forward_backward(data, augmenter, loss_fn)
+                 student_out, teacher_out) = model.forward_backward(xs, augmenter, loss_fn)
             optimizer.step()
 
             # EMA teacher update
@@ -453,25 +425,12 @@ def main(
             loss_fn.update_center(teacher_out)
             debugger.log_center_stats(iteration, loss_fn)
 
-            # Backbone entropy (diagnostic: are backbone features already sharp before the head?)
-            # Only meaningful when a projection head is active and loss is dino.
-            backbone_teacher_entropy = None
-            backbone_student_entropy = None
-            if model.student_head is not None and loss_fn.loss_type == "dino":
-                with torch.no_grad():
-                    # L2-normalize backbone features before softmax: backbone features are
-                    # raw/unnormalized, so dividing by the head temperatures (≈0.04) without
-                    # normalization would make softmax a near-hard-argmax → entropy ≈ 0 always.
-                    s_bb = F.normalize(student_backbone_out.feature_tensor.float(), dim=-1)
-                    t_bb = F.normalize(teacher_backbone_out.feature_tensor.float(), dim=-1)
-                    t_prob_bb = F.softmax(t_bb / loss_fn.teacher_temp, dim=-1)
-                    s_prob_bb = F.softmax(s_bb / loss_fn.student_temp, dim=-1)
-                    backbone_teacher_entropy = -(t_prob_bb * t_prob_bb.log().clamp(min=-100)).sum(dim=-1).mean().item()
-                    backbone_student_entropy = -(s_prob_bb * s_prob_bb.log().clamp(min=-100)).sum(dim=-1).mean().item()
-
-            # Scalar logging
+            # Scalar logging — the (teacher_entropy, student_entropy, kl) trio already
+            # reflects whatever goes into the loss (head output if a head is present,
+            # raw backbone otherwise), so no separate backbone-entropy diagnostic is needed.
             n_valid = student_out.feature_tensor.shape[0]
-            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, student_entropy, kl, cov_penalty, var_penalty, backbone_teacher_entropy, backbone_student_entropy)
+            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, student_entropy, kl, cov_penalty, var_penalty)
+            debugger.log_gpu_memory(iteration)
 
             # Gradient norms per backbone module (.grad still populated before next zero_grad)
             debugger.log_gradient_norms(iteration, model.student)
@@ -485,7 +444,7 @@ def main(
 
             # First batch: log tensor shapes
             if first_batch:
-                debugger.log_shapes(data, student_backbone_out.feature_tensor, teacher_backbone_out.feature_tensor)
+                debugger.log_shapes(xs.feature_tensor, student_backbone_out.feature_tensor, teacher_backbone_out.feature_tensor)
                 first_batch = False
 
             # Periodically persist histories to disk
@@ -497,8 +456,9 @@ def main(
             if (batch_idx + 1) % 50 == 0 or batch_idx == 0:
                 cov_str = f", cov={cov_penalty:.4f}" if cov_penalty is not None else ""
                 var_str = f", var={var_penalty:.4f}" if var_penalty is not None else ""
+                mem_str = f", gpu={debugger.last_peak_alloc_gib:.2f}GiB"
                 print(f"[{epoch}/{epochs}] iter {iteration}: loss={loss_val:.6f}, "
-                      f"lr={lr_val:.2e}, mom={mom_val:.6f}{cov_str}{var_str}")
+                      f"lr={lr_val:.2e}, mom={mom_val:.6f}{cov_str}{var_str}{mem_str}")
 
         # Validation
         #val_loss = validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_mode)

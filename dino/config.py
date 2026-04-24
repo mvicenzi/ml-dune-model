@@ -10,7 +10,6 @@ class DINOConfig:
     # ============ Backbone ============
     backbone_name: str = "attn_default"  # key into BACKBONE_REGISTRY (e.g., "base", "attn_default")
     feature_dim: int = 64             # backbone output channels; must match model's output
-    image_size: int = 500             # spatial resolution (H = W)
     encoding_range: float = 125.0     # sinusoidal positional encoding range (bottleneck coordinate extent)
 
     # ============ Augmentation mode ============
@@ -61,11 +60,14 @@ class DINOConfig:
     var_gamma: float = 1.0           # target minimum std per feature dimension
 
     # ============ Data ============
-    rootdir: str = "/nfs/data/1/rrazakami/work/data_cvn/data/dune/2023_trainings/latest/dunevd"
-    view_index: int = 2              # which wire plane view to use (0, 1, or 2)
+    rootdir: str = "/nfs/data/1/yuhw/cffm-data/prod-jay-100k-truth-2026-02-27"
+    apa: int = 0                    # which APA to train on
+    view: str = "W"                 # which wire plane view to use
     n_subset: int = -1               # -1 = full dataset; otherwise use first N samples for testing
     batch_size: int = 16
     num_workers: int = 4
+    image_h: int = 1500               # spatial resolution: height (time ticks)
+    image_w: int = 1050               # spatial resolution: width (wire channels)
 
     # ============ Checkpointing ============
     output_dir: str = "./dino_checkpoints"

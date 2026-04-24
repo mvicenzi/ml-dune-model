@@ -37,11 +37,52 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-CLASS_NAMES = ["numu", "nue", "nutau", "NC"]
+CLASS_NAMES = ["numuCC", "nueCC", "NC"]
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _filter_valid(
+    labels: np.ndarray,
+    offsets: np.ndarray,
+    *pixel_arrays: np.ndarray,
+) -> tuple:
+    """
+    Drop images with ``label == -1`` (nutau CC / missing metadata) together with
+    the pixels that belong to them, and rebuild ``offsets`` so downstream code
+    can still index pixel arrays image-by-image.
+
+    Args:
+        labels:        [N_images] int array of class labels; -1 marks "skip".
+        offsets:       [N_images+1] CSR-style pixel offsets.
+        pixel_arrays:  any number of [N_valid, ...] arrays aligned with the
+                       pixel axis (e.g. student_features, teacher_features,
+                       positions, charges).
+
+    Returns:
+        (labels_filtered, offsets_filtered, *pixel_arrays_filtered)
+    """
+    keep_img = labels >= 0
+    if keep_img.all():
+        return (labels, offsets, *pixel_arrays)
+
+    # Pixel mask: keep a pixel iff its parent image is kept.
+    keep_pix = np.zeros(int(offsets[-1]), dtype=bool)
+    new_counts = []
+    for i in range(len(labels)):
+        start, end = int(offsets[i]), int(offsets[i + 1])
+        if keep_img[i]:
+            keep_pix[start:end] = True
+            new_counts.append(end - start)
+
+    new_offsets = np.concatenate(
+        [np.zeros(1, dtype=offsets.dtype),
+         np.cumsum(new_counts, dtype=offsets.dtype)]
+    )
+    filtered_pixels = tuple(arr[keep_pix] for arr in pixel_arrays)
+    return (labels[keep_img], new_offsets, *filtered_pixels)
+
 
 def _l2_norm(X: np.ndarray) -> np.ndarray:
     """Row-wise L2 normalisation — cosine similarity becomes a dot product."""
@@ -555,10 +596,17 @@ def main():
     t_feats  = data["teacher_features"]
     labels   = data["labels"].astype(int) # [N_images]
     offsets  = data["offsets"]            # [N_images+1]
-    positions = data["positions"]         # [N_valid, 2]  (not used here but validated)
+
+    # Drop images with label == -1 (nutau CC / missing metadata). Keeping them
+    # would break per-class indexing since CLASS_NAMES has no entry for -1.
+    n_before = len(labels)
+    labels, offsets, s_feats, t_feats = _filter_valid(
+        labels, offsets, s_feats, t_feats,
+    )
+    n_dropped = n_before - len(labels)
 
     print(f"  Valid pixels : {s_feats.shape[0]}   Feature dim: {s_feats.shape[1]}")
-    print(f"  Images       : {len(labels)}")
+    print(f"  Images       : {len(labels)}  ({n_dropped} dropped, label==-1)")
     print(f"  Class counts : { {CLASS_NAMES[c]: int((labels==c).sum()) for c in np.unique(labels)} }")
     print(f"  Device       : {device}")
 
