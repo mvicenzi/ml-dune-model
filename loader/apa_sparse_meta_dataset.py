@@ -2,6 +2,7 @@
 
 import warnings
 import h5py
+import numpy as np
 import torch
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
@@ -52,6 +53,13 @@ class APASparseMetaDataset(APASparseDataset):
         All numeric fields default to -1 / 0.0 when metadata is missing; the
         caller can detect this via label == -1.
 
+    - return_pixel_truth=True (requires return_full_metadata=True):
+        Also adds to the meta dict:
+            pid_labels: np.ndarray[N_pixels] int32
+                Raw PDG code from frame_pid_1st for each reco pixel, aligned to
+                the order of pixels in the returned Voxels.  Value 0 means the
+                pixel has no pid1 truth hit.
+
     Metadata file co-location: given
         {dir}/{basename}_pixeldata-anode{N}.h5
     the metadata file is
@@ -72,6 +80,7 @@ class APASparseMetaDataset(APASparseDataset):
         view_ranges: Optional[Dict[str, Tuple[int, int]]] = None,
         frame_name: str = "frame_rebinned_reco",
         return_full_metadata: bool = False,
+        return_pixel_truth: bool = False,
     ):
         super().__init__(
             rootdir=rootdir,
@@ -83,6 +92,7 @@ class APASparseMetaDataset(APASparseDataset):
             frame_name=frame_name,
         )
         self.return_full_metadata = return_full_metadata
+        self.return_pixel_truth = return_pixel_truth
         self._warned_missing: set = set()
 
     def __getitem__(self, idx: int):
@@ -91,6 +101,8 @@ class APASparseMetaDataset(APASparseDataset):
         s = self.samples[idx]
         if self.return_full_metadata:
             meta = self._read_full_metadata(s.path, s.group)
+            if self.return_pixel_truth:
+                meta["pid_labels"] = self._read_pixel_truth(s.path, s.group)
             return voxels, meta
 
         label = self._read_label(s.path, s.group)
@@ -183,3 +195,57 @@ class APASparseMetaDataset(APASparseDataset):
             "vertex_xyz": torch.tensor([vx, vy, vz], dtype=torch.float32),
             "event_key":  event_key,
         }
+
+    # ------------------------------------------------------------------
+    # Pixel-level truth reader
+    # ------------------------------------------------------------------
+
+    def _read_pixel_truth(self, pixeldata_path: Path, group: str) -> np.ndarray:
+        """
+        Read frame_pid_1st from the pixeldata file and return a per-reco-pixel
+        array of raw PDG codes, aligned to the pixel order produced by
+        APASparseDataset.__getitem__ for the same (path, group).
+
+        Pixels with no pid1 hit carry value 0.
+        """
+        try:
+            with h5py.File(pixeldata_path, "r") as f:
+                g = f[group]
+                reco_coords = g[self.frame_name]["coords"][()]   # (N, 2) int32
+
+                if "frame_pid_1st" not in g:
+                    mask = ((reco_coords[:, 0] >= self.ch_start) &
+                            (reco_coords[:, 0] < self.ch_end))
+                    return np.zeros(int(mask.sum()), dtype=np.int32)
+
+                pid1_coords = g["frame_pid_1st"]["coords"][()]   # (M, 2) int32
+                pid1_feats  = g["frame_pid_1st"]["features"][()]  # (M,) float32
+        except Exception as e:
+            self._warn_once(
+                pixeldata_path,
+                f"Could not read pixel truth from {pixeldata_path}[{group}]: {e}",
+            )
+            return np.zeros(0, dtype=np.int32)
+
+        # Filter to this view's channel range (same logic as APASparseDataset)
+        mask_reco = ((reco_coords[:, 0] >= self.ch_start) &
+                     (reco_coords[:, 0] < self.ch_end))
+        mask_pid1 = ((pid1_coords[:, 0] >= self.ch_start) &
+                     (pid1_coords[:, 0] < self.ch_end))
+
+        reco_view       = reco_coords[mask_reco]
+        pid1_view_coords = pid1_coords[mask_pid1]
+        pid1_view_feats  = pid1_feats[mask_pid1]
+
+        # Build lookup: (rebased_ch, tick) -> PDG code
+        pid1_lookup = {
+            (int(c[0]) - self.ch_start, int(c[1])): int(v)
+            for c, v in zip(pid1_view_coords, pid1_view_feats)
+        }
+
+        # Align to reco pixel order (APASparseDataset subtracts ch_start from coords)
+        return np.array(
+            [pid1_lookup.get((int(c[0]) - self.ch_start, int(c[1])), 0)
+             for c in reco_view],
+            dtype=np.int32,
+        )

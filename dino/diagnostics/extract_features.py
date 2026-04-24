@@ -27,6 +27,8 @@ Output (.npz):
     positions         [N_valid, 2]   int32     (channel, tick) pixel coordinates in view-local frame
     charges           [N_valid, 1]   float32   raw pixel charge (ADC value) at each active pixel
     offsets           [N_images+1]   int64     CSR-style: image i occupies rows offsets[i]:offsets[i+1]
+    pid_labels        [N_valid]      int32     raw PDG code from frame_pid_1st per pixel (0 = no truth)
+                                               only present when extracted with --pixel_truth
 """
 
 import fire
@@ -91,6 +93,7 @@ def _run_loader(student, teacher, loader, device, student_head=None, teacher_hea
 
     labels_all, pdg_all, ccnc_all, intType_all, energy_all = [], [], [], [], []
     vertex_all, event_keys_all = [], []
+    pid_labels_all = []
 
     have_head = student_head is not None
 
@@ -138,6 +141,10 @@ def _run_loader(student, teacher, loader, device, student_head=None, teacher_hea
         vertex_all.append(meta["vertex_xyz"].numpy())   # [B, 3]
         event_keys_all.extend(meta["event_key"])
 
+        # Optional pixel-level PID truth (list of B arrays, one per image)
+        if "pid_labels" in meta:
+            pid_labels_all.extend(meta["pid_labels"])
+
     return {
         "student_features":      np.concatenate(s_feats_all, axis=0).astype(np.float32),
         "teacher_features":      np.concatenate(t_feats_all, axis=0).astype(np.float32),
@@ -153,6 +160,8 @@ def _run_loader(student, teacher, loader, device, student_head=None, teacher_hea
         "positions":  np.concatenate(pos_all,     axis=0).astype(np.int32),
         "charges":    np.concatenate(charges_all, axis=0).astype(np.float32),
         "offsets":    np.array(offsets, dtype=np.int64),
+        "pid_labels": (np.concatenate(pid_labels_all, axis=0).astype(np.int32)
+                       if pid_labels_all else None),
     }
 
 
@@ -163,17 +172,20 @@ def main(
     batch_size: int = 32,
     num_workers: int = 4,
     device: str = "cuda",
+    pixel_truth: bool = False,
 ):
     """
     Extract DINO features from a trained checkpoint for PCA / probing.
 
     Args:
-        checkpoint:  Path to a .pt checkpoint saved by train_dino.py
-        output:      Output .npz path. Defaults to <checkpoint_dir>/features_ep<N>.npz
-        max_images:  Max number of images to process (-1 = full dataset)
-        batch_size:  Inference batch size
-        num_workers: DataLoader workers
-        device:      "cuda" or "cpu"
+        checkpoint:   Path to a .pt checkpoint saved by train_dino.py
+        output:       Output .npz path. Defaults to <checkpoint_dir>/features_ep<N>.npz
+        max_images:   Max number of images to process (-1 = full dataset)
+        batch_size:   Inference batch size
+        num_workers:  DataLoader workers
+        device:       "cuda" or "cpu"
+        pixel_truth:  If True, also save per-pixel PDG codes (pid_labels) from
+                      frame_pid_1st, enabling pixel-level PID k-NN analysis.
     """
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     ckpt_path = Path(checkpoint).resolve()
@@ -200,6 +212,7 @@ def main(
         view=cfg.view,
         use_cache=True,
         return_full_metadata=True,
+        return_pixel_truth=pixel_truth,
     )
     if 0 < max_images < len(dataset):
         indices = torch.randperm(len(dataset))[:max_images]
@@ -252,6 +265,9 @@ def main(
     if results["student_head_features"] is not None:
         arrays["student_head_features"] = results["student_head_features"]
         arrays["teacher_head_features"] = results["teacher_head_features"]
+    if results["pid_labels"] is not None:
+        arrays["pid_labels"] = results["pid_labels"]
+        print(f"  Pixels with pid1 truth: {(results['pid_labels'] != 0).sum()}")
 
     np.savez_compressed(out_path, **arrays)
     print(f"\nSaved: {out_path}")

@@ -36,7 +36,7 @@ if [[ ! -f "$FEATURES" ]]; then
         exit 1
     fi
     echo "Extracting features from checkpoint: $CHECKPOINT"
-    python -m dino.diagnostics.extract_features "$CHECKPOINT"
+    python -m dino.diagnostics.extract_features "$CHECKPOINT" --pixel_truth
     echo
 fi
 
@@ -51,9 +51,12 @@ echo "--- [2/3] plot_features (ep10) ---"
 python -m dino.diagnostics.plot_features "$FEATURES" --n_dominant=5 --n_samples=30
 echo
 
+echo "--- [3/3] plot_knn (ep10) ---"
+python -m dino.diagnostics.plot_knn "$FEATURES"
+echo
 
-echo "--- [3/3] plot_knn (ep10, pixel k-NN) ---"
-python -m dino.diagnostics.plot_knn "$FEATURES" --pixel_knn --n_pixel_samples=50000
+echo "--- [3/3] plot_knn_pid (ep10) ---"
+python -m dino.diagnostics.plot_knn_pid "$FEATURES"
 echo
 
 echo "=== Done. ==="

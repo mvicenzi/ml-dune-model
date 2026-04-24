@@ -59,6 +59,8 @@ def voxels_meta_collate_fn(batch):
         nu_energy                           →  FloatTensor[B]
         vertex_xyz                          →  FloatTensor[B, 3]
         event_key                           →  list[str] of length B
+        pid_labels (optional)               →  list of B np.ndarray[N_i] int32
+                                               (present only with return_pixel_truth=True)
 
     Usage:
         from loader.collate import voxels_meta_collate_fn
@@ -76,4 +78,6 @@ def voxels_meta_collate_fn(batch):
         "vertex_xyz": torch.stack([m["vertex_xyz"]  for m in metas], dim=0),
         "event_key":  [m["event_key"] for m in metas],
     }
+    if "pid_labels" in metas[0]:
+        out["pid_labels"] = [m["pid_labels"] for m in metas]
     return batched_voxels, out
