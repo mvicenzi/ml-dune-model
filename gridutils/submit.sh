@@ -78,6 +78,7 @@ universe                = vanilla
 notification            = never
 executable              = ${REPODIR}/gridutils/job.sh
 arguments               = ${REPODIR} ${PYENV} ${config} ${out_dir} ${WP_CACHE} ${run_name}
+environment             = "CLUSTER_ID=\$(ClusterId) JOB_ID=\$(ProcId)"
 output                  = ${out_dir}/\$(ClusterId).\$(ProcId).out
 error                   = ${out_dir}/\$(ClusterId).\$(ProcId).err
 log                     = ${out_dir}/\$(ClusterId).\$(ProcId).log

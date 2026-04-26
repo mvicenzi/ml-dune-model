@@ -24,15 +24,21 @@ outdir=$4
 wp_cache=$5
 run_name=$6
 
-echo "[job.sh] codedir=${codedir}"
-echo "[job.sh] pyenv=${pyenv}"
-echo "[job.sh] config=${config}"
-echo "[job.sh] outdir=${outdir}"
-echo "[job.sh] wp_cache=${wp_cache}"
-echo "[job.sh] run_name=${run_name}"
-echo "[job.sh] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
-echo "[job.sh] _CONDOR_SCRATCH_DIR=${_CONDOR_SCRATCH_DIR}"
+echo "Running $CLUSTER_ID.$JOB_ID on $(hostname)"
+echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "  _CONDOR_SCRATCH_DIR=${_CONDOR_SCRATCH_DIR}"
+echo ""
 
+echo "JOB CONFIGURATION:"
+echo "  run_name=${run_name}"
+echo "  codedir=${codedir}"
+echo "  pyenv=${pyenv}"
+echo "  config=${config}"
+echo "  outdir=${outdir}"
+echo "  wp_cache=${wp_cache}"
+echo ""
+
+echo "Activating python environment..."
 source "${pyenv}/bin/activate"
 export WARPCONVNET_BENCHMARK_CACHE_DIR="$wp_cache"
 
@@ -44,7 +50,7 @@ scratch_dbg=${_CONDOR_SCRATCH_DIR}/debug
 mkdir -p "$scratch_ckpt" "$scratch_dbg"
 
 sync_back() {
-  echo "[job.sh] syncing ${_CONDOR_SCRATCH_DIR} -> ${outdir}"
+  echo "Syncing ${_CONDOR_SCRATCH_DIR} -> ${outdir}"
   mkdir -p "${outdir}/checkpoints" "${outdir}/debug"
   # Trailing slash on source flattens the inner /${run_name} dir, so the GPFS
   # layout is ${outdir}/{checkpoints,debug}/... without a redundant nest.
@@ -54,10 +60,13 @@ sync_back() {
 trap sync_back EXIT                      # flush scratch -> GPFS on any normal/error exit
 trap 'sync_back; exit 143' SIGTERM       # on scheduler kill: flush, then exit 128+15 (SIGTERM)
 
+echo "Starting training..."
+
 PYTHONPATH="$codedir${PYTHONPATH:+:$PYTHONPATH}" \
-    python -m dino.train_dino from_config "$config" \
+    python -m dino.train_dino from_config \
+        --config_path="$config" \
         --output_dir="$scratch_ckpt" \
         --debug_dir="$scratch_dbg" \
         --device=cuda
 
-echo "[job.sh] training complete"
+echo "Training complete!"
