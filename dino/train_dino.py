@@ -126,6 +126,7 @@ def main(
     weight_decay_end: float = 0.4,
     warmup_epochs: int = 1,
     datadir: str = "/nfs/data/1/yuhw/cffm-data/prod-jay-100k-truth-2026-02-27",
+    cache_dir: str = "./data",
     output_dir: str = "./dino_checkpoints",
     save_every: int = 10,
     device: str = "cuda",
@@ -174,6 +175,7 @@ def main(
         weight_decay_end: Final weight decay (cosine annealed)
         warmup_epochs: Linear warmup duration
         datadir: Root directory of the sparse dataset on disk
+        cache_dir: Where to cache the dataset index .pt file
         output_dir: Where to save checkpoints
         save_every: Save checkpoint every N epochs
         device: "cuda" or "cpu"
@@ -235,6 +237,7 @@ def main(
         epochs=epochs,
         batch_size=batch_size,
         datadir=datadir,
+        cache_dir=cache_dir,
         output_dir=output_dir,
         save_every=save_every,
         debug=debug,
@@ -293,6 +296,7 @@ def main(
         apa=cfg.apa,
         view=cfg.view,
         use_cache=True,
+        cache_dir=cfg.cache_dir
     )
 
     if test_mode:
