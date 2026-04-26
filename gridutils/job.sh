@@ -8,7 +8,7 @@
 #   $2 pyenv    -- path to uv virtual environment to activate
 #   $3 config   -- path to run_config.json
 #   $4 outdir   -- path to output directory on GPFS (where outputs are rsynced back)
-#   $5 wp_cache -- path to warpconvnet cache dir
+#   $5 cache_dir -- general cache base; ${cache_dir}/warpconvnet and ${cache_dir}/data are used
 #   $6 run_name -- run/training name
 #
 # I/O strategy: write everything to $_CONDOR_SCRATCH_DIR (fast local disk on
@@ -21,8 +21,12 @@ codedir=$1
 pyenv=$2
 config=$3
 outdir=$4
-wp_cache=$5
+cache_dir=$5
 run_name=$6
+
+wp_cache="${cache_dir}/warpconvnet"
+data_cache="${cache_dir}/data"
+mkdir -p "$wp_cache" "$data_cache"
 
 echo "Running $CLUSTER_ID.$JOB_ID on $(hostname)"
 echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
@@ -35,7 +39,7 @@ echo "  codedir=${codedir}"
 echo "  pyenv=${pyenv}"
 echo "  config=${config}"
 echo "  outdir=${outdir}"
-echo "  wp_cache=${wp_cache}"
+echo "  cache_dir=${cache_dir}"
 echo ""
 
 echo "Activating python environment..."
@@ -67,6 +71,7 @@ PYTHONPATH="$codedir${PYTHONPATH:+:$PYTHONPATH}" \
         --config_path="$config" \
         --output_dir="$scratch_ckpt" \
         --debug_dir="$scratch_dbg" \
+        --cache_dir="$data_cache" \
         --device=cuda
 
 echo "Training complete!"

@@ -24,8 +24,8 @@ REPODIR="${REPODIR:-${HOME}/ml-dune-model}"
 # python virtual environment
 PYENV="${PYENV:-/gpfs01/lbne/users/fm/${USER}/ml-venv}"
 
-# warpconvnet benchmark cache dir
-WP_CACHE="${WP_CACHE:-/gpfs01/lbne/users/fm/${USER}/cache/warpconvnet}"
+# cache directory for warpconvnet and data index
+CACHE_DIR="${CACHE_DIR:-/gpfs01/lbne/users/fm/${USER}/cache}"
 
 # JOB REQUIREMENTS: memory, GPU type, etc.
 REQUEST_MEMORY="${REQUEST_MEMORY:-32000}"
@@ -77,7 +77,7 @@ cat > "$subfile" <<EOF
 universe                = vanilla
 notification            = never
 executable              = ${REPODIR}/gridutils/job.sh
-arguments               = ${REPODIR} ${PYENV} ${config} ${out_dir} ${WP_CACHE} ${run_name}
+arguments               = ${REPODIR} ${PYENV} ${config} ${out_dir} ${CACHE_DIR} ${run_name}
 environment             = "CLUSTER_ID=\$(ClusterId) JOB_ID=\$(ProcId)"
 output                  = ${out_dir}/\$(ClusterId).\$(ProcId).out
 error                   = ${out_dir}/\$(ClusterId).\$(ProcId).err
