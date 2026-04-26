@@ -245,25 +245,49 @@ def main(
     )
 
     print(f"Device: {device}")
-    print(f"Model: backbone_name={cfg.backbone_name}, encoding_range={cfg.encoding_range}, "
-          f"use_proj_head={cfg.use_proj_head}, proj_head_hidden_dim={cfg.proj_head_hidden_dim}, "
-          f"proj_head_output_dim={cfg.proj_head_output_dim}, proj_head_n_layers={cfg.proj_head_n_layers}")
-    print(f"Config: epochs={cfg.epochs}, lr={cfg.lr}, batch_size={cfg.batch_size}, "
-          f"warmup_epochs={cfg.warmup_epochs}, momentum_start={cfg.momentum_start}, "
-          f"momentum_end={cfg.momentum_end}")
-    print(f"Augmentation: augmentation_mode={cfg.augmentation_mode}, mask_ratio={cfg.mask_ratio}, "
-          f"crop_n_global={cfg.crop_n_global}, crop_n_local={cfg.crop_n_local}, "
-          f"crop_global_scale={cfg.crop_global_scale}, crop_local_scale={cfg.crop_local_scale}, "
-          f"crop_aspect_ratio={cfg.crop_aspect_ratio}, crop_blur_sigma_px={cfg.crop_blur_sigma_px}, "
-          f"crop_heatmap_power={cfg.crop_heatmap_power}, crop_min_active_pixels={cfg.crop_min_active_pixels}")
-    print(f'Loss: type={cfg.loss_type}, center_momentum={cfg.center_momentum}, '
-          f'use_centering={cfg.use_centering}, teacher_temp={cfg.teacher_temp}, '
-          f'student_temp={cfg.student_temp}, use_cov_penalty={cfg.use_cov_penalty}, '
-          f'cov_penalty_weight={cfg.cov_penalty_weight}, use_var_penalty={cfg.use_var_penalty}, '
-          f'var_penalty_weight={cfg.var_penalty_weight}, var_gamma={cfg.var_gamma}')
+
+    print("Model:")
+    print(f"  backbone_name        = {cfg.backbone_name}")
+    print(f"  encoding_range       = {cfg.encoding_range}")
+    print(f"  use_proj_head        = {cfg.use_proj_head}")
+    print(f"  proj_head_hidden_dim = {cfg.proj_head_hidden_dim}")
+    print(f"  proj_head_output_dim = {cfg.proj_head_output_dim}")
+    print(f"  proj_head_n_layers   = {cfg.proj_head_n_layers}")
+
+    print("Training:")
+    print(f"  epochs         = {cfg.epochs}")
+    print(f"  lr             = {cfg.lr}")
+    print(f"  batch_size     = {cfg.batch_size}")
+    print(f"  warmup_epochs  = {cfg.warmup_epochs}")
+    print(f"  momentum_start = {cfg.momentum_start}")
+    print(f"  momentum_end   = {cfg.momentum_end}")
+
+    print("Augmentation:")
+    print(f"  augmentation_mode      = {cfg.augmentation_mode}")
+    print(f"  mask_ratio             = {cfg.mask_ratio}")
+    print(f"  crop_n_global          = {cfg.crop_n_global}")
+    print(f"  crop_n_local           = {cfg.crop_n_local}")
+    print(f"  crop_global_scale      = {cfg.crop_global_scale}")
+    print(f"  crop_local_scale       = {cfg.crop_local_scale}")
+    print(f"  crop_aspect_ratio      = {cfg.crop_aspect_ratio}")
+    print(f"  crop_blur_sigma_px     = {cfg.crop_blur_sigma_px}")
+    print(f"  crop_heatmap_power     = {cfg.crop_heatmap_power}")
+    print(f"  crop_min_active_pixels = {cfg.crop_min_active_pixels}")
+
+    print("Loss:")
+    print(f"  type                = {cfg.loss_type}")
+    print(f"  center_momentum     = {cfg.center_momentum}")
+    print(f"  use_centering       = {cfg.use_centering}")
+    print(f"  teacher_temp        = {cfg.teacher_temp}")
+    print(f"  student_temp        = {cfg.student_temp}")
+    print(f"  use_cov_penalty     = {cfg.use_cov_penalty}")
+    print(f"  cov_penalty_weight  = {cfg.cov_penalty_weight}")
+    print(f"  use_var_penalty     = {cfg.use_var_penalty}")
+    print(f"  var_penalty_weight  = {cfg.var_penalty_weight}")
+    print(f"  var_gamma           = {cfg.var_gamma}")
 
     # ============ Data ============
-    print("\nLoading dataset...")
+    print("\nLoading dataset:", cfg.datadir)
     dataset = APASparseDataset(
         rootdir=cfg.datadir,
         apa=cfg.apa,
