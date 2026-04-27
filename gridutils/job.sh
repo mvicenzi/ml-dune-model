@@ -64,10 +64,10 @@ sync_back() {
 trap sync_back EXIT                      # flush scratch -> GPFS on any normal/error exit
 trap 'sync_back; exit 143' SIGTERM       # on scheduler kill: flush, then exit 128+15 (SIGTERM)
 
-echo "Starting training..."
+echo "Executing train_dino.py ..."
 
 PYTHONPATH="$codedir${PYTHONPATH:+:$PYTHONPATH}" \
-    python -m dino.train_dino from_config \
+    python -u -m dino.train_dino from_config \
         --config_path="$config" \
         --output_dir="$scratch_ckpt" \
         --debug_dir="$scratch_dbg" \
