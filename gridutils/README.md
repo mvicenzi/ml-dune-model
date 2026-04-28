@@ -8,7 +8,7 @@ Both your `$HOME` and `/gpfs01/lbne/users/fm` (shared group area) are visible fr
 
 - `$HOME/ml-dune-model`: clone the repo here. Keep all code in `$HOME`.
 - `/gpfs01/lbne/users/fm/${USER}/`: your personal area on the group GPFS volume. Create it once. Inside it:
-  - `/gpfs01/lbne/users/fm/${USER}/uvenv/`: python virtual environment. Lives on GPFS (not `$HOME`) because it can get large (~10GB).
+  - `/gpfs01/lbne/users/fm/${USER}/uvenv/`: python virtual environment. Lives here because it can get large (~10GB).
   - `/gpfs01/lbne/users/fm/${USER}/CONDOR_OUT/`: training run outputs (checkpoints, debug, condor logs). Subdirectories are created automatically by `submit.sh` for each run.
   - `/gpfs01/lbne/users/fm/${USER}/cache/`: will store `warpconvnet/` and `data/` caches.
 - `/gpfs01/lbne/users/fm/cffm-data/`: **shared** dataset area, available to anyone. Point `datadir` in your config here.
@@ -16,7 +16,7 @@ Both your `$HOME` and `/gpfs01/lbne/users/fm` (shared group area) are visible fr
 ## Setting up the environment
 
 One-time setup is handled by [build_env.sh](build_env.sh) and [build.sub](build.sub). 
-Some packaged can be installed directly from the interactive node (thanks to pre-built wheels), but GPU availability is needed when building from source and so the script must be run as a job (via `build.sub`).
+Some packages can be installed directly from the interactive node (thanks to pre-built wheels), but GPU availability is needed when building from source and so the script must be run as a job (via `build.sub`).
 See the comments in the script, and the instructions below:
 
 ```bash
@@ -26,11 +26,10 @@ pip install uv
 # 1. create the venv (only needed once)
 uv venv /gpfs01/lbne/users/fm/${USER}/uvenv --python 3.11
 
-# 2. CPU-only install 
-source /gpfs01/lbne/users/fm/${USER}/uvenv/bin/activate
+# 2. CPU-only installs via script
 ./build_env.sh
 
-# 2b. GPU install (needed for flash-attn / local warpconvnet builds)
+# 2b. GPU installs (needed for flash-attn / local warpconvnet builds)
 # edit build_env.sh to uncomment the relevant blocks, then:
 condor_submit build.sub
 ```
@@ -41,7 +40,7 @@ Edit the env vars at the top of `build_env.sh` (`CUDA`, `TORCH_REL`, `WARPCONV_R
 
 There are two relevant files: 
 - [trainjob.sh](trainjob.sh): training script that runs on the workder node
-- [submit.sh](submit.sh): submission script that prepare the `.sub` file and runs `condor_submit`.
+- [submit.sh](submit.sh): submission script that prepares the `.sub` file and runs `condor_submit`.
 
 Training jobs can be submitted by:
 
@@ -51,15 +50,14 @@ Training jobs can be submitted by:
 
 What it does:
 
-1. Reads `run_name` from the JSON configuration; this is the campaign name and must be unique.
+1. Reads `run_name` from the JSON configuration; this is the campaign name and **must be unique**.
 2. Creates `${CONDOR_OUT}/${run_name}/` (errors out if it already exists, always pick a fresh `run_name`).
 3. Writes `${run_name}.sub` and submits it.
-4. On the worker, [trainjob.sh](trainjob.sh) writes checkpoints/debug to `$_CONDOR_SCRATCH_DIR` and `rsync`s back to `${CONDOR_OUT}/${run_name}/{checkpoints,debug}/` on exit (including SIGTERM).
+4. On the worker, [trainjob.sh](trainjob.sh) writes checkpoints/debug to `$_CONDOR_SCRATCH_DIR` and `rsync`s them back to `${CONDOR_OUT}/${run_name}/{checkpoints,debug}/` on exit (including SIGTERM).
 
 ### Job submission parameters
 
-At the top of `submit.sh`, customize the directory locations as well as the job requirements for your case.
-Note that the dataset directory is specified directly in the `config.json` file (see below).
+At the top of `submit.sh`, you can customize the directory locations as well as the job requirements for your case. Note that the dataset directory is specified directly in the `config.json` file (see below).
 
 ```bash
 # output base directory on GPFS
@@ -104,5 +102,5 @@ ${CONDOR_OUT}/${run_name}/
 ├── ${run_name}.sub                    # generated submit file
 ├── <ClusterId>.<ProcId>.{out,err,log} # condor logs
 ├── checkpoints/                       # rsynced from scratch
-└── debug/                             # rsynced from scratch
+└── debug/                             # rsynced from scratch, includes config.json
 ```
