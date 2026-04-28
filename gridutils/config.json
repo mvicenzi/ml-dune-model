@@ -1,5 +1,5 @@
 {
-  "run_name": "test2", 
+  "run_name": "test", 
   
   "datadir": "/gpfs01/lbne/users/fm/cffm-data/prod-jay-100k-truth-2026-02-27",
   "apa": 0,
@@ -38,7 +38,7 @@
   "crop_heatmap_power": 1.0,
   "crop_min_active_pixels": 10,
 
-  "epochs": 10,
+  "epochs": 2,
   "momentum_start": 0.998,
   "momentum_end": 0.9999,
   "lr": 0.0001,

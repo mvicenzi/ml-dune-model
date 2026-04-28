@@ -42,9 +42,21 @@ echo "  outdir=${outdir}"
 echo "  cache_dir=${cache_dir}"
 echo ""
 
+echo "WarpConNet overrides:"
+export WARPCONVNET_USE_FP16_ACCUM=false
+export WARPCONVNET_BENCHMARK_CACHE_DIR="$wp_cache"
+#export WARPCONVNET_FWD_ALGO_MODE=auto
+#export WARPCONVNET_DGRAD_ALGO_MODE=auto
+#export WARPCONVNET_WGRAD_ALGO_MODE=auto
+echo "  WARPCONVNET_USE_FP16_ACCUM=${WARPCONVNET_USE_FP16_ACCUM}"
+echo "  WARPCONVNET_BENCHMARK_CACHE_DIR=${WARPCONVNET_BENCHMARK_CACHE_DIR}"
+#echo "  WARPCONVNET_FWD_ALGO_MODE=${WARPCONVNET_FWD_ALGO_MODE}"
+#echo "  WARPCONVNET_DGRAD_ALGO_MODE=${WARPCONVNET_DGRAD_ALGO_MODE}"
+#echo "  WARPCONVNET_WGRAD_ALGO_MODE=${WARPCONVNET_WGRAD_ALGO_MODE}"
+echo ""
+
 echo "Activating python environment..."
 source "${pyenv}/bin/activate"
-export WARPCONVNET_BENCHMARK_CACHE_DIR="$wp_cache"
 
 # Stage all outputs on local scratch.  main() will append /${run_name} under
 # each base, so the actual write dirs are $scratch_ckpt/$run_name and

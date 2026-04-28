@@ -47,11 +47,12 @@ if [ ! -f "$config" ]; then
 fi
 config=$(cd "$(dirname "$config")" && pwd)/$(basename "$config")  # absolute
 
-# Pull run_name (and num_workers, with default) out of the JSON.
-read run_name num_workers < <(python3 - "$config" <<'PY'
+# Pull run_name out of the JSON configuration
+# This is to make sure things are consistent
+read run_name < <(python3 - "$config" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1]))
-print(c.get("run_name", ""), c.get("num_workers", 4))
+print(c.get("run_name", ""))
 PY
 )
 
