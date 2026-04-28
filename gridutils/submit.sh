@@ -22,7 +22,7 @@ CONDOR_OUT="${CONDOR_OUT:-/gpfs01/lbne/users/fm/${USER}/CONDOR_OUT}"
 REPODIR="${REPODIR:-${HOME}/ml-dune-model}"
 
 # python virtual environment
-PYENV="${PYENV:-/gpfs01/lbne/users/fm/${USER}/ml-venv}"
+PYENV="${PYENV:-/gpfs01/lbne/users/fm/${USER}/uvenv}"
 
 # cache directory for warpconvnet and data index
 CACHE_DIR="${CACHE_DIR:-/gpfs01/lbne/users/fm/${USER}/cache}"
@@ -77,7 +77,7 @@ subfile="${out_dir}/${run_name}.sub"
 cat > "$subfile" <<EOF
 universe                = vanilla
 notification            = never
-executable              = ${REPODIR}/gridutils/job.sh
+executable              = ${REPODIR}/gridutils/trainjob.sh
 arguments               = ${REPODIR} ${PYENV} ${config} ${out_dir} ${CACHE_DIR} ${run_name}
 environment             = "CLUSTER_ID=\$(ClusterId) JOB_ID=\$(ProcId)"
 output                  = ${out_dir}/\$(ClusterId).\$(ProcId).out
