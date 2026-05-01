@@ -39,7 +39,10 @@ class DINODebugger:
     def __init__(self, cfg, enabled: bool = True):
         self.enabled = enabled and cfg.debug
         self.debug_every = cfg.debug_every
-        self.debug_dir = Path(cfg.debug_dir) if self.enabled else None
+        # debug_dir is always set so run_config.json can be written unconditionally;
+        # the verbose logger / history accumulation below is still gated on self.enabled.
+        self.debug_dir = Path(cfg.debug_dir)
+        self.debug_dir.mkdir(parents=True, exist_ok=True)
         self.logger = None
         self.loss_history = [] if self.enabled else None
         self.teacher_entropy_history = [] if self.enabled else None
@@ -76,8 +79,6 @@ class DINODebugger:
         if not self.enabled:
             return
 
-        self.debug_dir.mkdir(parents=True, exist_ok=True)
-
         self.logger = logging.getLogger("dino_debug")
         self.logger.setLevel(logging.INFO)
         handler = logging.FileHandler(self.debug_dir / "training.log")
@@ -92,13 +93,17 @@ class DINODebugger:
     # ------------------------------------------------------------------
 
     def log_config(self, cfg):
-        """Log config summary and save run_config.json for experiment tracking."""
-        if not self.enabled or self.logger is None:
-            return
-        self.logger.info(
-            f"Config: backbone={cfg.backbone_name}, mask_ratio={cfg.mask_ratio}, "
-            f"loss_type={cfg.loss_type}, lr={cfg.lr}, epochs={cfg.epochs}"
-        )
+        """Log config summary and save run_config.json for experiment tracking.
+
+        run_config.json is always written (debug or not) so every run dir has
+        an authoritative record of what main() was called with. The verbose
+        logger.info call only fires when debug logging is enabled.
+        """
+        if self.logger is not None:
+            self.logger.info(
+                f"Config: backbone={cfg.backbone_name}, mask_ratio={cfg.mask_ratio}, "
+                f"loss_type={cfg.loss_type}, lr={cfg.lr}, epochs={cfg.epochs}"
+            )
         config_dict = {
             "timestamp": datetime.now().isoformat(),
             "run_name": getattr(cfg, "run_name", ""),

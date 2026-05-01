@@ -205,9 +205,9 @@ def main(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Dataset (sparse, with full event metadata)
-    print(f"\nLoading dataset from {cfg.rootdir} ...")
+    print(f"\nLoading dataset from {cfg.datadir} ...")
     dataset = APASparseMetaDataset(
-        rootdir=cfg.rootdir,
+        rootdir=cfg.datadir,
         apa=cfg.apa,
         view=cfg.view,
         use_cache=True,

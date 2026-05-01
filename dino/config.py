@@ -60,7 +60,8 @@ class DINOConfig:
     var_gamma: float = 1.0           # target minimum std per feature dimension
 
     # ============ Data ============
-    rootdir: str = "/nfs/data/1/yuhw/cffm-data/prod-jay-100k-truth-2026-02-27"
+    datadir: str = "/nfs/data/1/yuhw/cffm-data/prod-jay-100k-truth-2026-02-27"
+    cache_dir: str = "./data"       # where to cache dataset index
     apa: int = 0                    # which APA to train on
     view: str = "W"                 # which wire plane view to use
     n_subset: int = -1               # -1 = full dataset; otherwise use first N samples for testing

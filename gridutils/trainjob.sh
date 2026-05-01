@@ -1,0 +1,89 @@
+#!/bin/bash
+#
+# DINO training script.  
+# Runs on the Condor worker; called by submit.sh.
+#
+# Args (positional):
+#   $1 codedir  -- path to ml-dune-model repo root
+#   $2 pyenv    -- path to uv virtual environment to activate
+#   $3 config   -- path to run_config.json
+#   $4 outdir   -- path to output directory on GPFS (where outputs are rsynced back)
+#   $5 cache_dir -- general cache base; ${cache_dir}/warpconvnet and ${cache_dir}/data are used
+#   $6 run_name -- run/training name
+#
+# I/O strategy: write everything to $_CONDOR_SCRATCH_DIR (fast local disk on
+# the worker), rsync to GPFS at the end via an EXIT trap so partial outputs
+# survive failures and preemption.
+
+set -euo pipefail
+
+codedir=$1
+pyenv=$2
+config=$3
+outdir=$4
+cache_dir=$5
+run_name=$6
+
+wp_cache="${cache_dir}/warpconvnet"
+data_cache="${cache_dir}/data"
+mkdir -p "$wp_cache" "$data_cache"
+
+echo "Running $CLUSTER_ID.$JOB_ID on $(hostname)"
+echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "  _CONDOR_SCRATCH_DIR=${_CONDOR_SCRATCH_DIR}"
+echo ""
+
+echo "JOB CONFIGURATION:"
+echo "  run_name=${run_name}"
+echo "  codedir=${codedir}"
+echo "  pyenv=${pyenv}"
+echo "  config=${config}"
+echo "  outdir=${outdir}"
+echo "  cache_dir=${cache_dir}"
+echo ""
+
+echo "WarpConNet overrides:"
+export WARPCONVNET_USE_FP16_ACCUM=false
+export WARPCONVNET_BENCHMARK_CACHE_DIR="$wp_cache"
+#export WARPCONVNET_FWD_ALGO_MODE=auto
+#export WARPCONVNET_DGRAD_ALGO_MODE=auto
+#export WARPCONVNET_WGRAD_ALGO_MODE=auto
+echo "  WARPCONVNET_USE_FP16_ACCUM=${WARPCONVNET_USE_FP16_ACCUM}"
+echo "  WARPCONVNET_BENCHMARK_CACHE_DIR=${WARPCONVNET_BENCHMARK_CACHE_DIR}"
+#echo "  WARPCONVNET_FWD_ALGO_MODE=${WARPCONVNET_FWD_ALGO_MODE}"
+#echo "  WARPCONVNET_DGRAD_ALGO_MODE=${WARPCONVNET_DGRAD_ALGO_MODE}"
+#echo "  WARPCONVNET_WGRAD_ALGO_MODE=${WARPCONVNET_WGRAD_ALGO_MODE}"
+echo ""
+
+echo "Activating python environment..."
+source "${pyenv}/bin/activate"
+
+# Stage all outputs on local scratch.  main() will append /${run_name} under
+# each base, so the actual write dirs are $scratch_ckpt/$run_name and
+# $scratch_dbg/$run_name.
+scratch_ckpt=${_CONDOR_SCRATCH_DIR}/checkpoints
+scratch_dbg=${_CONDOR_SCRATCH_DIR}/debug
+mkdir -p "$scratch_ckpt" "$scratch_dbg"
+
+sync_back() {
+  echo "Syncing ${_CONDOR_SCRATCH_DIR} -> ${outdir}"
+  mkdir -p "${outdir}/checkpoints" "${outdir}/debug"
+  # Trailing slash on source flattens the inner /${run_name} dir, so the GPFS
+  # layout is ${outdir}/{checkpoints,debug}/... without a redundant nest.
+  rsync -a "${scratch_ckpt}/${run_name}/" "${outdir}/checkpoints/" || true
+  rsync -a "${scratch_dbg}/${run_name}/"  "${outdir}/debug/"       || true
+}
+trap sync_back EXIT                      # flush scratch -> GPFS on any normal/error exit
+trap 'sync_back; exit 143' SIGTERM       # on scheduler kill: flush, then exit 128+15 (SIGTERM)
+
+echo "Executing train_dino.py ..."
+
+PYTHONPATH="$codedir${PYTHONPATH:+:$PYTHONPATH}" \
+    python -u -m dino.train_dino from_config \
+        --config_path="$config" \
+        --output_dir="$scratch_ckpt" \
+        --debug_dir="$scratch_dbg" \
+        --cache_dir="$data_cache" \
+        --device=cuda
+
+echo "Training complete!"
