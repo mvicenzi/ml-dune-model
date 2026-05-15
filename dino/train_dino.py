@@ -20,6 +20,7 @@ from loader.collate import voxels_collate_fn
 from loader.splits import train_val_split, Subset
 
 from .config import DINOConfig
+from .transforms import FeatureLogTransform
 from .masking import SparseVoxelMasker
 from .cropping import CropConfig, SparseCropper
 from .loss import PixelDINOLoss
@@ -29,17 +30,13 @@ from .debug import DINODebugger
 
 
 @torch.no_grad()
-def validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_mode="masking"):
+def validate_epoch(model, val_loader, cropper, masker, loss_fn, device, normalizer,
+                   use_cropping=False, use_masking=True):
     """
     Compute mean DINO loss on the validation set.
 
-    Student runs in eval mode (no dropout / batchnorm stochasticity) with the
-    same augmentation as during training. Teacher is always in eval mode.
-    No gradients are computed. Model is restored to train mode before returning.
-
-    Args:
-        augmenter: SparseVoxelMasker (masking mode) or SparseCropper (cropping mode)
-        augmentation_mode: "masking" or "cropping"
+    Student runs in eval mode with the same augmentation strategy as training.
+    Teacher is always in eval mode. No gradients are computed.
 
     Returns:
         mean validation loss (0.0 if val_loader is empty)
@@ -50,40 +47,35 @@ def validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_m
 
     for xs in val_loader:
         xs = xs.to(device)
+        if normalizer is not None:
+            xs = normalizer(xs)
 
-        if augmentation_mode == "cropping":
-            n_global = augmenter.cfg.n_global
-            crops = augmenter(xs)
-            n_crops = len(crops)
-
-            teacher_encoded = [model.encode_teacher(crops[g]) for g in range(n_global)]
-
-            batch_loss = None
-            n_pairs    = 0
-            for k in range(n_crops):
-                student_backbone_k, student_out_k = model.encode_student(crops[k])
-                for g in range(n_global):
-                    if k == g:
-                        continue
-                    _, teacher_out_g = teacher_encoded[g]
-                    s_feats, s_bb_feats, t_feats, counts = match_and_gather(
-                        student_out_k, student_backbone_k, teacher_out_g,
-                    )
-                    loss_k, _, _, _, _, _ = loss_fn(s_feats, s_bb_feats, t_feats, counts)
-                    batch_loss = loss_k if batch_loss is None else batch_loss + loss_k
-                    n_pairs += 1
-            loss_val = (batch_loss / n_pairs).item()
+        if use_cropping:
+            all_views = cropper(xs)
+            n_global  = cropper.cfg.n_global
         else:
-            xs_student, _ = augmenter(xs)
-            _, teacher_out = model.encode_teacher(xs)
-            student_backbone_out, student_out = model.encode_student(xs_student)
-            s_feats, s_bb_feats, t_feats, counts = match_and_gather(
-                student_out, student_backbone_out, teacher_out,
-            )
-            loss, _, _, _, _, _ = loss_fn(s_feats, s_bb_feats, t_feats, counts)
-            loss_val = loss.item()
+            all_views = [xs]
+            n_global  = 1
+        n_crops = len(all_views)
 
-        total_loss += loss_val
+        teacher_encoded = [model.encode_teacher(all_views[g]) for g in range(n_global)]
+
+        batch_loss = None
+        n_pairs = 0
+        for k in range(n_crops):
+            view_k = masker(all_views[k])[0] if use_masking else all_views[k]
+            student_backbone_k, student_out_k = model.encode_student(view_k)
+            for g in range(n_global):
+                if k == g and n_crops > 1:
+                    continue
+                _, teacher_out_g = teacher_encoded[g]
+                s_feats, s_bb_feats, t_feats, counts = match_and_gather(
+                    student_out_k, student_backbone_k, teacher_out_g,
+                )
+                loss_k, _, _, _, _, _ = loss_fn(s_feats, s_bb_feats, t_feats, counts)
+                batch_loss = loss_k if batch_loss is None else batch_loss + loss_k
+                n_pairs += 1
+        total_loss += (batch_loss / n_pairs).item()
         n_batches += 1
 
     model.train()  # restores student; teacher stays eval via DINODuneModel.train()
@@ -96,7 +88,8 @@ def main(
     epochs: int = 100,
     batch_size: int = 50,
     lr: float = 1e-4,
-    augmentation_mode: str = "masking",
+    use_cropping: bool = True,
+    use_masking: bool = True,
     mask_ratio: float = 0.5,
     crop_n_global: int = 2,
     crop_n_local: int = 4,
@@ -127,6 +120,9 @@ def main(
     warmup_epochs: int = 1,
     datadir: str = "/nfs/data/1/yuhw/cffm-data/prod-jay-100k-truth-2026-02-27",
     cache_dir: str = "./data",
+    use_log_transform: bool = True,
+    feat_min_val: float = 3.75,
+    feat_max_val: float = 83861.2,
     output_dir: str = "./dino_checkpoints",
     save_every: int = 10,
     device: str = "cuda",
@@ -145,7 +141,8 @@ def main(
         epochs: Number of training epochs
         batch_size: Batch size per GPU
         lr: Base learning rate
-        augmentation_mode: "masking" (default) or "cropping"
+        use_cropping: enable activity-aware multi-crop augmentation
+        use_masking: enable random pixel dropout on student views
         mask_ratio: Fraction of active pixels to mask (masking mode only)
         crop_n_global: Number of global crops per image (cropping mode)
         crop_n_local: Number of local crops per image (cropping mode)
@@ -203,7 +200,8 @@ def main(
     cfg = DINOConfig(
         backbone_name=backbone_name,
         encoding_range=encoding_range,
-        augmentation_mode=augmentation_mode,
+        use_cropping=use_cropping,
+        use_masking=use_masking,
         mask_ratio=mask_ratio,
         crop_n_global=crop_n_global,
         crop_n_local=crop_n_local,
@@ -235,8 +233,11 @@ def main(
         weight_decay_end=weight_decay_end,
         warmup_epochs=warmup_epochs,
         epochs=epochs,
-        batch_size=batch_size,
         datadir=datadir,
+        use_log_transform=use_log_transform,
+        feat_min_val=feat_min_val,
+        feat_max_val=feat_max_val,
+        batch_size=batch_size,
         cache_dir=cache_dir,
         output_dir=output_dir,
         save_every=save_every,
@@ -266,7 +267,8 @@ def main(
     print(f"  momentum_end   = {cfg.momentum_end}")
 
     print("Augmentation:")
-    print(f"  augmentation_mode      = {cfg.augmentation_mode}")
+    print(f"  use_cropping           = {cfg.use_cropping}")
+    print(f"  use_masking            = {cfg.use_masking}")
     print(f"  mask_ratio             = {cfg.mask_ratio}")
     print(f"  crop_n_global          = {cfg.crop_n_global}")
     print(f"  crop_n_local           = {cfg.crop_n_local}")
@@ -276,6 +278,11 @@ def main(
     print(f"  crop_blur_sigma_px     = {cfg.crop_blur_sigma_px}")
     print(f"  crop_heatmap_power     = {cfg.crop_heatmap_power}")
     print(f"  crop_min_active_pixels = {cfg.crop_min_active_pixels}")
+
+    print("Data normalization:")
+    print(f"  use_log_transform = {cfg.use_log_transform}")
+    print(f"  feat_min_val      = {cfg.feat_min_val}")
+    print(f"  feat_max_val      = {cfg.feat_max_val}")
 
     print("Loss:")
     print(f"  type                = {cfg.loss_type}")
@@ -292,7 +299,7 @@ def main(
     # ============ Data ============
     print("\nLoading dataset:", cfg.datadir)
     dataset = APASparseDataset(
-        rootdir=cfg.datadir,
+        datadir=cfg.datadir,
         apa=cfg.apa,
         view=cfg.view,
         use_cache=True,
@@ -351,9 +358,12 @@ def main(
         student_params += list(model.student_head.parameters())
     optimizer = optim.AdamW(student_params, lr=lr, weight_decay=weight_decay)
 
+    normalizer = FeatureLogTransform(cfg.feat_min_val, cfg.feat_max_val) if cfg.use_log_transform else None
+
     masker = SparseVoxelMasker(mask_ratio=mask_ratio)
 
-    if augmentation_mode == "cropping":
+    cropper = None
+    if use_cropping:
         crop_cfg = CropConfig(
             n_global=cfg.crop_n_global,
             n_local=cfg.crop_n_local,
@@ -367,10 +377,6 @@ def main(
             image_w=cfg.image_w,
         )
         cropper = SparseCropper(crop_cfg)
-        augmenter = cropper
-
-    else:
-        augmenter = masker
 
     loss_fn = PixelDINOLoss(
         loss_type=cfg.loss_type,
@@ -425,6 +431,8 @@ def main(
         for batch_idx, xs in enumerate(train_loader):
             iteration = (epoch - 1) * epoch_len + batch_idx
             xs = xs.to(device)
+            if normalizer is not None:
+                xs = normalizer(xs)
 
             # Apply schedules
             lr_val = lr_schedule[iteration]
@@ -437,16 +445,12 @@ def main(
 
             # Forward + backward
             optimizer.zero_grad()
-            if augmentation_mode == "cropping":
-                (loss_val, teacher_entropy, student_entropy,
-                 kl, cov_penalty, var_penalty,
-                 student_backbone_out, teacher_backbone_out,
-                 student_out, teacher_out) = model.forward_backward_crops(xs, augmenter, loss_fn)
-            else:
-                (loss_val, teacher_entropy, student_entropy,
-                 kl, cov_penalty, var_penalty,
-                 student_backbone_out, teacher_backbone_out,
-                 student_out, teacher_out) = model.forward_backward(xs, augmenter, loss_fn)
+            (loss_val, teacher_entropy, student_entropy,
+             kl, cov_penalty, var_penalty,
+             student_backbone_out, teacher_backbone_out,
+             student_out, teacher_out) = model.forward_backward(
+                xs, cropper, masker, loss_fn, use_cropping, use_masking,
+            )
             optimizer.step()
 
             # EMA teacher update
@@ -492,7 +496,7 @@ def main(
                       f"lr={lr_val:.2e}, mom={mom_val:.6f}{cov_str}{var_str}{mem_str}")
 
         # Validation
-        #val_loss = validate_epoch(model, val_loader, augmenter, loss_fn, device, augmentation_mode)
+        #val_loss = validate_epoch(model, val_loader, cropper, masker, loss_fn, device, normalizer, use_cropping, use_masking)
         #print(f"[{epoch}/{epochs}] val_loss={val_loss:.6f}")
         #debugger.log_val_epoch(epoch, iteration, val_loss)
 
