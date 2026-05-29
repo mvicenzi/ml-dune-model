@@ -31,7 +31,6 @@ class DINODebugger:
     - kl:              [float|null, ...]                 per-batch KL(P_t||P_s) (dino only, else null)
     - cov_penalty:              [float|null, ...]  per-batch raw covariance penalty (if enabled, else null)
     - var_penalty:              [float|null, ...]  per-batch raw variance penalty (if enabled, else null)
-    - val:    {iter: [...], loss: [...]}         per-epoch val loss
     - stats:  {iter: [...], s_var: [...], ...}  feature statistics
     - grad:   {module: {iter: [...], norm: [...]}, ...}
     """
@@ -73,9 +72,6 @@ class DINODebugger:
         )
         # cached norm-module prefixes, built once on first log_gradient_norms call
         self._norm_prefixes: tuple | None = None
-        # val_history: iteration index at end of each epoch -> val loss
-        self.val_history = {"iter": [], "loss": []} if self.enabled else None
-
         if not self.enabled:
             return
 
@@ -168,21 +164,6 @@ class DINODebugger:
         if self.var_penalty_history is not None:
             self.var_penalty_history.append(var_penalty)
 
-    def log_val_epoch(self, epoch: int, iteration: int, val_loss: float):
-        """
-        Record end-of-epoch validation loss.
-
-        The iteration passed should be the last training iteration of that epoch so
-        the val point lands at the right x position on the shared train/val plot.
-        """
-        if not self.enabled or self.logger is None:
-            return
-        self.logger.info(
-            f"[epoch {epoch:3d} iter {iteration:6d}] VAL_LOSS: {val_loss:.6f}"
-        )
-        self.val_history["iter"].append(iteration)
-        self.val_history["loss"].append(val_loss)
-
     def save_histories(self):
         """
         Persist all in-memory histories to histories.json for offline analysis/plotting.
@@ -194,7 +175,6 @@ class DINODebugger:
           kl:              [float|null, ...]                 per-batch KL(P_t||P_s) (dino only, else null)
           cov_penalty:              [float|null, ...]  per-batch raw covariance penalty (if enabled, else null)
           var_penalty:              [float|null, ...]  per-batch raw variance penalty (if enabled, else null)
-          val:             {iter: [...], loss: [...]}        per-epoch val loss
           stats:           {iter: [...], s_var: [...], ...}  feature statistics
           grad:            {module: {iter: [...], norm: [...]}, ...}
           gpu_memory:      {iter: [...], peak_alloc_gib: [...], peak_reserved_gib: [...]}
@@ -208,7 +188,6 @@ class DINODebugger:
             "kl":               self.kl_history               or [],
             "cov_penalty":      self.cov_penalty_history      or [],
             "var_penalty":      self.var_penalty_history      or [],
-            "val":              self.val_history               or {},
             "stats":            self.stats_history             or {},
             "grad":             self.grad_history              or {},
             "gpu_memory":       self.gpu_memory_history        or {},

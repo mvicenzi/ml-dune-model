@@ -1,6 +1,8 @@
 """DINO training model: student + teacher with EMA update."""
 
 import inspect
+from typing import Optional
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -21,8 +23,8 @@ def match_and_gather(
     return pre-aligned feature tensors ready for the loss.
 
     Uses flat coordinate keys (y * W + x) with searchsorted for efficient
-    intersection.  No LUTs or index bookkeeping from the cropper are needed —
-    coordinates are intrinsic to the backbone output.
+    intersection.  No LUTs or index bookkeeping from the cropper are needed.
+    Coordinates are intrinsic to the backbone output.
 
     Args:
         s_out:      Student head output (Voxels).
@@ -115,13 +117,12 @@ class DINODuneModel(nn.Module):
     """
     DINO-style teacher/student framework for DUNE backbone.
 
-    - Student: trainable backbone (+ optional projection head), receives masked input
-    - Teacher: frozen backbone (+ optional projection head), receives full input, EMA-updated from student
+    - Student: trainable backbone (+ optional projection head), receives masked/cropped input
+    - Teacher: frozen backbone (+ optional projection head), receives full input
     - Both share the same architecture; training updates only student
+    - Teacher updates via EMA of student parameters (momentum schedule)
 
-    Key: teacher parameters are NOT updated by gradients, only by explicit EMA update.
     """
-
     def __init__(
         self,
         backbone_name: str = "attn_default",
@@ -142,12 +143,13 @@ class DINODuneModel(nn.Module):
         """
         super().__init__()
 
-        # Instantiate both backbones (sparse: Voxels → Voxels)
+        # Instantiate both backbones (sparse: Voxels -> Voxels)
         # Only pass encoding_range to backbones that accept it (attn_* variants).
         backbone_cls = BACKBONE_REGISTRY[backbone_name]
         backbone_kwargs = {}
         if "encoding_range" in inspect.signature(backbone_cls.__init__).parameters:
             backbone_kwargs["encoding_range"] = encoding_range
+
         print("Initializing STUDENT backbone:")
         self.student = backbone_cls(**backbone_kwargs)
         print("Initializing TEACHER backbone:")
@@ -205,25 +207,45 @@ class DINODuneModel(nn.Module):
             t_param.data.mul_(momentum).add_((1.0 - momentum) * s_param.data)
 
     def encode_teacher(self, xs: Voxels) -> Voxels:
-        """Run the teacher backbone (+ head if present). Always called in no_grad context."""
+        """ 
+            Run the teacher backbone (+ head if present). 
+            Always called in no_grad context.
+        """
         backbone_out = self.teacher(xs)
         if self.teacher_head is not None:
             return backbone_out, self.teacher_head(backbone_out)
         return backbone_out, backbone_out
 
-    def encode_student(self, xs: Voxels) -> tuple[Voxels, Voxels]:
+    def encode_student(
+        self,
+        xs: Voxels,
+        masked_coords: Optional[list] = None,
+    ) -> tuple[Voxels, Voxels]:
         """
         Run the student backbone (+ head if present).
+
+        Args:
+            xs:            Student input Voxels (kept voxels only when masking).
+            masked_coords: List of B tensors [N_masked_b, 2] for MAE injection.
+                           Passed through to the backbone only when not None.
 
         Returns:
             backbone_out: raw 64-dim backbone output (before head)
             final_out:    head output if head present, else same as backbone_out
         """
-        backbone_out = self.student(xs)
+
+        # if masked_coords is not None, the backbone must accept it
+        # this enables their use for injection in the skip connections
+        if masked_coords is not None:
+            backbone_out = self.student(xs, masked_coords=masked_coords)
+        else:
+            backbone_out = self.student(xs)
+
         if self.student_head is not None:
             return backbone_out, self.student_head(backbone_out)
         return backbone_out, backbone_out
 
+    # ----------------------- main forward/backward pass for training -------------------
     def forward_backward(
         self,
         xs: Voxels,
@@ -239,9 +261,11 @@ class DINODuneModel(nn.Module):
         Views are always treated as a list:
           - Cropping enabled:  SparseCropper produces n_global + n_local views.
           - Cropping disabled: the original full-image batch is the single view.
+
         Masking (random pixel dropout) is applied independently to each student
         view when enabled; teacher views are never masked.
-        Loss is summed over all (student_k, teacher_g) pairs.  Same-index pairs
+
+        Loss is summed over all (student_k, teacher_g) pairs. Same-index pairs
         (k == g) are skipped only when multiple views exist; with a single view
         the masking pair (k=0, g=0) is the only valid pair and must be kept.
 
@@ -262,6 +286,8 @@ class DINODuneModel(nn.Module):
             teacher_out:          head output of the first teacher global view (for logging)
         """
         # ── 1. Generate views ──────────────────────────────────────────────
+        # view are always treated as a list: 
+        # either multiple crops or a single full-image view
         if use_cropping:
             all_views = cropper(xs)
             n_global  = cropper.cfg.n_global
@@ -279,33 +305,52 @@ class DINODuneModel(nn.Module):
         sum_t_ent = sum_s_ent = sum_kl = sum_cov = sum_var = 0.0
         n_metric = n_pairs = 0
 
+        # for each student view
         for k in range(n_crops):
-            view_k = masker(all_views[k])[0] if use_masking else all_views[k]
-            student_backbone_k, student_out_k = self.encode_student(view_k)
+            if use_masking:
+                view_k_masked, masked_coords_k = masker(all_views[k])
+            else:
+                view_k_masked, masked_coords_k = all_views[k], None
 
+            # execute the model, returning backbone and head outputs
+            student_backbone_k, student_out_k = self.encode_student(
+                view_k_masked, masked_coords=masked_coords_k,
+            )
+
+            # for each teacher global
             for g in range(n_global):
-                # Skip same-index pairs only when multiple views exist
+                # skip same-index pairs only when multiple views exist
                 # (with one view, the single masking pair must not be skipped)
+                # basically: never compare a global view with itself
                 if k == g and n_crops > 1:
                     continue
 
                 teacher_backbone_g, teacher_out_g = teacher_encoded[g]
 
+                # returns features for each matching voxels across views
+                # shape is [N_matched, D] --> D differs for backbone vs head
+                # returing student backbone feature for optional cov/var penalties
                 s_feats, s_bb_feats, t_feats, counts = match_and_gather(
                     student_out_k, student_backbone_k, teacher_out_g,
                 )
+
+                # compute the loss for these views
                 loss_kg, t_ent, s_ent, kl, cov, var = loss_fn(
                     s_feats, s_bb_feats, t_feats, counts,
                 )
 
+                # accumulate loss (averaging)
                 total_loss = loss_kg if total_loss is None else total_loss + loss_kg
                 n_pairs += 1
 
+                # accumulate entropy metrics for logging (averaging)
                 if t_ent is not None:
                     sum_t_ent += t_ent
                     sum_s_ent += s_ent
                     sum_kl    += kl
                     n_metric  += 1
+
+                # accumulate covariance/variance penalty metrics (averaging)
                 if cov is not None:
                     sum_cov += cov
                 if var is not None:
@@ -320,11 +365,15 @@ class DINODuneModel(nn.Module):
         avg_cov   = sum_cov   / n_pairs  if sum_cov != 0.0 else None
         avg_var   = sum_var   / n_pairs  if sum_var != 0.0 else None
 
-        # Logging: last student view, first teacher global view
+        # logging: last student view, first teacher global view
+        # teacher outputs also used for centering update
         teacher_backbone_log, teacher_out_log = teacher_encoded[0]
         return (
-            total_loss.item(),
+            total_loss.item(), # loss
+            # entropy metrics for logging
             avg_t_ent, avg_s_ent, avg_kl, avg_cov, avg_var,
+            # student/teacher backbone features for logging 
             student_backbone_k, teacher_backbone_log,
+            # student/teacher head features for logging
             student_out_k, teacher_out_log,
         )

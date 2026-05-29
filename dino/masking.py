@@ -14,11 +14,15 @@ class SparseVoxelMasker:
 
     For each image in a batch:
     1. Randomly select a fraction of active voxels to keep (1 - mask_ratio)
-    2. Return a reduced student Voxels and the kept indices per batch item
+    2. Returns: 
+        - reduced student Voxels
+        - (x, y) coordinates of the masked voxels per batch item
 
-    The kept_indices are needed by the loss to align student and teacher features:
-    teacher_out.feature_tensor[t_start:t_end][kept_indices[b]] gives the teacher
-    features at exactly the positions the student processed.
+    The masked_coords can be used to inject learnable mask tokens at the dropped positions,
+    so the student can predict teacher features there.
+    
+    NOTE: Student/teacher alignment in the loss continues to use
+    coordinate intersection via match_and_gather -- no index bookkeeping needed.
     """
 
     def __init__(self, mask_ratio: float = 0.5, seed: int = None):
@@ -39,51 +43,75 @@ class SparseVoxelMasker:
             voxels: Batched Voxels with batch_size B
 
         Returns:
-            student_voxels: Voxels with ~(1 - mask_ratio) of the original active voxels
-            kept_indices:   List of B tensors; kept_indices[b] indexes into the
-                            per-batch-item slice of voxels (i.e. offsets[b]:offsets[b+1])
+            student_voxels:          Voxels with ~(1 - mask_ratio) of the original voxels
+            masked_coords_per_batch: List of B tensors, each [N_masked_b, 2] holding
+                                     the (x, y) integer coords of voxels dropped from
+                                     that image. Same dtype/device as input coords.
         """
-        B = len(voxels.offsets) - 1
+        
+        #number of images in the batch
+        B = len(voxels.offsets) - 1 
+
         device = voxels.coordinate_tensor.device
 
-        kept_indices = []
-        coords_list  = []
-        feats_list   = []
+        # number of coordinate dimensions (2D or 3D)
+        coord_dim = voxels.coordinate_tensor.shape[1]
 
+        masked_coords_per_batch = []
+        coords_list = []
+        feats_list  = []
+
+        # for each image in the batch
         for b in range(B):
 
-            # find pixels in this image
+            # find start/end indices of the voxels for image b
+            # and count them 
             start = int(voxels.offsets[b])
             end   = int(voxels.offsets[b + 1])
             N     = end - start
 
             if N == 0:
-                # Image was already empty (no active voxels). Append an empty index
-                # tensor so kept_indices stays length-B and offsets reflect 0 voxels
-                # for this image. Nothing is added to coords_list/feats_list.
-                kept_indices.append(torch.zeros(0, dtype=torch.long, device=device))
+                # empty image: nothing to mask; append empty tensors to keep
+                # masked_coords_per_batch length-B and offsets consistent.
+                masked_coords_per_batch.append(
+                    voxels.coordinate_tensor.new_zeros(0, coord_dim)
+                )
                 continue
 
-            # max(1, ...) guarantees at least one voxel is always kept, so a
-            # non-empty image can never be fully dropped by the masker.
-            n_keep = max(1, N - int(N * self.mask_ratio))
-            perm   = torch.randperm(N, device=device)
-            keep   = perm[:n_keep].sort().values   # sorted to preserve spatial order
+            # max(1, ...) guarantees at least one voxel is always kept
+            n_keep   = max(1, N - int(N * self.mask_ratio))
 
-            kept_indices.append(keep)
+            # generate a random permutation of the voxel indices, then 
+            # keep the first n_keep and drop the the rest.
+            # sort the indices to preserve spatial order.
+            perm     = torch.randperm(N, device=device)
+            keep     = perm[:n_keep].sort().values    
+            masked   = perm[n_keep:].sort().values
+
+            masked_coords_per_batch.append(voxels.coordinate_tensor[start:end][masked])
             coords_list.append(voxels.coordinate_tensor[start:end][keep])
             feats_list.append(voxels.feature_tensor[start:end][keep])
 
-        counts      = torch.tensor([k.shape[0] for k in kept_indices], dtype=torch.int64)
-        new_offsets = torch.cat([torch.zeros(1, dtype=torch.int64), counts.cumsum(0)])
+        # number of surviving voxels per batch item
+        n_kept      = [c.shape[0] for c in coords_list] # 
+        counts      = torch.tensor(n_kept, dtype=torch.int64, device=device)
+        
+        # offsets for the new batched Voxels object
+        new_offsets = torch.cat([
+            torch.zeros(1, dtype=torch.int64, device=device),
+            counts.cumsum(0),
+        ])
 
-        new_coords = torch.cat(coords_list, dim=0) if coords_list else voxels.coordinate_tensor.new_zeros(0, voxels.coordinate_tensor.shape[1])
-        new_feats  = torch.cat(feats_list,  dim=0) if feats_list  else voxels.feature_tensor.new_zeros(0, voxels.feature_tensor.shape[1])
+        new_coords = (torch.cat(coords_list, dim=0) if coords_list
+                      else voxels.coordinate_tensor.new_zeros(0, coord_dim))
+        new_feats  = (torch.cat(feats_list,  dim=0) if feats_list
+                      else voxels.feature_tensor.new_zeros(0, voxels.feature_tensor.shape[1]))
 
+        # package new Voxels object
         student_voxels = Voxels(
             batched_coordinates=IntCoords(new_coords, offsets=new_offsets),
             batched_features=CatFeatures(new_feats, offsets=new_offsets),
             offsets=new_offsets,
         )
 
-        return student_voxels, kept_indices
+        return student_voxels, masked_coords_per_batch

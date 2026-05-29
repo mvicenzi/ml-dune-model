@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 
 from loader.apa_sparse_dataset import APASparseDataset
 from loader.collate import voxels_collate_fn
-from loader.splits import train_val_split, Subset
+from loader.splits import Subset
 
 from .config import DINOConfig
 from .transforms import FeatureLogTransform
@@ -25,61 +25,8 @@ from .masking import SparseVoxelMasker
 from .cropping import CropConfig, SparseCropper
 from .loss import PixelDINOLoss
 from .scheduler import CosineScheduler
-from .model import DINODuneModel, match_and_gather
+from .model import DINODuneModel
 from .debug import DINODebugger
-
-
-@torch.no_grad()
-def validate_epoch(model, val_loader, cropper, masker, loss_fn, device, normalizer,
-                   use_cropping=False, use_masking=True):
-    """
-    Compute mean DINO loss on the validation set.
-
-    Student runs in eval mode with the same augmentation strategy as training.
-    Teacher is always in eval mode. No gradients are computed.
-
-    Returns:
-        mean validation loss (0.0 if val_loader is empty)
-    """
-    model.eval()
-    total_loss = 0.0
-    n_batches = 0
-
-    for xs in val_loader:
-        xs = xs.to(device)
-        if normalizer is not None:
-            xs = normalizer(xs)
-
-        if use_cropping:
-            all_views = cropper(xs)
-            n_global  = cropper.cfg.n_global
-        else:
-            all_views = [xs]
-            n_global  = 1
-        n_crops = len(all_views)
-
-        teacher_encoded = [model.encode_teacher(all_views[g]) for g in range(n_global)]
-
-        batch_loss = None
-        n_pairs = 0
-        for k in range(n_crops):
-            view_k = masker(all_views[k])[0] if use_masking else all_views[k]
-            student_backbone_k, student_out_k = model.encode_student(view_k)
-            for g in range(n_global):
-                if k == g and n_crops > 1:
-                    continue
-                _, teacher_out_g = teacher_encoded[g]
-                s_feats, s_bb_feats, t_feats, counts = match_and_gather(
-                    student_out_k, student_backbone_k, teacher_out_g,
-                )
-                loss_k, _, _, _, _, _ = loss_fn(s_feats, s_bb_feats, t_feats, counts)
-                batch_loss = loss_k if batch_loss is None else batch_loss + loss_k
-                n_pairs += 1
-        total_loss += (batch_loss / n_pairs).item()
-        n_batches += 1
-
-    model.train()  # restores student; teacher stays eval via DINODuneModel.train()
-    return total_loss / n_batches if n_batches > 0 else 0.0
 
 
 def main(
@@ -312,27 +259,12 @@ def main(
         subset_indices = torch.randperm(len(dataset))[:n_subset]
         dataset = Subset(dataset, subset_indices)
 
-    train_ds, val_ds, train_idx, val_idx = train_val_split(dataset, val_fraction=0.2, use_cache=False)
-
-    train_set = set(train_idx.tolist())
-    val_set   = set(val_idx.tolist())
-    overlap = train_set & val_set
-    print(f"Train size: {len(train_set)}, Val size: {len(val_set)}")
-    print(f"Overlap: {len(overlap)} samples")                    # should be 0
-    print(f"Union covers full dataset: {len(train_set | val_set) == len(dataset)}")  # should be True
+    print(f"Dataset size: {len(dataset)}")
 
     train_loader = DataLoader(
-        train_ds,
+        dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=voxels_collate_fn,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
         collate_fn=voxels_collate_fn,
@@ -352,16 +284,27 @@ def main(
         proj_head_output_dim=proj_head_output_dim,
         proj_head_n_layers=proj_head_n_layers,
     ).to(device)
+
     # Optimise backbone + head (if present)
+    # fetch parmaters from the model (student-only)
     student_params = list(model.student.parameters())
     if model.student_head is not None:
         student_params += list(model.student_head.parameters())
+
+    # Optimizer: AdamW with weight decay
     optimizer = optim.AdamW(student_params, lr=lr, weight_decay=weight_decay)
 
-    normalizer = FeatureLogTransform(cfg.feat_min_val, cfg.feat_max_val) if cfg.use_log_transform else None
+    # define normalizer for input features
+    normalizer = None
+    if cfg.use_log_transform:
+        normalizer = FeatureLogTransform(cfg.feat_min_val, cfg.feat_max_val)
 
-    masker = SparseVoxelMasker(mask_ratio=mask_ratio)
+    #define masker
+    masker = None
+    if use_masking:
+        masker = SparseVoxelMasker(mask_ratio=mask_ratio)
 
+    #define cropper
     cropper = None
     if use_cropping:
         crop_cfg = CropConfig(
@@ -378,6 +321,7 @@ def main(
         )
         cropper = SparseCropper(crop_cfg)
 
+    # define loss function
     loss_fn = PixelDINOLoss(
         loss_type=cfg.loss_type,
         normalize_features=cfg.normalize_features,
@@ -423,14 +367,19 @@ def main(
 
     # ============ Training loop ============
     print("\nStarting training...")
-    first_batch = True
+    first_batch = True # for one-time logging
 
     for epoch in range(1, epochs + 1):
+
+        # set model to training mode
         model.train()
 
         for batch_idx, xs in enumerate(train_loader):
+
             iteration = (epoch - 1) * epoch_len + batch_idx
             xs = xs.to(device)
+
+            # normalize input features if requested (log transform)
             if normalizer is not None:
                 xs = normalizer(xs)
 
@@ -445,47 +394,49 @@ def main(
 
             # Forward + backward
             optimizer.zero_grad()
+
+            # execute forward/backward pass, returning loss and other metrics
             (loss_val, teacher_entropy, student_entropy,
              kl, cov_penalty, var_penalty,
              student_backbone_out, teacher_backbone_out,
-             student_out, teacher_out) = model.forward_backward(
-                xs, cropper, masker, loss_fn, use_cropping, use_masking,
-            )
+             student_out, teacher_out) = model.forward_backward(xs, cropper, masker, loss_fn, use_cropping, use_masking)
+            
+            # "three steps forward, two steps back"
             optimizer.step()
 
             # EMA teacher update
             model.update_teacher(mom_val)
 
-            # Centering: update teacher center for next iteration
+            # centering: update teacher center for next iteration
             loss_fn.update_center(teacher_out)
             debugger.log_center_stats(iteration, loss_fn)
 
-            # Scalar logging — the (teacher_entropy, student_entropy, kl) trio already
+            # scalar logging: the (teacher_entropy, student_entropy, kl) trio already
             # reflects whatever goes into the loss (head output if a head is present,
             # raw backbone otherwise), so no separate backbone-entropy diagnostic is needed.
             n_valid = student_out.feature_tensor.shape[0]
             debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, student_entropy, kl, cov_penalty, var_penalty)
             debugger.log_gpu_memory(iteration)
 
-            # Gradient norms per backbone module (.grad still populated before next zero_grad)
+            # gradient norms per backbone module (.grad still populated before next zero_grad)
             debugger.log_gradient_norms(iteration, model.student)
 
-            # Representation-quality statistics (variance, covariance, norm)
-            # Pass head features separately when a head is present (student_out != student_backbone_out)
+            # representation-quality statistics (variance, covariance, norm)
+            # pass head features separately when a head is present (student_out != student_backbone_out)
             s_head_feats = student_out.feature_tensor if model.student_head is not None else None
             t_head_feats = teacher_out.feature_tensor if model.teacher_head is not None else None
             debugger.log_feature_stats(iteration, student_backbone_out.feature_tensor, teacher_backbone_out.feature_tensor,
                                         s_head_feats, t_head_feats)
 
-            # First batch: log tensor shapes
+            # first batch: log tensor shapes
             if first_batch:
                 debugger.log_shapes(xs.feature_tensor, student_backbone_out.feature_tensor, teacher_backbone_out.feature_tensor)
                 first_batch = False
 
-            # Periodically persist histories to disk
+            # periodically persist histories to disk
             debugger.maybe_save_histories(iteration)
 
-            # Free Voxels objects to release GPU memory before the next forward pass
+            # free Voxels objects to release GPU memory before the next forward pass
             del student_backbone_out, student_out, teacher_backbone_out, teacher_out
 
             if (batch_idx + 1) % 50 == 0 or batch_idx == 0:
@@ -495,12 +446,7 @@ def main(
                 print(f"[{epoch}/{epochs}] iter {iteration}: loss={loss_val:.6f}, "
                       f"lr={lr_val:.2e}, mom={mom_val:.6f}{cov_str}{var_str}{mem_str}")
 
-        # Validation
-        #val_loss = validate_epoch(model, val_loader, cropper, masker, loss_fn, device, normalizer, use_cropping, use_masking)
-        #print(f"[{epoch}/{epochs}] val_loss={val_loss:.6f}")
-        #debugger.log_val_epoch(epoch, iteration, val_loss)
-
-        # Save checkpoint
+        # Save model checkpoint
         if epoch % save_every == 0 or epoch == epochs:
             ckpt = {
                 "epoch": epoch,
@@ -532,16 +478,14 @@ def from_config(
     """
     Start training from a saved run_config.json file.
 
-    Loads training parameters from a previously saved run_config.json (e.g. from
-    ./dino_debug/<run_name>/run_config.json).  Any JSON field that does not match
-    a parameter of main() is silently ignored, so old configs with stale or missing
-    keys work without errors — missing fields fall back to main()'s defaults.
+    Loads training parameters from a previously saved run_config.json.
+    Any JSON field that does not match a parameter of main() is silently ignored, 
+    so old configs with stale or missing keys work without errors.
+    Missing fields fall back to main()'s defaults.
 
-    The `run_name`, `device`, and `test_mode` arguments override the corresponding
-    values from the config file.  Any other parameter accepted by main() can also
-    be overridden via CLI (e.g. --use_cov_penalty=True --cov_penalty_weight=1e-2).
-    Providing a new run_name is recommended when re-running a config so outputs
-    don't overwrite the original run.
+    `run_name`, `device`, and `test_mode` are named parameters here (so they
+    appear in --help); everything else is passed as **overrides kwargs.  Any
+    main() parameter can be overridden either way.
 
     Args:
         config_path: Path to the run_config.json file
@@ -583,7 +527,7 @@ def from_config(
 
     main(**kwargs)
 
-
+#----- Entry point ----- 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "from_config":
         sys.argv = [sys.argv[0]] + sys.argv[2:]

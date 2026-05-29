@@ -80,10 +80,10 @@ class PixelDINOLoss(nn.Module):
 
     def forward(
         self,
-        s: Tensor,            # [N_matched, D] pre-aligned student head features
-        s_backbone: Tensor,   # [N_matched, D_bb] pre-aligned student backbone features
-        t: Tensor,            # [N_matched, D] pre-aligned teacher head features
-        counts: Tensor,       # [B] per-image matched voxel counts
+        s: Tensor,        # [N_matched, D]    student head features
+        s_backbone: Tensor,  # [N_matched, D_bb] student backbone features
+        t: Tensor,        # [N_matched, D]    teacher head features
+        counts: Tensor,   # [B] per-image matched voxel counts
     ) -> Tensor:
         """
         Compute per-voxel DINO loss on pre-aligned student/teacher features.
@@ -113,13 +113,8 @@ class PixelDINOLoss(nn.Module):
                 dtype=t.dtype,
             )
 
-        # For dino loss: L2-normalize to unit sphere so scale-invariant
-        ## TEMPORARY: only for legacy norm before centering
-        #if self.loss_type == "dino":
-        #    s = F.normalize(s, dim=-1)
-        #    t = F.normalize(t, dim=-1)
-
-        # Optionally subtract running mean from teacher to remove the dominant direction
+        # Centering: subtract running mean from teacher 
+        # to remove the dominant direction
         if self.use_centering:
             t = t - self.center
 
