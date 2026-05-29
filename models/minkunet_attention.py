@@ -145,12 +145,16 @@ class MinkUNetSparseAttentionMAE(MinkUNetSparseAttention):
         super().__init__(**kw)
 
         # Channel counts come from the base class layer definitions:
-        #   out_p1   = conv0  = ConvBlock2D(1, 32, ...)             
-        #   out_b1p2 = block1 = ResidualSparseBlock2D(32, 32, ...)  
+        #   out_p1   = conv0  = ConvBlock2D(1, 32, ...)
+        #   out_b1p2 = block1 = ResidualSparseBlock2D(32, 32, ...)
         self.mask_token_full = nn.Parameter(torch.zeros(32))  # injected at out_p1
         self.mask_token_half = nn.Parameter(torch.zeros(32))  # injected at out_b1p2
         nn.init.trunc_normal_(self.mask_token_full, std=0.02)
         nn.init.trunc_normal_(self.mask_token_half, std=0.02)
+
+        print("[MAE] MAE backbone: skip-level mask tokens initialized")
+        print(f"  mask_token_full: dim={self.mask_token_full.shape[0]}  (injected at full-res skip)")
+        print(f"  mask_token_half: dim={self.mask_token_half.shape[0]}  (injected at half-res skip)")
 
     def _augment_skip_with_masked(self,
         skip: Voxels,
