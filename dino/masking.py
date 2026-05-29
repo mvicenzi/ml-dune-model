@@ -71,11 +71,14 @@ class SparseVoxelMasker:
             N     = end - start
 
             if N == 0:
-                # empty image: nothing to mask; append empty tensors to keep
-                # masked_coords_per_batch length-B and offsets consistent.
+                # empty image: append empty entries to ALL lists so that
+                # student_voxels.offsets stays length B+1 and aligns with
+                # masked_coords_per_batch (which is always length B).
                 masked_coords_per_batch.append(
                     voxels.coordinate_tensor.new_zeros(0, coord_dim)
                 )
+                coords_list.append(voxels.coordinate_tensor.new_zeros(0, coord_dim))
+                feats_list.append(voxels.feature_tensor.new_zeros(0, voxels.feature_tensor.shape[1]))
                 continue
 
             # max(1, ...) guarantees at least one voxel is always kept

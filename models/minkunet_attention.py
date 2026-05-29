@@ -166,9 +166,12 @@ class MinkUNetSparseAttentionMAE(MinkUNetSparseAttention):
         """
         device = skip.coordinate_tensor.device
 
-        B = len(masked_coords_per_batch)  # images in this back batch
-        C = skip.feature_tensor.shape[1]  # channels in the skip features 
-        coord_dim = skip.coordinate_tensor.shape[1] # coordinate dim (2D)
+        # Use skip.offsets as the authority on batch size: WarpConvNet's strided
+        # conv drops trailing empty items from offsets (bincount only covers up to
+        # max batch index), so len(masked_coords_per_batch) may exceed B_skip.
+        B = len(skip.offsets) - 1
+        C = skip.feature_tensor.shape[1]
+        coord_dim = skip.coordinate_tensor.shape[1]
 
         new_coords_list: list[Tensor] = []
         new_feats_list:  list[Tensor] = []
@@ -226,8 +229,10 @@ class MinkUNetSparseAttentionMAE(MinkUNetSparseAttention):
         This means applying the same downsampling process and return only 
         the coords NOT already present in that skip (to avoid duplicates).
         """
-        B = len(masked_coords_per_batch) # number of images in the batch
-        coord_dim = skip.coordinate_tensor.shape[1] # coordinate dim (2D)
+        # Use skip.offsets as the authority on batch size (same reason as
+        # _augment_skip_with_masked: trailing empty items may be missing).
+        B = len(skip.offsets) - 1
+        coord_dim = skip.coordinate_tensor.shape[1]
 
         # we want to create a unique key for each (x,y) pair
         # W must exceed the max x-coord so that y*W+x is a unique.
