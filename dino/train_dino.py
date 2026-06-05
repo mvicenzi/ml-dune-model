@@ -398,6 +398,7 @@ def main(
             # execute forward/backward pass, returning loss and other metrics
             (loss_val, teacher_entropy, student_entropy,
              kl, cov_penalty, var_penalty,
+             loss_masked, loss_unmasked,
              student_backbone_out, teacher_backbone_out,
              student_out, teacher_out) = model.forward_backward(xs, cropper, masker, loss_fn, use_cropping, use_masking)
             
@@ -415,7 +416,7 @@ def main(
             # reflects whatever goes into the loss (head output if a head is present,
             # raw backbone otherwise), so no separate backbone-entropy diagnostic is needed.
             n_valid = student_out.feature_tensor.shape[0]
-            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, student_entropy, kl, cov_penalty, var_penalty)
+            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, student_entropy, kl, cov_penalty, var_penalty, loss_masked, loss_unmasked)
             debugger.log_gpu_memory(iteration)
 
             # gradient norms per backbone module (.grad still populated before next zero_grad)

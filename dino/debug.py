@@ -44,6 +44,8 @@ class DINODebugger:
         self.debug_dir.mkdir(parents=True, exist_ok=True)
         self.logger = None
         self.loss_history = [] if self.enabled else None
+        self.loss_masked_history = [] if self.enabled else None
+        self.loss_unmasked_history = [] if self.enabled else None
         self.teacher_entropy_history = [] if self.enabled else None
         self.student_entropy_history = [] if self.enabled else None
         self.kl_history = [] if self.enabled else None
@@ -136,6 +138,8 @@ class DINODebugger:
         kl: float | None = None,
         cov_penalty: float | None = None,
         var_penalty: float | None = None,
+        loss_masked: float | None = None,
+        loss_unmasked: float | None = None,
     ):
         """Log per-batch scalar information (every batch)."""
         if not self.enabled or self.logger is None:
@@ -153,6 +157,10 @@ class DINODebugger:
         )
         if self.loss_history is not None:
             self.loss_history.append(loss)
+        if self.loss_masked_history is not None:
+            self.loss_masked_history.append(loss_masked)
+        if self.loss_unmasked_history is not None:
+            self.loss_unmasked_history.append(loss_unmasked)
         if self.teacher_entropy_history is not None:
             self.teacher_entropy_history.append(teacher_entropy)
         if self.student_entropy_history is not None:
@@ -183,6 +191,8 @@ class DINODebugger:
             return
         data = {
             "loss":             self.loss_history             or [],
+            "loss_masked":      self.loss_masked_history      or [],
+            "loss_unmasked":    self.loss_unmasked_history    or [],
             "teacher_entropy":  self.teacher_entropy_history  or [],
             "student_entropy":  self.student_entropy_history  or [],
             "kl":               self.kl_history               or [],

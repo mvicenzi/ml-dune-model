@@ -17,7 +17,8 @@ def match_and_gather(
     s_out: Voxels,
     s_backbone: Voxels,
     t_out: Voxels,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    masked_coords_per_batch=None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None]:
     """
     Match student and teacher output voxels by spatial coordinates and
     return pre-aligned feature tensors ready for the loss.
@@ -36,6 +37,9 @@ def match_and_gather(
         s_bb_feats: [N_matched, D_bb]    student backbone features at intersection
         t_feats:    [N_matched, D_head]  teacher head features at intersection
         counts:     [B] int64 per-image matched voxel counts
+        is_masked:  [N_matched] bool — True for positions that were masked in the
+                    student input (i.e. the backbone received a mask token there);
+                    None when masked_coords_per_batch is not provided
     """
     B = len(s_out.offsets) - 1
     device = s_out.feature_tensor.device
@@ -53,6 +57,7 @@ def match_and_gather(
     s_global_idx = []
     t_global_idx = []
     counts_list = []
+    is_masked_list = [] if masked_coords_per_batch is not None else None
 
     for b in range(B):
         s_start, s_end = int(s_out.offsets[b]), int(s_out.offsets[b + 1])
@@ -93,6 +98,17 @@ def match_and_gather(
         t_global_idx.append(t_local + t_start)
         counts_list.append(s_local.shape[0])
 
+        # Tag each matched student position as masked or not.
+        if is_masked_list is not None:
+            m_coords = masked_coords_per_batch[b]
+            if m_coords.shape[0] > 0:
+                m_keys = m_coords[:, 1].long() * W + m_coords[:, 0].long()
+                matched_keys = s_keys[s_local]
+                is_masked_b = torch.isin(matched_keys, m_keys)
+            else:
+                is_masked_b = torch.zeros(s_local.shape[0], dtype=torch.bool, device=device)
+            is_masked_list.append(is_masked_b)
+
     counts = torch.tensor(counts_list, dtype=torch.int64, device=device)
 
     # Single gather over the concatenated feature tensors — no intermediate
@@ -110,7 +126,9 @@ def match_and_gather(
         s_bb_feats = s_backbone.feature_tensor.new_zeros(0, D_bb)
         t_feats    = t_out.feature_tensor.new_zeros(0, D_head)
 
-    return s_feats, s_bb_feats, t_feats, counts
+    is_masked = torch.cat(is_masked_list) if is_masked_list else None
+
+    return s_feats, s_bb_feats, t_feats, counts, is_masked
 
 
 class DINODuneModel(nn.Module):
@@ -303,7 +321,8 @@ class DINODuneModel(nn.Module):
         # ── 3. Student: encode all views (optionally masked), compute loss ─
         total_loss = None
         sum_t_ent = sum_s_ent = sum_kl = sum_cov = sum_var = 0.0
-        n_metric = n_pairs = 0
+        sum_loss_masked = sum_loss_unmasked = 0.0
+        n_metric = n_pairs = n_split = 0
 
         # for each student view
         for k in range(n_crops):
@@ -330,13 +349,14 @@ class DINODuneModel(nn.Module):
                 # returns features for each matching voxels across views
                 # shape is [N_matched, D] --> D differs for backbone vs head
                 # returing student backbone feature for optional cov/var penalties
-                s_feats, s_bb_feats, t_feats, counts = match_and_gather(
+                s_feats, s_bb_feats, t_feats, counts, is_masked = match_and_gather(
                     student_out_k, student_backbone_k, teacher_out_g,
+                    masked_coords_per_batch=masked_coords_k,
                 )
 
                 # compute the loss for these views
-                loss_kg, t_ent, s_ent, kl, cov, var = loss_fn(
-                    s_feats, s_bb_feats, t_feats, counts,
+                loss_kg, t_ent, s_ent, kl, cov, var, loss_masked_kg, loss_unmasked_kg = loss_fn(
+                    s_feats, s_bb_feats, t_feats, counts, is_masked=is_masked,
                 )
 
                 # accumulate loss (averaging)
@@ -356,6 +376,13 @@ class DINODuneModel(nn.Module):
                 if var is not None:
                     sum_var += var
 
+                # accumulate masked/unmasked split losses (diagnostics only)
+                if loss_masked_kg is not None:
+                    sum_loss_masked   += loss_masked_kg
+                    n_split += 1
+                if loss_unmasked_kg is not None:
+                    sum_loss_unmasked += loss_unmasked_kg
+
         total_loss = total_loss / n_pairs
         total_loss.backward()
 
@@ -364,6 +391,8 @@ class DINODuneModel(nn.Module):
         avg_kl    = sum_kl    / n_metric if n_metric > 0 else None
         avg_cov   = sum_cov   / n_pairs  if sum_cov != 0.0 else None
         avg_var   = sum_var   / n_pairs  if sum_var != 0.0 else None
+        avg_loss_masked   = sum_loss_masked   / n_split if n_split > 0 else None
+        avg_loss_unmasked = sum_loss_unmasked / n_split if n_split > 0 else None
 
         # logging: last student view, first teacher global view
         # teacher outputs also used for centering update
@@ -372,7 +401,9 @@ class DINODuneModel(nn.Module):
             total_loss.item(), # loss
             # entropy metrics for logging
             avg_t_ent, avg_s_ent, avg_kl, avg_cov, avg_var,
-            # student/teacher backbone features for logging 
+            # masked/unmasked loss split for logging
+            avg_loss_masked, avg_loss_unmasked,
+            # student/teacher backbone features for logging
             student_backbone_k, teacher_backbone_log,
             # student/teacher head features for logging
             student_out_k, teacher_out_log,

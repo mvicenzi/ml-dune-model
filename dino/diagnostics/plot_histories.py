@@ -84,8 +84,22 @@ def plot_loss(data: dict, out_dir: Path):
     if n_rows == 1:
         axes = [axes]
 
+    # Extract non-null masked/unmasked loss values for the split overlay.
+    raw_masked   = data.get("loss_masked",   [])
+    raw_unmasked = data.get("loss_unmasked", [])
+    masked_iters   = [i for i, v in enumerate(raw_masked)   if v is not None]
+    masked_vals    = [raw_masked[i]   for i in masked_iters]
+    unmasked_iters = [i for i, v in enumerate(raw_unmasked) if v is not None]
+    unmasked_vals  = [raw_unmasked[i] for i in unmasked_iters]
+
     ax_loss = axes[0]
     ax_loss.plot(loss, linewidth=1.0, alpha=0.8, label="Train (per batch)")
+    if masked_vals:
+        ax_loss.plot(masked_iters, masked_vals, linewidth=1.0, alpha=0.7,
+                     linestyle="--", color="C3", label="Loss (masked positions)")
+    if unmasked_vals:
+        ax_loss.plot(unmasked_iters, unmasked_vals, linewidth=1.0, alpha=0.7,
+                     linestyle="--", color="C2", label="Loss (unmasked positions)")
     if val and val.get("iter"):
         ax_loss.plot(
             val["iter"], val["loss"],
@@ -179,9 +193,14 @@ def plot_stats(data: dict, out_dir: Path, label: str = "backbone", mat_key: str 
         else:
             x_edges = np.array([x_arr[0] - 0.5, x_arr[0] + 0.5])
 
-        y_edges = np.linspace(y_vals.min(), y_vals.max(), 51)
-
         x_vals = np.concatenate([np.full(len(d), it) for d, it in zip(dataset, iters)])
+        finite_mask = np.isfinite(x_vals) & np.isfinite(y_vals)
+        x_vals, y_vals = x_vals[finite_mask], y_vals[finite_mask]
+        if len(y_vals) == 0:
+            ax.set_title(title + " [no finite data]")
+            ax.set_xlabel("Iteration")
+            return
+        y_edges = np.linspace(y_vals.min(), y_vals.max(), 51)
         H, xedges, yedges = np.histogram2d(x_vals, y_vals, bins=[x_edges, y_edges])
 
         # Mask empty bins → white
