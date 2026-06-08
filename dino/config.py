@@ -20,6 +20,9 @@ class DINOConfig:
     batch_size: int = 16
     num_workers: int = 4
     cache_dir: str = "./data"           # directory for cached dataset index .pt file
+    use_sharded: bool = False           # use pre-sharded HDF5 dataset (loader/create_shards.py)
+    sharded_dir: str = ""               # path to directory containing shard_*.h5 files
+    buffer_size: int = 3000             # shuffle-buffer size (samples) for sharded dataset
     use_log_transform: bool = True     # apply FeatureLogTransform to raw charge before model
     feat_min_val: float = 3.75        # 2nd percentile of raw charge [ADC]; anchors y = -1
     feat_max_val: float = 83861.2     # 99.999th percentile of raw charge [ADC]; anchors y = +1

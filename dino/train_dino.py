@@ -79,6 +79,9 @@ def main(
     run_name: str = "",
     test_mode: bool = True,
     num_workers: int = 4,
+    use_sharded: bool = False,
+    sharded_dir: str = "",
+    buffer_size: int = 3000,
 ):
     """
     DINO training loop for DUNE detector.
@@ -193,6 +196,9 @@ def main(
         debug_dir=debug_dir,
         run_name=run_name,
         num_workers=num_workers,
+        use_sharded=use_sharded,
+        sharded_dir=sharded_dir,
+        buffer_size=buffer_size,
     )
 
     print(f"Device: {device}")
@@ -244,32 +250,47 @@ def main(
     print(f"  var_gamma           = {cfg.var_gamma}")
 
     # ============ Data ============
-    print("\nLoading dataset:", cfg.datadir)
-    dataset = APASparseDataset(
-        datadir=cfg.datadir,
-        apa=cfg.apa,
-        view=cfg.view,
-        use_cache=True,
-        cache_dir=cfg.cache_dir
-    )
-
-    if test_mode:
-        n_subset = 100000
-        print(f"TEST MODE: using {n_subset} samples")
-        subset_indices = torch.randperm(len(dataset))[:n_subset]
-        dataset = Subset(dataset, subset_indices)
+    if cfg.use_sharded:
+        from loader.apa_sparse_sharded_dataset import APASparseShardedDataset
+        print(f"\nLoading sharded dataset: {cfg.sharded_dir}")
+        print(f"  batch_size  = {batch_size}")
+        print(f"  buffer_size = {cfg.buffer_size}")
+        dataset = APASparseShardedDataset(
+            root_dir=cfg.sharded_dir,
+            batch_size=batch_size,
+            buffer_size=cfg.buffer_size,
+        )
+        train_loader = DataLoader(
+            dataset,
+            batch_size=None,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+    else:
+        print("\nLoading dataset:", cfg.datadir)
+        dataset = APASparseDataset(
+            datadir=cfg.datadir,
+            apa=cfg.apa,
+            view=cfg.view,
+            use_cache=True,
+            cache_dir=cfg.cache_dir,
+        )
+        if test_mode:
+            n_subset = 100000
+            print(f"TEST MODE: using {n_subset} samples")
+            subset_indices = torch.randperm(len(dataset))[:n_subset]
+            dataset = Subset(dataset, subset_indices)
+        train_loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            collate_fn=voxels_collate_fn,
+        )
 
     print(f"Dataset size: {len(dataset)}")
-
-    train_loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=voxels_collate_fn,
-    )
-
     epoch_len = len(train_loader)
     total_iters = epochs * epoch_len
     print(f"Total training iterations: {total_iters} (epochs={epochs}, epoch_len={epoch_len})")

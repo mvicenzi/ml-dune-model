@@ -173,6 +173,7 @@ def main(
     num_workers: int = 4,
     device: str = "cuda",
     pixel_truth: bool = False,
+    cache_dir: str = "",
 ):
     """
     Extract DINO features from a trained checkpoint for PCA / probing.
@@ -186,6 +187,9 @@ def main(
         device:       "cuda" or "cpu"
         pixel_truth:  If True, also save per-pixel PDG codes (pid_labels) from
                       frame_pid_1st, enabling pixel-level PID k-NN analysis.
+        cache_dir:    Directory for the dataset index cache. Defaults to ./data.
+                      Point this at the same persistent cache used during training
+                      to avoid re-scanning the full dataset on every run.
     """
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     ckpt_path = Path(checkpoint).resolve()
@@ -206,6 +210,7 @@ def main(
 
     # Dataset (sparse, with full event metadata)
     print(f"\nLoading dataset from {cfg.datadir} ...")
+    dataset_kwargs = {"cache_dir": cache_dir} if cache_dir else {}
     dataset = APASparseMetaDataset(
         datadir=cfg.datadir,
         apa=cfg.apa,
@@ -213,6 +218,7 @@ def main(
         use_cache=True,
         return_full_metadata=True,
         return_pixel_truth=pixel_truth,
+        **dataset_kwargs,
     )
     if 0 < max_images < len(dataset):
         indices = torch.randperm(len(dataset))[:max_images]
