@@ -1,5 +1,6 @@
-"""Sparse-aware pixel masking for DINO student augmentation."""
+"""Sparse-aware masking strategies for DINO student augmentation."""
 
+import math
 from typing import List, Tuple
 
 import torch
@@ -111,6 +112,117 @@ class SparseVoxelMasker:
                       else voxels.feature_tensor.new_zeros(0, voxels.feature_tensor.shape[1]))
 
         # package new Voxels object
+        student_voxels = Voxels(
+            batched_coordinates=IntCoords(new_coords, offsets=new_offsets),
+            batched_features=CatFeatures(new_feats, offsets=new_offsets),
+            offsets=new_offsets,
+        )
+
+        return student_voxels, masked_coords_per_batch
+
+
+class SparseBlockMasker:
+    """
+    Block-masks active voxels for the DINO student by removing entire spatial regions.
+
+    For each image in the batch:
+    1. Randomly sample ceil(seed_frac × N) voxels as block centers (seeds).
+    2. Mark all voxels within [±win_ch, ±win_tick] of any seed as masked.
+    3. Remove masked voxels from the student input; return their coordinates.
+
+    Drop-in replacement for SparseVoxelMasker — same (Voxels) → (Voxels, List[coords])
+    interface, so match_and_gather, encode_student, and the loss need no changes.
+
+    Note: seed_frac controls the number of block centers, not the final masked fraction.
+    Each seed expands to a window, so actual masking ≥ seed_frac and depends on local
+    activity density and window size.  Use the test_block_masking notebook to calibrate.
+    """
+
+    def __init__(self, seed_frac: float = 0.05, win_ch: int = 5, win_tick: int = 5):
+        """
+        Args:
+            seed_frac: Fraction of active voxels used as block centers (0.0 to 1.0).
+                       Number of seeds = ceil(seed_frac × N_active).
+            win_ch:    Half-window radius in the channel direction (voxels).
+            win_tick:  Half-window radius in the tick direction (voxels).
+        """
+        self.seed_frac = seed_frac
+        self.win_ch    = win_ch
+        self.win_tick  = win_tick
+
+    def __call__(self, voxels: Voxels) -> Tuple[Voxels, List[torch.Tensor]]:
+        """
+        Apply block masking to a batched Voxels object.
+
+        Args:
+            voxels: Batched Voxels with batch_size B.
+
+        Returns:
+            student_voxels:          Voxels with block-masked voxels removed.
+            masked_coords_per_batch: List of B tensors, each [N_masked_b, 2] holding
+                                     the (channel, tick) coords of removed voxels.
+        """
+        B         = len(voxels.offsets) - 1
+        device    = voxels.coordinate_tensor.device
+        coord_dim = voxels.coordinate_tensor.shape[1]
+
+        masked_coords_per_batch = []
+        coords_list = []
+        feats_list  = []
+
+        for b in range(B):
+            start = int(voxels.offsets[b])
+            end   = int(voxels.offsets[b + 1])
+            N     = end - start
+
+            if N == 0:
+                # empty image: append empty entries to ALL lists so that
+                # student_voxels.offsets stays length B+1 and aligns with
+                # masked_coords_per_batch (which is always length B).
+                masked_coords_per_batch.append(
+                    voxels.coordinate_tensor.new_zeros(0, coord_dim)
+                )
+                coords_list.append(voxels.coordinate_tensor.new_zeros(0, coord_dim))
+                feats_list.append(voxels.feature_tensor.new_zeros(0, voxels.feature_tensor.shape[1]))
+                continue
+
+            coords_i = voxels.coordinate_tensor[start:end]  # (N, 2)
+            feats_i  = voxels.feature_tensor[start:end]     # (N, C)
+
+            # Sample seeds and expand each to a spatial window.
+            n_seeds  = max(1, math.ceil(self.seed_frac * N))
+            seed_idx = torch.randperm(N, device=device)[:n_seeds]
+            seeds    = coords_i[seed_idx]                    # (n_seeds, 2)
+
+            diff     = coords_i.unsqueeze(1) - seeds.unsqueeze(0)   # (N, n_seeds, 2)
+            in_win   = (diff[:, :, 0].abs() <= self.win_ch) & \
+                       (diff[:, :, 1].abs() <= self.win_tick)        # (N, n_seeds)
+            mask_bool = in_win.any(dim=1)                            # (N,)
+
+            # Guard: guarantee at least one voxel survives.
+            if mask_bool.all():
+                rescue = torch.randint(0, N, (1,), device=device)
+                mask_bool[rescue] = False
+
+            keep   = (~mask_bool).nonzero(as_tuple=False).squeeze(1)
+            masked = mask_bool.nonzero(as_tuple=False).squeeze(1)
+
+            masked_coords_per_batch.append(coords_i[masked])
+            coords_list.append(coords_i[keep])
+            feats_list.append(feats_i[keep])
+
+        n_kept      = [c.shape[0] for c in coords_list]
+        counts      = torch.tensor(n_kept, dtype=torch.int64, device=device)
+        new_offsets = torch.cat([
+            torch.zeros(1, dtype=torch.int64, device=device),
+            counts.cumsum(0),
+        ])
+
+        new_coords = (torch.cat(coords_list, dim=0) if coords_list
+                      else voxels.coordinate_tensor.new_zeros(0, coord_dim))
+        new_feats  = (torch.cat(feats_list,  dim=0) if feats_list
+                      else voxels.feature_tensor.new_zeros(0, voxels.feature_tensor.shape[1]))
+
         student_voxels = Voxels(
             batched_coordinates=IntCoords(new_coords, offsets=new_offsets),
             batched_features=CatFeatures(new_feats, offsets=new_offsets),

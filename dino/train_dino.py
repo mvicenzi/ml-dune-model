@@ -21,7 +21,7 @@ from loader.splits import Subset
 
 from .config import DINOConfig
 from .transforms import FeatureLogTransform
-from .masking import SparseVoxelMasker
+from .masking import SparseVoxelMasker, SparseBlockMasker
 from .cropping import CropConfig, SparseCropper
 from .loss import PixelDINOLoss
 from .scheduler import CosineScheduler
@@ -37,7 +37,11 @@ def main(
     lr: float = 1e-4,
     use_cropping: bool = True,
     use_masking: bool = True,
+    mask_type: str = "pixel",
     mask_ratio: float = 0.5,
+    mask_block_seed_frac: float = 0.05,
+    mask_block_win_ch: int = 5,
+    mask_block_win_tick: int = 5,
     crop_n_global: int = 2,
     crop_n_local: int = 4,
     crop_global_scale: tuple = (0.4, 1.0),
@@ -152,7 +156,11 @@ def main(
         encoding_range=encoding_range,
         use_cropping=use_cropping,
         use_masking=use_masking,
+        mask_type=mask_type,
         mask_ratio=mask_ratio,
+        mask_block_seed_frac=mask_block_seed_frac,
+        mask_block_win_ch=mask_block_win_ch,
+        mask_block_win_tick=mask_block_win_tick,
         crop_n_global=crop_n_global,
         crop_n_local=crop_n_local,
         crop_global_scale=crop_global_scale,
@@ -222,7 +230,11 @@ def main(
     print("Augmentation:")
     print(f"  use_cropping           = {cfg.use_cropping}")
     print(f"  use_masking            = {cfg.use_masking}")
+    print(f"  mask_type              = {cfg.mask_type}")
     print(f"  mask_ratio             = {cfg.mask_ratio}")
+    print(f"  mask_block_seed_frac   = {cfg.mask_block_seed_frac}")
+    print(f"  mask_block_win_ch      = {cfg.mask_block_win_ch}")
+    print(f"  mask_block_win_tick    = {cfg.mask_block_win_tick}")
     print(f"  crop_n_global          = {cfg.crop_n_global}")
     print(f"  crop_n_local           = {cfg.crop_n_local}")
     print(f"  crop_global_scale      = {cfg.crop_global_scale}")
@@ -323,7 +335,14 @@ def main(
     #define masker
     masker = None
     if use_masking:
-        masker = SparseVoxelMasker(mask_ratio=mask_ratio)
+        if mask_type == "block":
+            masker = SparseBlockMasker(
+                seed_frac=mask_block_seed_frac,
+                win_ch=mask_block_win_ch,
+                win_tick=mask_block_win_tick,
+            )
+        else:
+            masker = SparseVoxelMasker(mask_ratio=mask_ratio)
 
     #define cropper
     cropper = None
