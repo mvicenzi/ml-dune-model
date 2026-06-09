@@ -44,6 +44,7 @@ from loader.splits import Subset
 from models import BACKBONE_REGISTRY
 from dino.config import DINOConfig
 from dino.projhead import DINOProjectionHead
+from dino.transforms import FeatureLogTransform
 
 
 def _load_backbone(ckpt: dict, key: str, device: torch.device):
@@ -79,7 +80,7 @@ def _load_head(ckpt: dict, key: str, device: torch.device):
 
 
 @torch.no_grad()
-def _run_loader(student, teacher, loader, device, student_head=None, teacher_head=None):
+def _run_loader(student, teacher, loader, device, normalizer=None, student_head=None, teacher_head=None):
     """
     Run both student and teacher (+ optional heads) over the loader.
 
@@ -100,8 +101,11 @@ def _run_loader(student, teacher, loader, device, student_head=None, teacher_hea
     for xs, meta in loader:
         xs = xs.to(device)
 
-        # Raw pixel charges before the model touches them
-        input_charges = xs.feature_tensor.float()       # [N_active, 1]
+        # Raw pixel charges before normalization
+        input_charges = xs.feature_tensor.float().clone()  # [N_active, 1]
+
+        if normalizer is not None:
+            xs = normalizer(xs)
 
         s_out = student(xs)                             # Voxels [N_active, D_bb]
         t_out = teacher(xs)                             # Voxels [N_active, D_bb]
@@ -212,7 +216,7 @@ def main(
     print(f"\nLoading dataset from {cfg.datadir} ...")
     dataset_kwargs = {"cache_dir": cache_dir} if cache_dir else {}
     dataset = APASparseMetaDataset(
-        datadir=cfg.datadir,
+        datadir="/nfs/data/1/yuhw/cffm-data/prod-jay-100k-truth-2026-02-27", #cfg.datadir,
         apa=cfg.apa,
         view=cfg.view,
         use_cache=True,
@@ -244,9 +248,16 @@ def main(
     if student_head is not None:
         print(f"  Projection head found: {cfg.feature_dim}→{cfg.proj_head_output_dim}D")
 
+    # Data normalizer (must match training config)
+    normalizer = FeatureLogTransform(cfg.feat_min_val, cfg.feat_max_val) if cfg.use_log_transform else None
+    if normalizer is not None:
+        print(f"  Log-transform: min={cfg.feat_min_val}, max={cfg.feat_max_val}")
+    else:
+        print("  No normalization (use_log_transform=False in cfg)")
+
     # Extract
     print("Extracting features ...")
-    results = _run_loader(student, teacher, loader, device, student_head, teacher_head)
+    results = _run_loader(student, teacher, loader, device, normalizer, student_head, teacher_head)
 
     print(f"  Images:        {len(results['labels'])}")
     print(f"  Valid pixels:  {results['student_features'].shape[0]}")
