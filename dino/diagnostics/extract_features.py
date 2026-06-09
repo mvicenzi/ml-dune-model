@@ -11,6 +11,8 @@ Usage:
     python dino/extract_features.py path/to/checkpoint.pt --max_images=5000
     python dino/extract_features.py path/to/checkpoint.pt \
         --output=./my_features.npz --batch_size=16
+    python dino/extract_features.py path/to/checkpoint.pt \
+        --truth_shards_dir=/path/to/truth_shards
 
 Output (.npz):
     teacher_features       [N_valid, D_bb]   float32   teacher backbone features at valid pixels
@@ -178,22 +180,29 @@ def main(
     device: str = "cuda",
     pixel_truth: bool = False,
     cache_dir: str = "",
+    truth_shards_dir: str = "",
 ):
     """
     Extract DINO features from a trained checkpoint for PCA / probing.
 
     Args:
-        checkpoint:   Path to a .pt checkpoint saved by train_dino.py
-        output:       Output .npz path. Defaults to <checkpoint_dir>/features_ep<N>.npz
-        max_images:   Max number of images to process (-1 = full dataset)
-        batch_size:   Inference batch size
-        num_workers:  DataLoader workers
-        device:       "cuda" or "cpu"
-        pixel_truth:  If True, also save per-pixel PDG codes (pid_labels) from
-                      frame_pid_1st, enabling pixel-level PID k-NN analysis.
-        cache_dir:    Directory for the dataset index cache. Defaults to ./data.
-                      Point this at the same persistent cache used during training
-                      to avoid re-scanning the full dataset on every run.
+        checkpoint:       Path to a .pt checkpoint saved by train_dino.py
+        output:           Output .npz path. Defaults to <checkpoint_dir>/features_ep<N>.npz
+        max_images:       Max number of images to process (-1 = full dataset)
+        batch_size:       Inference batch size
+        num_workers:      DataLoader workers (forced to 0 when truth_shards_dir is set)
+        device:           "cuda" or "cpu"
+        pixel_truth:      If True, also save per-pixel PDG codes (pid_labels) from
+                          frame_pid_1st, enabling pixel-level PID k-NN analysis.
+                          Ignored when truth_shards_dir is set (pid_labels always present).
+        cache_dir:        Directory for the dataset index cache. Defaults to ./data.
+                          Point this at the same persistent cache used during training
+                          to avoid re-scanning the full dataset on every run.
+        truth_shards_dir: Path to a truth shard set created by loader/create_truth_shards.py.
+                          When provided, data is loaded from the pre-built shards instead of
+                          the original dataset, giving fast sequential I/O regardless of
+                          the underlying filesystem. The shard apa/view are asserted against
+                          the checkpoint config to catch mismatches early.
     """
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     ckpt_path = Path(checkpoint).resolve()
@@ -212,21 +221,36 @@ def main(
     out_path = Path(output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Dataset (sparse, with full event metadata)
-    print(f"\nLoading dataset from {cfg.datadir} ...")
-    dataset_kwargs = {"cache_dir": cache_dir} if cache_dir else {}
-    dataset = APASparseMetaDataset(
-        datadir="/nfs/data/1/yuhw/cffm-data/prod-jay-100k-truth-2026-02-27", #cfg.datadir,
-        apa=cfg.apa,
-        view=cfg.view,
-        use_cache=True,
-        return_full_metadata=True,
-        return_pixel_truth=pixel_truth,
-        **dataset_kwargs,
-    )
-    if 0 < max_images < len(dataset):
-        indices = torch.randperm(len(dataset))[:max_images]
-        dataset = Subset(dataset, indices)
+    if truth_shards_dir:
+        from loader.apa_sparse_sharded_truth_dataset import APASparseShardedTruthDataset
+        print(f"\nLoading truth shards from {truth_shards_dir} ...")
+        dataset = APASparseShardedTruthDataset(truth_shards_dir)
+        if dataset.apa != cfg.apa:
+            raise ValueError(f"Shard apa={dataset.apa} != checkpoint apa={cfg.apa}")
+        if dataset.view != cfg.view:
+            raise ValueError(f"Shard view={dataset.view!r} != checkpoint view={cfg.view!r}")
+        print(f"  apa={dataset.apa}  view={dataset.view}  images={len(dataset)}")
+        if 0 < max_images < len(dataset):
+            indices = torch.randperm(len(dataset))[:max_images]
+            dataset = Subset(dataset, indices)
+        num_workers = 0  # shard cache is per-process; workers would each reload shards
+    else:
+        # Dataset (sparse, with full event metadata)
+        print(f"\nLoading dataset from {cfg.datadir} ...")
+        dataset_kwargs = {"cache_dir": cache_dir} if cache_dir else {}
+        dataset = APASparseMetaDataset(
+            datadir=cfg.datadir,
+            apa=cfg.apa,
+            view=cfg.view,
+            use_cache=True,
+            return_full_metadata=True,
+            return_pixel_truth=pixel_truth,
+            **dataset_kwargs,
+        )
+        if 0 < max_images < len(dataset):
+            indices = torch.randperm(len(dataset))[:max_images]
+            dataset = Subset(dataset, indices)
+
     print(f"  Images to process: {len(dataset)}")
 
     loader = DataLoader(

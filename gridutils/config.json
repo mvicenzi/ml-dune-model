@@ -26,7 +26,10 @@
   
   "use_cropping": true,
   "use_masking": true,
+  "mask_type": "pixel",
   "mask_ratio": 0.5,
+  "mask_block_win_ch": 5,
+  "mask_block_win_tick": 5,
   "crop_n_global": 1,
   "crop_n_local": 2,
   "crop_global_scale": [
