@@ -40,8 +40,7 @@ class DINOConfig:
     use_cropping: bool = True             # enable activity-aware multi-crop augmentation
     use_masking: bool = True              # enable masking on student views
     mask_type: str = "pixel"             # "pixel" (random dropout) or "block" (spatial windows)
-    mask_ratio: float = 0.5             # fraction of active pixels to mask (pixel mode only)
-    mask_block_seed_frac: float = 0.05  # fraction of voxels used as block seeds (block mode only)
+    mask_ratio: float = 0.5             # fraction of active voxels to mask (both modes)
     mask_block_win_ch: int = 5          # half-window radius in channel direction (block mode only)
     mask_block_win_tick: int = 5        # half-window radius in tick direction (block mode only)
     crop_n_global: int = 2               # number of global crops per image

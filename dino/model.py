@@ -168,6 +168,11 @@ class DINODuneModel(nn.Module):
         if "encoding_range" in inspect.signature(backbone_cls.__init__).parameters:
             backbone_kwargs["encoding_range"] = encoding_range
 
+        # Detect whether this backbone supports masked_coords injection (MAE backbones).
+        self._student_accepts_masked_coords = (
+            "masked_coords" in inspect.signature(backbone_cls.forward).parameters
+        )
+
         print("Initializing STUDENT backbone:")
         self.student = backbone_cls(**backbone_kwargs)
         print("Initializing TEACHER backbone:")
@@ -252,9 +257,7 @@ class DINODuneModel(nn.Module):
             final_out:    head output if head present, else same as backbone_out
         """
 
-        # if masked_coords is not None, the backbone must accept it
-        # this enables their use for injection in the skip connections
-        if masked_coords is not None:
+        if masked_coords is not None and self._student_accepts_masked_coords:
             backbone_out = self.student(xs, masked_coords=masked_coords)
         else:
             backbone_out = self.student(xs)

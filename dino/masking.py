@@ -126,29 +126,30 @@ class SparseBlockMasker:
     Block-masks active voxels for the DINO student by removing entire spatial regions.
 
     For each image in the batch:
-    1. Randomly sample ceil(seed_frac × N) voxels as block centers (seeds).
-    2. Mark all voxels within [±win_ch, ±win_tick] of any seed as masked.
-    3. Remove masked voxels from the student input; return their coordinates.
+    1. Draw voxels one at a time in random order as block centers.
+    2. For each center, mark all voxels within [±win_ch, ±win_tick] as masked.
+    3. Stop as soon as the masked fraction reaches mask_ratio.
+    4. Remove masked voxels from the student input; return their coordinates.
 
     Drop-in replacement for SparseVoxelMasker — same (Voxels) → (Voxels, List[coords])
     interface, so match_and_gather, encode_student, and the loss need no changes.
 
-    Note: seed_frac controls the number of block centers, not the final masked fraction.
-    Each seed expands to a window, so actual masking ≥ seed_frac and depends on local
-    activity density and window size.  Use the test_block_masking notebook to calibrate.
+    Because blocks may overlap, the actual masked fraction can slightly exceed mask_ratio
+    (the last block added pushes it over).  Use the test_block_masking notebook to verify
+    the distribution across your data.
     """
 
-    def __init__(self, seed_frac: float = 0.05, win_ch: int = 5, win_tick: int = 5):
+    def __init__(self, mask_ratio: float = 0.5, win_ch: int = 5, win_tick: int = 5):
         """
         Args:
-            seed_frac: Fraction of active voxels used as block centers (0.0 to 1.0).
-                       Number of seeds = ceil(seed_frac × N_active).
-            win_ch:    Half-window radius in the channel direction (voxels).
-            win_tick:  Half-window radius in the tick direction (voxels).
+            mask_ratio: Target fraction of active voxels to mask (0.0 to 1.0).
+                        Blocks are added until the masked count reaches mask_ratio × N.
+            win_ch:     Half-window radius in the channel direction (voxels).
+            win_tick:   Half-window radius in the tick direction (voxels).
         """
-        self.seed_frac = seed_frac
-        self.win_ch    = win_ch
-        self.win_tick  = win_tick
+        self.mask_ratio = mask_ratio
+        self.win_ch     = win_ch
+        self.win_tick   = win_tick
 
     def __call__(self, voxels: Voxels) -> Tuple[Voxels, List[torch.Tensor]]:
         """
@@ -189,15 +190,16 @@ class SparseBlockMasker:
             coords_i = voxels.coordinate_tensor[start:end]  # (N, 2)
             feats_i  = voxels.feature_tensor[start:end]     # (N, C)
 
-            # Sample seeds and expand each to a spatial window.
-            n_seeds  = max(1, math.ceil(self.seed_frac * N))
-            seed_idx = torch.randperm(N, device=device)[:n_seeds]
-            seeds    = coords_i[seed_idx]                    # (n_seeds, 2)
-
-            diff     = coords_i.unsqueeze(1) - seeds.unsqueeze(0)   # (N, n_seeds, 2)
-            in_win   = (diff[:, :, 0].abs() <= self.win_ch) & \
-                       (diff[:, :, 1].abs() <= self.win_tick)        # (N, n_seeds)
-            mask_bool = in_win.any(dim=1)                            # (N,)
+            # Add random blocks one at a time until the target masked fraction is reached.
+            target    = int(self.mask_ratio * N)
+            mask_bool = torch.zeros(N, dtype=torch.bool, device=device)
+            for s in torch.randperm(N, device=device):
+                if mask_bool.sum() >= target:
+                    break
+                diff   = coords_i - coords_i[s]
+                in_win = (diff[:, 0].abs() <= self.win_ch) & \
+                         (diff[:, 1].abs() <= self.win_tick)
+                mask_bool |= in_win
 
             # Guard: guarantee at least one voxel survives.
             if mask_bool.all():

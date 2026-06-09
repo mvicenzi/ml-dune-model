@@ -39,7 +39,6 @@ def main(
     use_masking: bool = True,
     mask_type: str = "pixel",
     mask_ratio: float = 0.5,
-    mask_block_seed_frac: float = 0.05,
     mask_block_win_ch: int = 5,
     mask_block_win_tick: int = 5,
     crop_n_global: int = 2,
@@ -158,7 +157,6 @@ def main(
         use_masking=use_masking,
         mask_type=mask_type,
         mask_ratio=mask_ratio,
-        mask_block_seed_frac=mask_block_seed_frac,
         mask_block_win_ch=mask_block_win_ch,
         mask_block_win_tick=mask_block_win_tick,
         crop_n_global=crop_n_global,
@@ -232,7 +230,6 @@ def main(
     print(f"  use_masking            = {cfg.use_masking}")
     print(f"  mask_type              = {cfg.mask_type}")
     print(f"  mask_ratio             = {cfg.mask_ratio}")
-    print(f"  mask_block_seed_frac   = {cfg.mask_block_seed_frac}")
     print(f"  mask_block_win_ch      = {cfg.mask_block_win_ch}")
     print(f"  mask_block_win_tick    = {cfg.mask_block_win_tick}")
     print(f"  crop_n_global          = {cfg.crop_n_global}")
@@ -337,7 +334,7 @@ def main(
     if use_masking:
         if mask_type == "block":
             masker = SparseBlockMasker(
-                seed_frac=mask_block_seed_frac,
+                mask_ratio=mask_ratio,
                 win_ch=mask_block_win_ch,
                 win_tick=mask_block_win_tick,
             )
