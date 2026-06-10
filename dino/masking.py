@@ -126,30 +126,34 @@ class SparseBlockMasker:
     Block-masks active voxels for the DINO student by removing entire spatial regions.
 
     For each image in the batch:
-    1. Draw voxels one at a time in random order as block centers.
-    2. For each center, mark all voxels within [±win_ch, ±win_tick] as masked.
-    3. Stop as soon as the masked fraction reaches mask_ratio.
+    1. Estimate K block centers needed to cover mask_ratio of voxels using the
+       geometric coverage formula: E[fraction] = 1 - (1 - p)^K, where
+       p = min(block_area, N) / N is the expected per-block coverage rate.
+    2. Sample K random centers from active voxels (no replacement).
+    3. Mask all voxels within [±win_ch, ±win_tick] of any center in one vectorised op.
     4. Remove masked voxels from the student input; return their coordinates.
 
     Drop-in replacement for SparseVoxelMasker — same (Voxels) → (Voxels, List[coords])
     interface, so match_and_gather, encode_student, and the loss need no changes.
 
-    Because blocks may overlap, the actual masked fraction can slightly exceed mask_ratio
-    (the last block added pushes it over).  Use the test_block_masking notebook to verify
-    the distribution across your data.
+    Because blocks may overlap, the actual masked fraction varies around mask_ratio.
     """
 
     def __init__(self, mask_ratio: float = 0.5, win_ch: int = 5, win_tick: int = 5):
         """
         Args:
             mask_ratio: Target fraction of active voxels to mask (0.0 to 1.0).
-                        Blocks are added until the masked count reaches mask_ratio × N.
             win_ch:     Half-window radius in the channel direction (voxels).
             win_tick:   Half-window radius in the tick direction (voxels).
         """
-        self.mask_ratio = mask_ratio
-        self.win_ch     = win_ch
-        self.win_tick   = win_tick
+        self.mask_ratio  = mask_ratio
+        self.win_ch      = win_ch
+        self.win_tick    = win_tick
+        self._block_area = (2 * win_ch + 1) * (2 * win_tick + 1)
+        # Adaptive estimate of the effective per-block coverage rate p.
+        # Initialised to None (falls back to the analytic formula on the first call)
+        # then updated via EMA from observed coverage — no extra GPU syncs needed.
+        self._p_eff: float = None
 
     def __call__(self, voxels: Voxels) -> Tuple[Voxels, List[torch.Tensor]]:
         """
@@ -190,24 +194,41 @@ class SparseBlockMasker:
             coords_i = voxels.coordinate_tensor[start:end]  # (N, 2)
             feats_i  = voxels.feature_tensor[start:end]     # (N, C)
 
-            # Add random blocks one at a time until the target masked fraction is reached.
-            target    = int(self.mask_ratio * N)
-            mask_bool = torch.zeros(N, dtype=torch.bool, device=device)
-            for s in torch.randperm(N, device=device):
-                if mask_bool.sum() >= target:
-                    break
-                diff   = coords_i - coords_i[s]
-                in_win = (diff[:, 0].abs() <= self.win_ch) & \
-                         (diff[:, 1].abs() <= self.win_tick)
-                mask_bool |= in_win
+            # Estimate how many block centers K are needed to cover mask_ratio of voxels.
+            # Geometric coverage model: E[covered] = 1 - (1-p)^K.
+            # p is the effective per-block coverage rate: ideally block_area/N, but for
+            # sparse data the active voxels per window are far fewer than block_area, so
+            # we learn p from observed coverage via EMA (all CPU math, no extra GPU sync).
+            p_formula = min(self._block_area, N) / N
+            p = self._p_eff if self._p_eff is not None else p_formula
+            p = max(1e-6, min(p, 1.0 - 1e-6))
+            K = min(
+                math.ceil(math.log(1.0 - self.mask_ratio) / math.log(1.0 - p)),
+                N - 1,
+            )
 
-            # Guard: guarantee at least one voxel survives.
+            center_idx = torch.randperm(N, device=device)[:K]
+            centers    = coords_i[center_idx]                           # (K, 2)
+            diff       = coords_i.unsqueeze(1) - centers.unsqueeze(0)  # (N, K, 2)
+            mask_bool  = (
+                (diff[..., 0].abs() <= self.win_ch) &
+                (diff[..., 1].abs() <= self.win_tick)
+            ).any(dim=1)                                                # (N,) — no sync
+
+            # Guard: guarantee at least one voxel survives (rare with K ≤ N-1).
             if mask_bool.all():
-                rescue = torch.randint(0, N, (1,), device=device)
-                mask_bool[rescue] = False
+                mask_bool[torch.randint(0, N, (1,), device=device)] = False
 
             keep   = (~mask_bool).nonzero(as_tuple=False).squeeze(1)
             masked = mask_bool.nonzero(as_tuple=False).squeeze(1)
+
+            # Update EMA of effective p from observed coverage (keep.shape[0] is a
+            # Python int after nonzero — no extra GPU sync).
+            actual = (N - keep.shape[0]) / N
+            if K > 0 and 0.0 < actual < 1.0:
+                p_measured = 1.0 - (1.0 - actual) ** (1.0 / K)
+                self._p_eff = (p_measured if self._p_eff is None
+                               else 0.9 * self._p_eff + 0.1 * p_measured)
 
             masked_coords_per_batch.append(coords_i[masked])
             coords_list.append(coords_i[keep])
