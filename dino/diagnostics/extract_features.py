@@ -15,10 +15,10 @@ Usage:
         --truth_shards_dir=/path/to/truth_shards
 
 Output (.npz):
-    teacher_features       [N_valid, D_bb]   float32   teacher backbone features at valid pixels
-    student_features       [N_valid, D_bb]   float32   student backbone features at valid pixels
-    teacher_head_features  [N_valid, D_hd]   float32   teacher head features (only if head present)
-    student_head_features  [N_valid, D_hd]   float32   student head features (only if head present)
+    teacher_features       [N_valid, D_bb]   float16   teacher backbone features at valid pixels
+    student_features       [N_valid, D_bb]   float16   student backbone features at valid pixels
+    teacher_head_features  [N_valid, D_hd]   float16   teacher head features (only if head present)
+    student_head_features  [N_valid, D_hd]   float16   student head features (only if head present)
     labels            [N_images]     int64     class label per image (0=numuCC, 1=nueCC, 2=NC, -1=unknown)
     nu_pdg            [N_images]     int64     neutrino pdg code per image
     nu_ccnc           [N_images]     int64     0=CC, 1=NC, -1=unknown
@@ -152,10 +152,10 @@ def _run_loader(student, teacher, loader, device, normalizer=None, student_head=
             pid_labels_all.extend(meta["pid_labels"])
 
     return {
-        "student_features":      np.concatenate(s_feats_all, axis=0).astype(np.float32),
-        "teacher_features":      np.concatenate(t_feats_all, axis=0).astype(np.float32),
-        "student_head_features": (np.concatenate(s_head_all, axis=0).astype(np.float32) if have_head else None),
-        "teacher_head_features": (np.concatenate(t_head_all, axis=0).astype(np.float32) if have_head else None),
+        "student_features":      np.concatenate(s_feats_all, axis=0).astype(np.float16),
+        "teacher_features":      np.concatenate(t_feats_all, axis=0).astype(np.float16),
+        "student_head_features": (np.concatenate(s_head_all, axis=0).astype(np.float16) if have_head else None),
+        "teacher_head_features": (np.concatenate(t_head_all, axis=0).astype(np.float16) if have_head else None),
         "labels":     np.array(labels_all, dtype=np.int64),
         "nu_pdg":     np.array(pdg_all,    dtype=np.int64),
         "nu_ccnc":    np.array(ccnc_all,   dtype=np.int64),
