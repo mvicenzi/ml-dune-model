@@ -167,6 +167,12 @@ class SparseBlockMasker:
             masked_coords_per_batch: List of B tensors, each [N_masked_b, 2] holding
                                      the (channel, tick) coords of removed voxels.
         """
+        # Reset per-call so the EMA from one crop type (e.g. sparse global crop)
+        # does not contaminate K estimates for a different crop type (dense local
+        # crop) in the next call.  The EMA still converges within a call across
+        # batch elements, which is when it is actually useful.
+        self._p_eff = None
+
         B         = len(voxels.offsets) - 1
         device    = voxels.coordinate_tensor.device
         coord_dim = voxels.coordinate_tensor.shape[1]
