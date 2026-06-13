@@ -315,6 +315,16 @@ def main(
         proj_head_n_layers=proj_head_n_layers,
     ).to(device)
 
+    n_backbone = sum(p.numel() for p in model.student.parameters())
+    n_head = sum(p.numel() for p in model.student_head.parameters()) if model.student_head is not None else 0
+    n_total = sum(p.numel() for p in model.parameters())
+    print(f"  Backbone params:   {n_backbone:,}")
+    if model.student_head is not None:
+        print(f"  Head params:       {n_head:,}")
+    print(f"  Trainable params:  {n_backbone + n_head:,}  (student only)")
+    print(f"  Total params:      {n_total:,}  (student + teacher EMA)")
+    print(f"  Model size:        {n_total * 4 / 1024**2:.1f} MB  (fp32)")
+
     # Optimise backbone + head (if present)
     # fetch parmaters from the model (student-only)
     student_params = list(model.student.parameters())
