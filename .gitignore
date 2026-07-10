@@ -1,6 +1,10 @@
 __pycache__
 data
 checkpoints*
+dino_debug
+dino_checkpoints
+dino/fig
+*.whl
 metrics
 viz*
 run_*
