@@ -24,9 +24,13 @@ outdir=$4
 cache_dir=$5
 run_name=$6
 
-wp_cache="${cache_dir}/warpconvnet"
+wp_cache_gpfs="${cache_dir}/warpconvnet"
+wp_cache="${_CONDOR_SCRATCH_DIR}/warpconvnet"
 data_cache="${cache_dir}/data"
-mkdir -p "$wp_cache" "$data_cache"
+mkdir -p "$wp_cache_gpfs" "$data_cache"
+
+echo "Copying WarpConvNet benchmark cache to local scratch..."
+cp -r "$wp_cache_gpfs" "$wp_cache"
 
 echo "Running $CLUSTER_ID.$JOB_ID on $(hostname)"
 echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
@@ -72,6 +76,10 @@ sync_back() {
   # layout is ${outdir}/{checkpoints,debug}/... without a redundant nest.
   rsync -a "${scratch_ckpt}/${run_name}/" "${outdir}/checkpoints/" || true
   rsync -a "${scratch_dbg}/${run_name}/"  "${outdir}/debug/"       || true
+  # Merge benchmark cache back so new entries (new op shapes, updated WarpConvNet)
+  # are available to future jobs. rsync uses atomic temp-file writes so concurrent
+  # syncs from multiple jobs are safe.
+  rsync -a "${wp_cache}/" "${wp_cache_gpfs}/" || true
 }
 trap sync_back EXIT                      # flush scratch -> GPFS on any normal/error exit
 trap 'sync_back; exit 143' SIGTERM       # on scheduler kill: flush, then exit 128+15 (SIGTERM)

@@ -53,6 +53,15 @@ def plot_loss(data: dict, out_dir: Path):
         return
     val = data.get("val", {})
 
+    # Detect the iteration where training went non-finite (NaN/inf). matplotlib
+    # silently drops NaN points *and* excludes them from autoscale, so a collapse
+    # otherwise looks like the run simply ended at the last finite value. Find the
+    # onset so we can mark it and keep the dead region on-axis.
+    loss_arr = np.asarray(loss, dtype=float)
+    bad = ~np.isfinite(loss_arr)
+    nan_onset = int(np.argmax(bad)) if bad.any() else None
+    n_iters = len(loss_arr)
+
     # Extract non-null teacher/student entropy and KL values along with their iteration indices.
     # Values are null (None after JSON load) for non-dino loss types.
     raw_t_ent = data.get("teacher_entropy", [])
@@ -84,8 +93,26 @@ def plot_loss(data: dict, out_dir: Path):
     if n_rows == 1:
         axes = [axes]
 
+    # Extract non-null masked/unmasked loss values for the split overlay.
+    raw_masked   = data.get("loss_masked",   [])
+    raw_unmasked = data.get("loss_unmasked", [])
+    masked_iters   = [i for i, v in enumerate(raw_masked)   if v is not None]
+    masked_vals    = [raw_masked[i]   for i in masked_iters]
+    unmasked_iters = [i for i, v in enumerate(raw_unmasked) if v is not None]
+    unmasked_vals  = [raw_unmasked[i] for i in unmasked_iters]
+
+    # Replace non-finite (NaN/inf) with 0 so a collapse drops the curve to zero and
+    # stays on-axis, instead of matplotlib silently dropping the points and the x-range.
+    z = lambda a: np.nan_to_num(np.asarray(a, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+
     ax_loss = axes[0]
-    ax_loss.plot(loss, linewidth=1.0, alpha=0.8, label="Train (per batch)")
+    ax_loss.plot(z(loss), linewidth=1.0, alpha=0.8, label="Train (per batch)")
+    if masked_vals:
+        ax_loss.plot(masked_iters, masked_vals, linewidth=1.0, alpha=0.7,
+                     linestyle="--", color="C3", label="Loss (masked positions)")
+    if unmasked_vals:
+        ax_loss.plot(unmasked_iters, unmasked_vals, linewidth=1.0, alpha=0.7,
+                     linestyle="--", color="C2", label="Loss (unmasked positions)")
     if val and val.get("iter"):
         ax_loss.plot(
             val["iter"], val["loss"],
@@ -104,12 +131,12 @@ def plot_loss(data: dict, out_dir: Path):
         next_row += 1
         K = infer_feature_dim(data)  # head feature dimension (number of softmax categories)
         h_max = np.log(K)  # -log(1/K) = log(K): entropy of a uniform distribution over K dims
-        ax_comp.plot(t_ent_iters, t_ent_vals, linewidth=1.0, alpha=0.8,
+        ax_comp.plot(t_ent_iters, z(t_ent_vals), linewidth=1.0, alpha=0.8,
                      color="C2", label="Teacher entropy  H(P_t)")
         if s_ent_vals:
-            ax_comp.plot(s_ent_iters, s_ent_vals, linewidth=1.0, alpha=0.8,
+            ax_comp.plot(s_ent_iters, z(s_ent_vals), linewidth=1.0, alpha=0.8,
                          color="C0", label="Student entropy  H(P_s)")
-        ax_comp.plot(kl_iters, kl_vals, linewidth=1.0, alpha=0.8,
+        ax_comp.plot(kl_iters, z(kl_vals), linewidth=1.0, alpha=0.8,
                      color="C3", label="KL divergence  KL(P_t|P_s)")
         ax_comp.axhline(h_max, color="C2", linewidth=1.2, linestyle="--", alpha=0.7,
                         label=f"H_max = log({K})")
@@ -124,16 +151,21 @@ def plot_loss(data: dict, out_dir: Path):
         ax_reg = axes[next_row]
         next_row += 1
         if has_cov:
-            ax_reg.plot(cov_iters, cov_vals, linewidth=1.0, alpha=0.8,
+            ax_reg.plot(cov_iters, z(cov_vals), linewidth=1.0, alpha=0.8,
                         color="C0", label="Covariance penalty (raw, unweighted)")
         if has_var:
-            ax_reg.plot(var_iters, var_vals, linewidth=1.0, alpha=0.8,
+            ax_reg.plot(var_iters, z(var_vals), linewidth=1.0, alpha=0.8,
                         color="C1", label="Variance penalty (raw, unweighted)")
         ax_reg.set_xlabel("Iteration")
         ax_reg.set_ylabel("Penalty")
         ax_reg.set_title("VICReg penalties  (cov: low → less correlation | var: low → std above gamma)")
         ax_reg.legend()
         ax_reg.grid(True, alpha=0.3)
+
+    # Force the x-axis to span the full run so the zeroed-out NaN tail stays visible.
+    if nan_onset is not None:
+        for ax in axes[:next_row]:
+            ax.set_xlim(0, n_iters - 1)
 
     fig.tight_layout()
     fig.savefig(out_dir / "loss_curve.png", dpi=200, bbox_inches="tight")
@@ -179,9 +211,14 @@ def plot_stats(data: dict, out_dir: Path, label: str = "backbone", mat_key: str 
         else:
             x_edges = np.array([x_arr[0] - 0.5, x_arr[0] + 0.5])
 
-        y_edges = np.linspace(y_vals.min(), y_vals.max(), 51)
-
         x_vals = np.concatenate([np.full(len(d), it) for d, it in zip(dataset, iters)])
+        finite_mask = np.isfinite(x_vals) & np.isfinite(y_vals)
+        x_vals, y_vals = x_vals[finite_mask], y_vals[finite_mask]
+        if len(y_vals) == 0:
+            ax.set_title(title + " [no finite data]")
+            ax.set_xlabel("Iteration")
+            return
+        y_edges = np.linspace(y_vals.min(), y_vals.max(), 51)
         H, xedges, yedges = np.histogram2d(x_vals, y_vals, bins=[x_edges, y_edges])
 
         # Mask empty bins → white
@@ -451,11 +488,18 @@ def plot_gpu_memory(data: dict, out_dir: Path):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python dino/plot_histories.py path/to/histories.json")
-        sys.exit(1)
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Plot training histories from a histories.json file."
+    )
+    parser.add_argument("json_path", help="Path to histories.json")
+    parser.add_argument(
+        "--no_cov_plots", action="store_true",
+        help="Skip the full covariance/correlation matrix and eigenvalue decomposition plots",
+    )
+    args = parser.parse_args()
 
-    json_path = Path(sys.argv[1]).resolve()
+    json_path = Path(args.json_path).resolve()
     if not json_path.exists():
         print(f"Error: {json_path} not found")
         sys.exit(1)
@@ -471,10 +515,11 @@ def main():
     plot_stats(data, out_dir, label="backbone", mat_key="")
     plot_stats(data, out_dir, label="head", mat_key="head_")
     plot_center_stats(data, out_dir)
-    plot_cov_heatmap(data, out_dir, label="backbone", mat_key="")
-    plot_cov_heatmap(data, out_dir, label="head", mat_key="head_")
-    plot_eigen(data, out_dir, label="backbone", mat_key="")
-    plot_eigen(data, out_dir, label="head", mat_key="head_")
+    if not args.no_cov_plots:
+        plot_cov_heatmap(data, out_dir, label="backbone", mat_key="")
+        plot_cov_heatmap(data, out_dir, label="head", mat_key="head_")
+        plot_eigen(data, out_dir, label="backbone", mat_key="")
+        plot_eigen(data, out_dir, label="head", mat_key="head_")
     plot_grads(data, out_dir)
     plot_gpu_memory(data, out_dir)
 

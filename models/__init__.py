@@ -15,6 +15,7 @@ Backbone naming convention:
 from .minkunet import MinkUNetSparse
 from .minkunet_attention import (
     MinkUNetSparseAttention,
+    MinkUNetSparseAttentionMAE,
     MinkUNetSparseAttentionNoEnc,
     MinkUNetSparseAttentionNoFlash,
     MinkUNetSparseAttentionNoFlashEnc,
@@ -56,6 +57,9 @@ MODEL_REGISTRY = {
 BACKBONE_REGISTRY = {
     # Backbone with sparse attention
     "attn_default":     MinkUNetSparseAttention,
+
+    # MAE-augmented backbone (inject mask tokens at every skip in the decoder)
+    "attn_mae":         MinkUNetSparseAttentionMAE,
 
     # Variants of sparse attention module
     "attn_noenc":       MinkUNetSparseAttentionNoEnc,

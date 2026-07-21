@@ -78,12 +78,26 @@ class PixelDINOLoss(nn.Module):
         # register_buffer ensures it moves with .to(device) and is saved in checkpoints.
         self.register_buffer("center", None)
 
+    @staticmethod
+    def _img_mean(loss_px: Tensor, batch_idx: Tensor, B: int, device) -> Tensor | None:
+        """Scatter per-pixel loss into per-image means, then average over non-empty images."""
+        if loss_px.numel() == 0:
+            return None
+        per_img = torch.zeros(B, device=device, dtype=loss_px.dtype)
+        per_img.scatter_add_(0, batch_idx, loss_px)
+        cnt = torch.zeros(B, device=device, dtype=loss_px.dtype)
+        cnt.scatter_add_(0, batch_idx, torch.ones_like(loss_px))
+        per_img = per_img / cnt.clamp(min=1.0)
+        valid = cnt > 0
+        return per_img[valid].mean() if valid.any() else None
+
     def forward(
         self,
-        s: Tensor,            # [N_matched, D] pre-aligned student head features
-        s_backbone: Tensor,   # [N_matched, D_bb] pre-aligned student backbone features
-        t: Tensor,            # [N_matched, D] pre-aligned teacher head features
-        counts: Tensor,       # [B] per-image matched voxel counts
+        s: Tensor,           # [N_matched, D]    student head features
+        s_backbone: Tensor,  # [N_matched, D_bb] student backbone features
+        t: Tensor,           # [N_matched, D]    teacher head features
+        counts: Tensor,      # [B] per-image matched voxel counts
+        is_masked: Tensor | None = None,  # [N_matched] bool — True for mask-token positions
     ) -> Tensor:
         """
         Compute per-voxel DINO loss on pre-aligned student/teacher features.
@@ -98,9 +112,13 @@ class PixelDINOLoss(nn.Module):
             s_backbone: [N_matched, D_bb] student backbone features (for cov/var penalty)
             t:          [N_matched, D] teacher features (detached)
             counts:     [B] int64 tensor — number of matched voxels per image
+            is_masked:  [N_matched] bool — which positions came from masked tokens;
+                        when provided, masked/unmasked losses are returned as extra
+                        diagnostics (no effect on scalar_loss used for training)
 
         Returns:
-            Scalar loss value, plus diagnostic scalars
+            Scalar loss value (unchanged), plus diagnostic scalars including
+            loss_masked and loss_unmasked when is_masked is provided
         """
         B      = counts.shape[0]
         device = s.device
@@ -113,13 +131,8 @@ class PixelDINOLoss(nn.Module):
                 dtype=t.dtype,
             )
 
-        # For dino loss: L2-normalize to unit sphere so scale-invariant
-        ## TEMPORARY: only for legacy norm before centering
-        #if self.loss_type == "dino":
-        #    s = F.normalize(s, dim=-1)
-        #    t = F.normalize(t, dim=-1)
-
-        # Optionally subtract running mean from teacher to remove the dominant direction
+        # Centering: subtract running mean from teacher 
+        # to remove the dominant direction
         if self.use_centering:
             t = t - self.center
 
@@ -170,11 +183,7 @@ class PixelDINOLoss(nn.Module):
         # Mirrors DINOv2: sum(loss * mask) / mask.sum() per image, then .mean()
         counts_dev = counts.to(device)
         batch_idx = torch.repeat_interleave(torch.arange(B, device=device), counts_dev)
-        per_image_loss = torch.zeros(B, device=loss.device, dtype=loss.dtype)
-        per_image_loss.scatter_add_(0, batch_idx, loss)
-        counts_f = counts_dev.float()
-        per_image_loss = per_image_loss / counts_f.clamp(min=1.0)
-        scalar_loss = per_image_loss[counts_f > 0].mean()
+        scalar_loss = self._img_mean(loss, batch_idx, B, device)
 
         if self.use_cov_penalty:
             scalar_loss = scalar_loss + self.cov_penalty_weight * cov_penalty
@@ -185,23 +194,25 @@ class PixelDINOLoss(nn.Module):
         var_penalty_item = var_penalty.item() if var_penalty is not None else None
 
         if teacher_entropy_px is not None:
-            per_image_t_ent = torch.zeros(B, device=loss.device, dtype=loss.dtype)
-            per_image_t_ent.scatter_add_(0, batch_idx, teacher_entropy_px)
-            t_ent = (per_image_t_ent / counts_f.clamp(min=1.0))[counts_f > 0].mean().item()
-
-            per_image_s_ent = torch.zeros(B, device=loss.device, dtype=loss.dtype)
-            per_image_s_ent.scatter_add_(0, batch_idx, student_entropy_px)
-            s_ent = (per_image_s_ent / counts_f.clamp(min=1.0))[counts_f > 0].mean().item()
-
-            per_image_kl = torch.zeros(B, device=loss.device, dtype=loss.dtype)
-            per_image_kl.scatter_add_(0, batch_idx, kl_px)
-            kl = (per_image_kl / counts_f.clamp(min=1.0))[counts_f > 0].mean().item()
+            t_ent = self._img_mean(teacher_entropy_px, batch_idx, B, device).item()
+            s_ent = self._img_mean(student_entropy_px, batch_idx, B, device).item()
+            kl    = self._img_mean(kl_px,              batch_idx, B, device).item()
         else:
             t_ent = None
             s_ent = None
-            kl = None
+            kl    = None
 
-        return scalar_loss, t_ent, s_ent, kl, cov_penalty_item, var_penalty_item
+        # Split loss into masked / unmasked positions — diagnostics only, no effect on training.
+        loss_masked_item = loss_unmasked_item = None
+        if is_masked is not None:
+            with torch.no_grad():
+                unmasked = ~is_masked
+                m  = self._img_mean(loss[is_masked], batch_idx[is_masked], B, device)
+                um = self._img_mean(loss[unmasked],  batch_idx[unmasked],  B, device)
+                loss_masked_item   = m.item()  if m  is not None else None
+                loss_unmasked_item = um.item() if um is not None else None
+
+        return scalar_loss, t_ent, s_ent, kl, cov_penalty_item, var_penalty_item, loss_masked_item, loss_unmasked_item
 
     def _cov_penalty(self, s: Tensor) -> Tensor:
         """

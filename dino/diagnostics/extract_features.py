@@ -11,12 +11,14 @@ Usage:
     python dino/extract_features.py path/to/checkpoint.pt --max_images=5000
     python dino/extract_features.py path/to/checkpoint.pt \
         --output=./my_features.npz --batch_size=16
+    python dino/extract_features.py path/to/checkpoint.pt \
+        --truth_shards_dir=/path/to/truth_shards
 
 Output (.npz):
-    teacher_features       [N_valid, D_bb]   float32   teacher backbone features at valid pixels
-    student_features       [N_valid, D_bb]   float32   student backbone features at valid pixels
-    teacher_head_features  [N_valid, D_hd]   float32   teacher head features (only if head present)
-    student_head_features  [N_valid, D_hd]   float32   student head features (only if head present)
+    teacher_features       [N_valid, D_bb]   float16   teacher backbone features at valid pixels
+    student_features       [N_valid, D_bb]   float16   student backbone features at valid pixels
+    teacher_head_features  [N_valid, D_hd]   float16   teacher head features (only if head present)
+    student_head_features  [N_valid, D_hd]   float16   student head features (only if head present)
     labels            [N_images]     int64     class label per image (0=numuCC, 1=nueCC, 2=NC, -1=unknown)
     nu_pdg            [N_images]     int64     neutrino pdg code per image
     nu_ccnc           [N_images]     int64     0=CC, 1=NC, -1=unknown
@@ -44,6 +46,7 @@ from loader.splits import Subset
 from models import BACKBONE_REGISTRY
 from dino.config import DINOConfig
 from dino.projhead import DINOProjectionHead
+from dino.transforms import FeatureLogTransform
 
 
 def _load_backbone(ckpt: dict, key: str, device: torch.device):
@@ -79,7 +82,7 @@ def _load_head(ckpt: dict, key: str, device: torch.device):
 
 
 @torch.no_grad()
-def _run_loader(student, teacher, loader, device, student_head=None, teacher_head=None):
+def _run_loader(student, teacher, loader, device, normalizer=None, student_head=None, teacher_head=None):
     """
     Run both student and teacher (+ optional heads) over the loader.
 
@@ -100,8 +103,11 @@ def _run_loader(student, teacher, loader, device, student_head=None, teacher_hea
     for xs, meta in loader:
         xs = xs.to(device)
 
-        # Raw pixel charges before the model touches them
-        input_charges = xs.feature_tensor.float()       # [N_active, 1]
+        # Raw pixel charges before normalization
+        input_charges = xs.feature_tensor.float().clone()  # [N_active, 1]
+
+        if normalizer is not None:
+            xs = normalizer(xs)
 
         s_out = student(xs)                             # Voxels [N_active, D_bb]
         t_out = teacher(xs)                             # Voxels [N_active, D_bb]
@@ -146,10 +152,10 @@ def _run_loader(student, teacher, loader, device, student_head=None, teacher_hea
             pid_labels_all.extend(meta["pid_labels"])
 
     return {
-        "student_features":      np.concatenate(s_feats_all, axis=0).astype(np.float32),
-        "teacher_features":      np.concatenate(t_feats_all, axis=0).astype(np.float32),
-        "student_head_features": (np.concatenate(s_head_all, axis=0).astype(np.float32) if have_head else None),
-        "teacher_head_features": (np.concatenate(t_head_all, axis=0).astype(np.float32) if have_head else None),
+        "student_features":      np.concatenate(s_feats_all, axis=0).astype(np.float16),
+        "teacher_features":      np.concatenate(t_feats_all, axis=0).astype(np.float16),
+        "student_head_features": (np.concatenate(s_head_all, axis=0).astype(np.float16) if have_head else None),
+        "teacher_head_features": (np.concatenate(t_head_all, axis=0).astype(np.float16) if have_head else None),
         "labels":     np.array(labels_all, dtype=np.int64),
         "nu_pdg":     np.array(pdg_all,    dtype=np.int64),
         "nu_ccnc":    np.array(ccnc_all,   dtype=np.int64),
@@ -173,19 +179,30 @@ def main(
     num_workers: int = 4,
     device: str = "cuda",
     pixel_truth: bool = False,
+    cache_dir: str = "",
+    truth_shards_dir: str = "",
 ):
     """
     Extract DINO features from a trained checkpoint for PCA / probing.
 
     Args:
-        checkpoint:   Path to a .pt checkpoint saved by train_dino.py
-        output:       Output .npz path. Defaults to <checkpoint_dir>/features_ep<N>.npz
-        max_images:   Max number of images to process (-1 = full dataset)
-        batch_size:   Inference batch size
-        num_workers:  DataLoader workers
-        device:       "cuda" or "cpu"
-        pixel_truth:  If True, also save per-pixel PDG codes (pid_labels) from
-                      frame_pid_1st, enabling pixel-level PID k-NN analysis.
+        checkpoint:       Path to a .pt checkpoint saved by train_dino.py
+        output:           Output .npz path. Defaults to <checkpoint_dir>/features_ep<N>.npz
+        max_images:       Max number of images to process (-1 = full dataset)
+        batch_size:       Inference batch size
+        num_workers:      DataLoader workers (forced to 0 when truth_shards_dir is set)
+        device:           "cuda" or "cpu"
+        pixel_truth:      If True, also save per-pixel PDG codes (pid_labels) from
+                          frame_pid_1st, enabling pixel-level PID k-NN analysis.
+                          Ignored when truth_shards_dir is set (pid_labels always present).
+        cache_dir:        Directory for the dataset index cache. Defaults to ./data.
+                          Point this at the same persistent cache used during training
+                          to avoid re-scanning the full dataset on every run.
+        truth_shards_dir: Path to a truth shard set created by loader/create_truth_shards.py.
+                          When provided, data is loaded from the pre-built shards instead of
+                          the original dataset, giving fast sequential I/O regardless of
+                          the underlying filesystem. The shard apa/view are asserted against
+                          the checkpoint config to catch mismatches early.
     """
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     ckpt_path = Path(checkpoint).resolve()
@@ -204,19 +221,36 @@ def main(
     out_path = Path(output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Dataset (sparse, with full event metadata)
-    print(f"\nLoading dataset from {cfg.datadir} ...")
-    dataset = APASparseMetaDataset(
-        datadir=cfg.datadir,
-        apa=cfg.apa,
-        view=cfg.view,
-        use_cache=True,
-        return_full_metadata=True,
-        return_pixel_truth=pixel_truth,
-    )
-    if 0 < max_images < len(dataset):
-        indices = torch.randperm(len(dataset))[:max_images]
-        dataset = Subset(dataset, indices)
+    if truth_shards_dir:
+        from loader.apa_sparse_sharded_truth_dataset import APASparseShardedTruthDataset
+        print(f"\nLoading truth shards from {truth_shards_dir} ...")
+        dataset = APASparseShardedTruthDataset(truth_shards_dir)
+        if dataset.apa != cfg.apa:
+            raise ValueError(f"Shard apa={dataset.apa} != checkpoint apa={cfg.apa}")
+        if dataset.view != cfg.view:
+            raise ValueError(f"Shard view={dataset.view!r} != checkpoint view={cfg.view!r}")
+        print(f"  apa={dataset.apa}  view={dataset.view}  images={len(dataset)}")
+        if 0 < max_images < len(dataset):
+            indices = torch.randperm(len(dataset))[:max_images]
+            dataset = Subset(dataset, indices)
+        num_workers = 0  # shard cache is per-process; workers would each reload shards
+    else:
+        # Dataset (sparse, with full event metadata)
+        print(f"\nLoading dataset from {cfg.datadir} ...")
+        dataset_kwargs = {"cache_dir": cache_dir} if cache_dir else {}
+        dataset = APASparseMetaDataset(
+            datadir=cfg.datadir,
+            apa=cfg.apa,
+            view=cfg.view,
+            use_cache=True,
+            return_full_metadata=True,
+            return_pixel_truth=pixel_truth,
+            **dataset_kwargs,
+        )
+        if 0 < max_images < len(dataset):
+            indices = torch.randperm(len(dataset))[:max_images]
+            dataset = Subset(dataset, indices)
+
     print(f"  Images to process: {len(dataset)}")
 
     loader = DataLoader(
@@ -238,9 +272,16 @@ def main(
     if student_head is not None:
         print(f"  Projection head found: {cfg.feature_dim}→{cfg.proj_head_output_dim}D")
 
+    # Data normalizer (must match training config)
+    normalizer = FeatureLogTransform(cfg.feat_min_val, cfg.feat_max_val) if cfg.use_log_transform else None
+    if normalizer is not None:
+        print(f"  Log-transform: min={cfg.feat_min_val}, max={cfg.feat_max_val}")
+    else:
+        print("  No normalization (use_log_transform=False in cfg)")
+
     # Extract
     print("Extracting features ...")
-    results = _run_loader(student, teacher, loader, device, student_head, teacher_head)
+    results = _run_loader(student, teacher, loader, device, normalizer, student_head, teacher_head)
 
     print(f"  Images:        {len(results['labels'])}")
     print(f"  Valid pixels:  {results['student_features'].shape[0]}")

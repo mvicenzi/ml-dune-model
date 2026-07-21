@@ -20,6 +20,9 @@ class DINOConfig:
     batch_size: int = 16
     num_workers: int = 4
     cache_dir: str = "./data"           # directory for cached dataset index .pt file
+    use_sharded: bool = False           # use pre-sharded HDF5 dataset (loader/create_shards.py)
+    sharded_dir: str = ""               # path to directory containing shard_*.h5 files
+    buffer_size: int = 3000             # shuffle-buffer size (samples) for sharded dataset
     use_log_transform: bool = True     # apply FeatureLogTransform to raw charge before model
     feat_min_val: float = 3.75        # 2nd percentile of raw charge [ADC]; anchors y = -1
     feat_max_val: float = 83861.2     # 99.999th percentile of raw charge [ADC]; anchors y = +1
@@ -35,8 +38,11 @@ class DINOConfig:
 
     # ============ Augmentation ============
     use_cropping: bool = True             # enable activity-aware multi-crop augmentation
-    use_masking: bool = True              # enable random pixel dropout on student views
-    mask_ratio: float = 0.5              # fraction of active pixels to mask (masking mode)
+    use_masking: bool = True              # enable masking on student views
+    mask_type: str = "pixel"             # "pixel" (random dropout) or "block" (spatial windows)
+    mask_ratio: float = 0.5             # fraction of active voxels to mask (both modes)
+    mask_block_win_ch: int = 5          # half-window radius in channel direction (block mode only)
+    mask_block_win_tick: int = 5        # half-window radius in tick direction (block mode only)
     crop_n_global: int = 2               # number of global crops per image
     crop_n_local: int = 4                # number of local crops per image
     crop_global_scale: tuple = (0.4, 1.0)    # global crop area as fraction of image area

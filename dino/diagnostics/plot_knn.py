@@ -401,7 +401,7 @@ def plot_scatter(
     tag: str,
     fname: str,
     title_prefix: str,
-    alpha: float = 0.4,
+    alpha: float = 1.0,
     s: float = 4.0,
 ):
     n_classes = len(CLASS_NAMES)

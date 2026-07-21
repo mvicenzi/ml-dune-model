@@ -31,7 +31,6 @@ class DINODebugger:
     - kl:              [float|null, ...]                 per-batch KL(P_t||P_s) (dino only, else null)
     - cov_penalty:              [float|null, ...]  per-batch raw covariance penalty (if enabled, else null)
     - var_penalty:              [float|null, ...]  per-batch raw variance penalty (if enabled, else null)
-    - val:    {iter: [...], loss: [...]}         per-epoch val loss
     - stats:  {iter: [...], s_var: [...], ...}  feature statistics
     - grad:   {module: {iter: [...], norm: [...]}, ...}
     """
@@ -45,6 +44,8 @@ class DINODebugger:
         self.debug_dir.mkdir(parents=True, exist_ok=True)
         self.logger = None
         self.loss_history = [] if self.enabled else None
+        self.loss_masked_history = [] if self.enabled else None
+        self.loss_unmasked_history = [] if self.enabled else None
         self.teacher_entropy_history = [] if self.enabled else None
         self.student_entropy_history = [] if self.enabled else None
         self.kl_history = [] if self.enabled else None
@@ -73,9 +74,6 @@ class DINODebugger:
         )
         # cached norm-module prefixes, built once on first log_gradient_norms call
         self._norm_prefixes: tuple | None = None
-        # val_history: iteration index at end of each epoch -> val loss
-        self.val_history = {"iter": [], "loss": []} if self.enabled else None
-
         if not self.enabled:
             return
 
@@ -140,6 +138,8 @@ class DINODebugger:
         kl: float | None = None,
         cov_penalty: float | None = None,
         var_penalty: float | None = None,
+        loss_masked: float | None = None,
+        loss_unmasked: float | None = None,
     ):
         """Log per-batch scalar information (every batch)."""
         if not self.enabled or self.logger is None:
@@ -157,6 +157,10 @@ class DINODebugger:
         )
         if self.loss_history is not None:
             self.loss_history.append(loss)
+        if self.loss_masked_history is not None:
+            self.loss_masked_history.append(loss_masked)
+        if self.loss_unmasked_history is not None:
+            self.loss_unmasked_history.append(loss_unmasked)
         if self.teacher_entropy_history is not None:
             self.teacher_entropy_history.append(teacher_entropy)
         if self.student_entropy_history is not None:
@@ -167,21 +171,6 @@ class DINODebugger:
             self.cov_penalty_history.append(cov_penalty)
         if self.var_penalty_history is not None:
             self.var_penalty_history.append(var_penalty)
-
-    def log_val_epoch(self, epoch: int, iteration: int, val_loss: float):
-        """
-        Record end-of-epoch validation loss.
-
-        The iteration passed should be the last training iteration of that epoch so
-        the val point lands at the right x position on the shared train/val plot.
-        """
-        if not self.enabled or self.logger is None:
-            return
-        self.logger.info(
-            f"[epoch {epoch:3d} iter {iteration:6d}] VAL_LOSS: {val_loss:.6f}"
-        )
-        self.val_history["iter"].append(iteration)
-        self.val_history["loss"].append(val_loss)
 
     def save_histories(self):
         """
@@ -194,7 +183,6 @@ class DINODebugger:
           kl:              [float|null, ...]                 per-batch KL(P_t||P_s) (dino only, else null)
           cov_penalty:              [float|null, ...]  per-batch raw covariance penalty (if enabled, else null)
           var_penalty:              [float|null, ...]  per-batch raw variance penalty (if enabled, else null)
-          val:             {iter: [...], loss: [...]}        per-epoch val loss
           stats:           {iter: [...], s_var: [...], ...}  feature statistics
           grad:            {module: {iter: [...], norm: [...]}, ...}
           gpu_memory:      {iter: [...], peak_alloc_gib: [...], peak_reserved_gib: [...]}
@@ -203,12 +191,13 @@ class DINODebugger:
             return
         data = {
             "loss":             self.loss_history             or [],
+            "loss_masked":      self.loss_masked_history      or [],
+            "loss_unmasked":    self.loss_unmasked_history    or [],
             "teacher_entropy":  self.teacher_entropy_history  or [],
             "student_entropy":  self.student_entropy_history  or [],
             "kl":               self.kl_history               or [],
             "cov_penalty":      self.cov_penalty_history      or [],
             "var_penalty":      self.var_penalty_history      or [],
-            "val":              self.val_history               or {},
             "stats":            self.stats_history             or {},
             "grad":             self.grad_history              or {},
             "gpu_memory":       self.gpu_memory_history        or {},

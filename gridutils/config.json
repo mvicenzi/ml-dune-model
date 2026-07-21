@@ -1,5 +1,5 @@
 {
-  "run_name": "test", 
+  "run_name": "shards_mae_splitloss_b100", 
   
   "datadir": "/gpfs01/lbne/users/fm/cffm-data/prod-jay-100k-truth-2026-02-27",
   "apa": 0,
@@ -7,13 +7,16 @@
   "image_h": 1500,
   "image_w": 1050,
   "n_subset": -1,
-  "batch_size": 30,
+  "batch_size": 100,
   "num_workers": 4,
+  "use_sharded": true,
+  "sharded_dir": "/gpfs01/lbne/users/fm/cffm-data/shards_prod-jay-100k-truth-2026-02-27",
+  "buffer_size": 3000,
   "use_log_transform": true,
   "feat_min_val": 3.75,
   "feat_max_val": 83861.2,
 
-  "backbone_name": "attn_default",
+  "backbone_name": "attn_mae",
   "encoding_range": 320,
   "feature_dim": 64,
   "use_proj_head": true,
@@ -23,7 +26,10 @@
   
   "use_cropping": true,
   "use_masking": true,
+  "mask_type": "pixel",
   "mask_ratio": 0.5,
+  "mask_block_win_ch": 5,
+  "mask_block_win_tick": 5,
   "crop_n_global": 1,
   "crop_n_local": 2,
   "crop_global_scale": [
@@ -42,14 +48,14 @@
   "crop_heatmap_power": 1.0,
   "crop_min_active_pixels": 10,
 
-  "epochs": 2,
-  "momentum_start": 0.998,
+  "epochs": 70,
+  "momentum_start": 0.999,
   "momentum_end": 0.9999,
   "lr": 0.0001,
   "min_lr": 1e-06,
   "weight_decay": 0.04,
   "weight_decay_end": 0.1,
-  "warmup_epochs": 1,
+  "warmup_epochs": 10,
   
   "loss_type": "dino",
   "use_centering": true,
