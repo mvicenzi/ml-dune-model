@@ -195,6 +195,11 @@ def plot_stats(data: dict, out_dir: Path, label: str = "backbone", mat_key: str 
     s_pr = [pr_from_eigen(vals) for vals, _ in s_eigen]
     t_pr = [pr_from_eigen(vals) for vals, _ in t_eigen]
 
+    TITLE_FS  = 16
+    LABEL_FS  = 14
+    TICK_FS   = 12
+    LEGEND_FS = 13
+
     fig, axes = plt.subplots(3, 2, figsize=(14, 12))
 
     def draw_hist2d(ax, dataset, ylabel, title):
@@ -215,8 +220,8 @@ def plot_stats(data: dict, out_dir: Path, label: str = "backbone", mat_key: str 
         finite_mask = np.isfinite(x_vals) & np.isfinite(y_vals)
         x_vals, y_vals = x_vals[finite_mask], y_vals[finite_mask]
         if len(y_vals) == 0:
-            ax.set_title(title + " [no finite data]")
-            ax.set_xlabel("Iteration")
+            ax.set_title(title + " [no finite data]", fontsize=TITLE_FS)
+            ax.set_xlabel("Iteration", fontsize=LABEL_FS)
             return
         y_edges = np.linspace(y_vals.min(), y_vals.max(), 51)
         H, xedges, yedges = np.histogram2d(x_vals, y_vals, bins=[x_edges, y_edges])
@@ -231,10 +236,11 @@ def plot_stats(data: dict, out_dir: Path, label: str = "backbone", mat_key: str 
         medians = [np.median(d) for d in dataset]
         ax.plot(x_arr, medians, color="red", linewidth=1.5, label="Median")
 
-        ax.legend(fontsize=8)
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
-        ax.set_xlabel("Iteration")
+        ax.legend(fontsize=LEGEND_FS)
+        ax.set_ylabel(ylabel, fontsize=LABEL_FS)
+        ax.set_title(title, fontsize=TITLE_FS)
+        ax.set_xlabel("Iteration", fontsize=LABEL_FS)
+        ax.tick_params(labelsize=TICK_FS)
         ax.grid(True, alpha=0.3)
 
     # Row 0: per-pixel L2 norm — median line with min/max band
@@ -247,11 +253,12 @@ def plot_stats(data: dict, out_dir: Path, label: str = "backbone", mat_key: str 
         medians = h.get(f"{prefix}_median", [])
         ax.fill_between(iters, mins, maxs, alpha=0.3, color=color, label="Min–Max")
         ax.plot(iters, medians, linewidth=1.5, color=color, label="Median")
-        ax.set_ylabel("Per-pixel L2 norm")
-        ax.set_title(f"{name} feature magnitude")
-        ax.legend(fontsize=8)
+        ax.set_ylabel("Per-pixel L2 norm", fontsize=LABEL_FS)
+        ax.set_title(f"{name} feature magnitude", fontsize=TITLE_FS)
+        ax.legend(fontsize=LEGEND_FS)
         ax.set_yscale("log")
-        ax.set_xlabel("Iteration")
+        ax.set_xlabel("Iteration", fontsize=LABEL_FS)
+        ax.tick_params(labelsize=TICK_FS)
         ax.grid(True, alpha=0.3)
 
     # Row 1: per-feature variance 2D histogram
@@ -262,9 +269,10 @@ def plot_stats(data: dict, out_dir: Path, label: str = "backbone", mat_key: str 
     for col, (pr, role) in enumerate([(s_pr, "Student"), (t_pr, "Teacher")]):
         ax = axes[2, col]
         ax.plot(iters, pr, linewidth=1.5, color=f"C{col}")
-        ax.set_ylabel("Effective rank  [1, D]")
-        ax.set_title(f"{role} Participation Ratio [{label}]")
-        ax.set_xlabel("Iteration")
+        ax.set_ylabel("Effective rank  [1, D]", fontsize=LABEL_FS)
+        ax.set_title(f"{role} Participation Ratio [{label}]", fontsize=TITLE_FS)
+        ax.set_xlabel("Iteration", fontsize=LABEL_FS)
+        ax.tick_params(labelsize=TICK_FS)
         ax.grid(True, alpha=0.3)
 
     fname = f"feature_stats_{label}.png"
