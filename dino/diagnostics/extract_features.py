@@ -29,11 +29,13 @@ Output (.npz):
     positions         [N_valid, 2]   int32     (channel, tick) pixel coordinates in view-local frame
     charges           [N_valid, 1]   float32   raw pixel charge (ADC value) at each active pixel
     offsets           [N_images+1]   int64     CSR-style: image i occupies rows offsets[i]:offsets[i+1]
-    pid_labels        [N_valid]      int32     raw PDG code from frame_pid_1st per pixel (0 = no truth)
+    pixel_labels      [N_valid]      int8      per-pixel class label (0=Background/no-truth,
+                                               1=Track 2=Shower 3=Michel 4=DeltaRay 5=Blip 6=Other)
                                                only present when extracted with --pixel_truth
 """
 
 import fire
+import itertools
 import inspect
 import numpy as np
 import torch
@@ -96,7 +98,7 @@ def _run_loader(student, teacher, loader, device, normalizer=None, student_head=
 
     labels_all, pdg_all, ccnc_all, intType_all, energy_all = [], [], [], [], []
     vertex_all, event_keys_all = [], []
-    pid_labels_all = []
+    pixel_labels_all = []
 
     have_head = student_head is not None
 
@@ -148,8 +150,8 @@ def _run_loader(student, teacher, loader, device, normalizer=None, student_head=
         event_keys_all.extend(meta["event_key"])
 
         # Optional pixel-level PID truth (list of B arrays, one per image)
-        if "pid_labels" in meta:
-            pid_labels_all.extend(meta["pid_labels"])
+        if "pixel_labels" in meta:
+            pixel_labels_all.extend(meta["pixel_labels"])
 
     return {
         "student_features":      np.concatenate(s_feats_all, axis=0).astype(np.float16),
@@ -166,8 +168,8 @@ def _run_loader(student, teacher, loader, device, normalizer=None, student_head=
         "positions":  np.concatenate(pos_all,     axis=0).astype(np.int32),
         "charges":    np.concatenate(charges_all, axis=0).astype(np.float32),
         "offsets":    np.array(offsets, dtype=np.int64),
-        "pid_labels": (np.concatenate(pid_labels_all, axis=0).astype(np.int32)
-                       if pid_labels_all else None),
+        "pixel_labels": (np.concatenate(pixel_labels_all, axis=0).astype(np.int8)
+                       if pixel_labels_all else None),
     }
 
 
@@ -190,15 +192,17 @@ def main(
         output:           Output .npz path. Defaults to <checkpoint_dir>/features_ep<N>.npz
         max_images:       Max number of images to process (-1 = full dataset)
         batch_size:       Inference batch size
-        num_workers:      DataLoader workers (forced to 0 when truth_shards_dir is set)
+        num_workers:      DataLoader workers (ignored when truth_shards_dir is set)
         device:           "cuda" or "cpu"
-        pixel_truth:      If True, also save per-pixel PDG codes (pid_labels) from
-                          frame_pid_1st, enabling pixel-level PID k-NN analysis.
-                          Ignored when truth_shards_dir is set (pid_labels always present).
+        pixel_truth:      If True, also save per-pixel class labels (pixel_labels) from
+                          frame_label_1st, enabling pixel-level PID k-NN analysis.
+                          Ignored when truth_shards_dir is set (pixel_labels present when
+                          the shards were created with --with_pixel_truth).
         cache_dir:        Directory for the dataset index cache. Defaults to ./data.
                           Point this at the same persistent cache used during training
                           to avoid re-scanning the full dataset on every run.
-        truth_shards_dir: Path to a truth shard set created by loader/create_truth_shards.py.
+        truth_shards_dir: Path to a truth shard set created by loader/create_shards.py
+                          (--n_shards N --with_pixel_truth).
                           When provided, data is loaded from the pre-built shards instead of
                           the original dataset, giving fast sequential I/O regardless of
                           the underlying filesystem. The shard apa/view are asserted against
@@ -222,18 +226,18 @@ def main(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if truth_shards_dir:
-        from loader.apa_sparse_sharded_truth_dataset import APASparseShardedTruthDataset
+        from loader.apa_sparse_sharded_dataset import APASparseShardedDataset
         print(f"\nLoading truth shards from {truth_shards_dir} ...")
-        dataset = APASparseShardedTruthDataset(truth_shards_dir)
-        if dataset.apa != cfg.apa:
+        # shuffle=False -> deterministic event order, identical across checkpoints.
+        dataset = APASparseShardedDataset(
+            truth_shards_dir, batch_size=batch_size, shuffle=False,
+        )
+        if dataset.apa is not None and dataset.apa != cfg.apa:
             raise ValueError(f"Shard apa={dataset.apa} != checkpoint apa={cfg.apa}")
-        if dataset.view != cfg.view:
+        if dataset.view is not None and dataset.view != cfg.view:
             raise ValueError(f"Shard view={dataset.view!r} != checkpoint view={cfg.view!r}")
-        print(f"  apa={dataset.apa}  view={dataset.view}  images={len(dataset)}")
-        if 0 < max_images < len(dataset):
-            indices = torch.randperm(len(dataset))[:max_images]
-            dataset = Subset(dataset, indices)
-        num_workers = 0  # shard cache is per-process; workers would each reload shards
+        n_images = len(dataset) * batch_size
+        print(f"  apa={dataset.apa}  view={dataset.view}  images={n_images}")
     else:
         # Dataset (sparse, with full event metadata)
         print(f"\nLoading dataset from {cfg.datadir} ...")
@@ -243,24 +247,30 @@ def main(
             apa=cfg.apa,
             view=cfg.view,
             use_cache=True,
-            return_full_metadata=True,
             return_pixel_truth=pixel_truth,
             **dataset_kwargs,
         )
         if 0 < max_images < len(dataset):
             indices = torch.randperm(len(dataset))[:max_images]
             dataset = Subset(dataset, indices)
+        print(f"  Images to process: {len(dataset)}")
 
-    print(f"  Images to process: {len(dataset)}")
-
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=voxels_meta_collate_fn,
-    )
+    if truth_shards_dir:
+        # Reader yields pre-batched (voxels, meta); cap batches for max_images.
+        loader = DataLoader(dataset, batch_size=None, num_workers=0, pin_memory=True)
+        if 0 < max_images < len(dataset) * batch_size:
+            max_batches = max_images // batch_size
+            print(f"  Limiting to first {max_batches * batch_size} images ({max_batches} batches)")
+            loader = itertools.islice(iter(loader), max_batches)
+    else:
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            collate_fn=voxels_meta_collate_fn,
+        )
 
     # Load both models
     print("\nLoading student and teacher backbones ...")
@@ -306,9 +316,9 @@ def main(
     if results["student_head_features"] is not None:
         arrays["student_head_features"] = results["student_head_features"]
         arrays["teacher_head_features"] = results["teacher_head_features"]
-    if results["pid_labels"] is not None:
-        arrays["pid_labels"] = results["pid_labels"]
-        print(f"  Pixels with pid1 truth: {(results['pid_labels'] != 0).sum()}")
+    if results["pixel_labels"] is not None:
+        arrays["pixel_labels"] = results["pixel_labels"]
+        print(f"  Pixels with truth label: {(results['pixel_labels'] != 0).sum()}")
 
     np.savez_compressed(out_path, **arrays)
     print(f"\nSaved: {out_path}")

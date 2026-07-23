@@ -68,7 +68,7 @@ class APASparseDataset(Dataset):
                          detector geometries with different channel assignments.
             frame_name:  HDF5 group key that holds the sparse frame data
                          (coords + features).  Defaults to "frame_rebinned_reco".
-                         Other options in new files: "frame_pid_1st",
+                         Other options in new files: "frame_label_1st",
                          "frame_trackid_1st", etc.
         """
         self.datadir   = Path(datadir)

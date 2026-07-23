@@ -15,8 +15,8 @@ import torch.optim as optim
 from pathlib import Path
 from torch.utils.data import DataLoader
 
-from loader.apa_sparse_dataset import APASparseDataset
-from loader.collate import voxels_collate_fn
+from loader.apa_sparse_meta_dataset import APASparseMetaDataset
+from loader.collate import voxels_meta_collate_fn
 from loader.splits import Subset
 
 from .config import DINOConfig
@@ -278,7 +278,7 @@ def main(
         )
     else:
         print("\nLoading dataset:", cfg.datadir)
-        dataset = APASparseDataset(
+        dataset = APASparseMetaDataset(
             datadir=cfg.datadir,
             apa=cfg.apa,
             view=cfg.view,
@@ -296,7 +296,7 @@ def main(
             shuffle=True,
             num_workers=num_workers,
             pin_memory=True,
-            collate_fn=voxels_collate_fn,
+            collate_fn=voxels_meta_collate_fn,
         )
 
     print(f"Dataset size: {len(dataset)}")
@@ -421,7 +421,10 @@ def main(
         # set model to training mode
         model.train()
 
-        for batch_idx, xs in enumerate(train_loader):
+        for batch_idx, batch in enumerate(train_loader):
+
+            # Every data branch yields (voxels, meta); training ignores the truth.
+            xs, _ = batch
 
             iteration = (epoch - 1) * epoch_len + batch_idx
             xs = xs.to(device)

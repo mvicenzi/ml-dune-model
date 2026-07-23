@@ -35,15 +35,18 @@ def voxels_collate_fn(batch):
 
 def voxels_label_collate_fn(batch):
     """
-    Collate a list of (Voxels, int) tuples into (batched_Voxels, LongTensor).
+    Collate a list of (Voxels, meta_dict) tuples into (batched_Voxels, LongTensor)
+    keeping only the event class index (meta["label"]).
 
-    Used with APASparseMetaDataset for supervised fine-tuning DataLoaders.
+    Used with APASparseMetaDataset for supervised fine-tuning DataLoaders that
+    need nothing but the event label.
 
     Usage:
         from loader.collate import voxels_label_collate_fn
         loader = DataLoader(dataset, batch_size=8, collate_fn=voxels_label_collate_fn)
     """
-    voxels_list, labels = zip(*batch)
+    voxels_list, metas = zip(*batch)
+    labels = [m["label"] for m in metas]
     return voxels_collate_fn(list(voxels_list)), torch.tensor(labels, dtype=torch.long)
 
 
@@ -51,16 +54,19 @@ def voxels_meta_collate_fn(batch):
     """
     Collate a list of (Voxels, meta_dict) tuples into (batched_Voxels, meta_dict).
 
-    Used with APASparseMetaDataset(return_full_metadata=True). Numeric dict fields
+    Used with APASparseMetaDataset (meta dict mode is always on). Numeric dict fields
     are stacked into batched tensors; `event_key` stays a list of strings.
 
-    Expected dict keys (as produced by APASparseMetaDataset._read_full_metadata):
+    Expected dict keys (as produced by APASparseMetaDataset._read_event_truth):
         label, nu_pdg, nu_ccnc, nu_intType  →  LongTensor[B]
         nu_energy                           →  FloatTensor[B]
         vertex_xyz                          →  FloatTensor[B, 3]
         event_key                           →  list[str] of length B
-        pid_labels (optional)               →  list of B np.ndarray[N_i] int32
+        pixel_labels (optional)             →  list of B np.ndarray[N_i] int8
                                                (present only with return_pixel_truth=True)
+        pixel_energyfrac / pixel_trackid / pixel_truth_q (optional)
+                                            →  list of B np.ndarray[N_i]
+                                               (present only with return_extra_truth=True)
 
     Usage:
         from loader.collate import voxels_meta_collate_fn
@@ -78,6 +84,7 @@ def voxels_meta_collate_fn(batch):
         "vertex_xyz": torch.stack([m["vertex_xyz"]  for m in metas], dim=0),
         "event_key":  [m["event_key"] for m in metas],
     }
-    if "pid_labels" in metas[0]:
-        out["pid_labels"] = [m["pid_labels"] for m in metas]
+    for key in ("pixel_labels", "pixel_energyfrac", "pixel_trackid", "pixel_truth_q"):
+        if key in metas[0]:
+            out[key] = [m[key] for m in metas]
     return batched_voxels, out
