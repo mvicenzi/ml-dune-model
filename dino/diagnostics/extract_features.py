@@ -251,7 +251,10 @@ def main(
             **dataset_kwargs,
         )
         if 0 < max_images < len(dataset):
-            indices = torch.randperm(len(dataset))[:max_images]
+            # Seeded: every extraction samples the same events, so features
+            # are comparable across checkpoints.
+            rng = torch.Generator().manual_seed(42)
+            indices = torch.randperm(len(dataset), generator=rng)[:max_images]
             dataset = Subset(dataset, indices)
         print(f"  Images to process: {len(dataset)}")
 
