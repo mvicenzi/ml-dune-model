@@ -229,7 +229,10 @@ def main() -> None:
     parser.add_argument("--view",       default="W",             help="Wire-plane view U/V/W (default: W)")
     parser.add_argument("--cache_dir",  required=True,           help="Dataset index cache directory")
     parser.add_argument("--n_subset",   type=int, default=-1,
-                        help="Pack only the first N events (default: all)")
+                        help="Pack only the first N events in index order (default: all). "
+                             "Note: on a mixed nominal+nueswap root the index is "
+                             "flavor-blocked, so a subset is effectively single-flavor "
+                             "— use for smoke tests only")
     parser.add_argument("--no_pixel_truth", action="store_true",
                         help="Skip per-pixel class labels (pixel truth is packed by default)")
     parser.add_argument("--no_extra_truth", action="store_true",

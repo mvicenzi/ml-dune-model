@@ -2,7 +2,7 @@
 
 Dataset classes and preprocessing scripts for the DUNE event data.
 
-# Dataset classes
+## Dataset classes
 
 | File | Class / script | Status | Format | Truth | Dataset |
 |---|---|---|---|---|---|
