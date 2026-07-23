@@ -4,12 +4,41 @@ Dataset classes and preprocessing scripts for the DUNE event data.
 
 ## Productions
 
-| Production | SDCC | WCWC | Events | Truth | Status |
-|---|---|---|---|---|---|
-| `prod-jay-100k-truth-2026-06-11` | `/gpfs01/lbne/users/bnayak/cffm-data/` | `/srv/data/1/nitish/cffm-data/` | ~200k (`nominal/` νμ flux + `nueswap/` νe-swap flux) | full (event metadata, per-pixel labels/ energyfrac / trackid / charge,  MC genealogy map) | **supported (reference)** |
-| `prod-jay-1M-truth-2026-06-11` | ? | ? | ~1M (`nominal/` νμ flux + `nueswap/` νe-swap flux) | event metadata only | supported (reference) |
-| `prod-jay-100k-truth-2026-02-27` | `/gpfs01/lbne/users/fm/cffm-data/prod-jay-100k-truth-2026-02-27` | `/nfs/data/1/yuhw/cffm-data/prod-jay-100k-truth-2026-02-27` | ~100k (νμ flux) | event metadata + per-pixel raw PDG | **not supported** |
-| `prod-jay-1M-2026-02-27` | `/gpfs01/lbne/users/fm/cffm-data/prod-jay-1M-2026-02-27` | — | ~1M (νμ flux) | event metadata only | supported |
+Locations are given for both clusters (`?` = location unknown / to be confirmed).
+
+`prod-jay-100k-truth-2026-06-11` — **DEFAULT**
+- SDCC: `/gpfs01/lbne/users/bnayak/cffm-data/prod-jay-100k-truth-2026-06-11`
+- WCWC: `/srv/data/1/nitish/cffm-data/prod-jay-100k-truth-2026-06-11`
+- Events: ~200k (`nominal/` νμ flux + `nueswap/` νe-swap flux)
+- Truth: full (event metadata, per-pixel labels / energyfrac / trackid / charge, MC genealogy map)
+
+`prod-jay-1M-truth-2026-06-11` — supported
+- SDCC: ?
+- WCWC: ?
+- Events: ~1M (`nominal/` νμ flux + `nueswap/` νe-swap flux)
+- Truth: event metadata only
+
+`prod-jay-100k-truth-2026-02-27` - not supported (old truth labels)
+- SDCC: `/gpfs01/lbne/users/fm/cffm-data/prod-jay-100k-truth-2026-02-27`
+- WCWC: `/nfs/data/1/yuhw/cffm-data/prod-jay-100k-truth-2026-02-27`
+- Events: ~100k (νμ flux)
+- Truth: event metadata + per-pixel raw PDG
+
+`prod-jay-1M-2026-02-27` — supported
+- SDCC: `/gpfs01/lbne/users/fm/cffm-data/prod-jay-1M-2026-02-27`
+- WCWC: `/nfs/data/1/yuhw/cffm-data/prod-jay-1M-truth-2026-02-27`
+- Events: ~1M (νμ flux)
+- Truth: event metadata only
+
+Early APA production (dense) — legacy
+- SDCC: ?
+- WCWC: `/nfs/data/1/mvicenzi/apa-test-data/gzip2`
+- Used by `APAImageDataset`
+
+DUNE CVN dataset (`.gz` image files) — legacy
+- SDCC: ?
+- WCWC: `/nfs/data/1/rrazakami/work/data_cvn/data/dune/2023_trainings/latest/dunevd`
+- Used by `DUNEImageDataset`
 
 ## Dataset classes
 
