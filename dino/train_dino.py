@@ -9,7 +9,9 @@ Usage:
 import fire
 import inspect
 import json
+import resource
 import sys
+import time
 import torch
 import torch.optim as optim
 from pathlib import Path
@@ -460,7 +462,13 @@ def main(
         # set model to training mode
         model.train()
 
+        # Per-epoch timing: wall clock + time spent waiting on the data loader.
+        epoch_t0 = time.perf_counter()
+        data_wait = 0.0
+        t_fetch = time.perf_counter()
+
         for batch_idx, batch in enumerate(train_loader):
+            data_wait += time.perf_counter() - t_fetch
 
             # Every data branch yields (voxels, meta); training ignores the truth.
             xs, _ = batch
@@ -535,6 +543,21 @@ def main(
                 mem_str = f", gpu={debugger.last_peak_alloc_gib:.2f}GiB"
                 print(f"[{epoch}/{epochs}] iter {iteration}: loss={loss_val:.6f}, "
                       f"lr={lr_val:.2e}, mom={mom_val:.6f}{cov_str}{var_str}{mem_str}")
+
+            t_fetch = time.perf_counter()
+
+        # One line per epoch: wall clock, data-loader wait, throughput, peak RSS
+        # self = main process incl. in-RAM packed dataset
+        # workers = exited dataloader workers
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        wall = time.perf_counter() - epoch_t0
+        n_samples = epoch_len * batch_size
+        rss_self = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2
+        rss_kids = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024**2
+        print(f"[timing] epoch={epoch} wall={wall:.1f}s data_wait={data_wait:.1f}s "
+              f"({100*data_wait/max(wall,1e-9):.1f}%) samples_per_sec={n_samples/max(wall,1e-9):.1f} "
+              f"peak_rss_self={rss_self:.2f}GiB peak_rss_workers={rss_kids:.2f}GiB")
 
         # Save model checkpoint
         if epoch % save_every == 0 or epoch == epochs:
