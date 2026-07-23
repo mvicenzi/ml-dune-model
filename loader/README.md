@@ -6,8 +6,9 @@ Dataset classes and preprocessing scripts for the DUNE event data.
 
 | File | Class / script | Status | Format | Truth | Dataset |
 |---|---|---|---|---|---|
-| `apa_sparse_meta_dataset.py` | `APASparseMetaDataset` | default | sparse | yes — event truth always; per-pixel opt-in (`return_pixel_truth`), rich per-pixel opt-in (`return_extra_truth`) | APA productions |
+| `apa_sparse_meta_dataset.py` | `APASparseMetaDataset` | default | sparse | yes — event truth always; per-pixel opt-in (`return_pixel_truth`/`return_extra_truth`) | APA productions |
 | `apa_sparse_sharded_dataset.py` | `APASparseShardedDataset` | grid-optimized | sparse | yes — auto-detects and returns whatever tiers the shards carry | make shards with `create_shards.py` |
+| `apa_packed_dataset.py` | `APAPackedDataset` | grid-optimized | sparse | yes — event truth always; per-pixel opt-in (`return_pixel_truth`/`return_extra_truth`) | make packs with `pack_dataset.py` |
 | `apa_sparse_dataset.py` | `APASparseDataset` | legacy | sparse | no | APA productions |
 | `apa_dataset.py` | `APAImageDataset` | legacy | dense | no | early APA productions (dense) |
 | `dataset.py` | `DUNEImageDataset` | legacy | dense | yes — event labels only (from `.info` files) | DUNE CVN dataset (`.gz` image files) |
