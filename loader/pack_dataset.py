@@ -180,15 +180,10 @@ def pack_dataset(
 
     offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
 
+    # Build the output arrays one at a time, freeing each accumulation list
+    # right after its concatenate — roughly halves the peak RSS of the job
+    # (at ~200k mixed events the per-pixel lists alone are tens of GB).
     out = {
-        "coords": (
-            np.concatenate(coords_list, axis=0).astype(np.int32)
-            if coords_list else np.zeros((0, 2), np.int32)
-        ),
-        "features": (
-            np.concatenate(feats_list, axis=0).astype(np.float32)
-            if feats_list else np.zeros((0, 1), np.float32)
-        ),
         "offsets":    offsets,
         "apa":        np.int64(apa),
         "view":       str(view),
@@ -201,6 +196,12 @@ def pack_dataset(
                        else np.zeros((0, 3), np.float32)),
         "event_key":  np.array(keys),
     }
+    out["coords"] = (np.concatenate(coords_list, axis=0).astype(np.int32)
+                     if coords_list else np.zeros((0, 2), np.int32))
+    coords_list.clear()
+    out["features"] = (np.concatenate(feats_list, axis=0).astype(np.float32)
+                       if feats_list else np.zeros((0, 1), np.float32))
+    feats_list.clear()
     if pixel_spec:
         out["truth_format"] = TRUTH_FORMAT
         out["class_names"]  = np.array(CLASS_NAMES)
@@ -210,6 +211,7 @@ def pack_dataset(
             assert arr.shape[0] == int(offsets[-1]), (
                 f"{kk} total {arr.shape[0]} != offsets[-1] {int(offsets[-1])}")
             out[kk] = arr
+            pixel_lists[kk].clear()
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -30,9 +30,11 @@ class APASparseShardedDataset(IterableDataset):
     per-epoch reshuffling while keeping IO to one file read per buffer-refill
     step.
 
-    Truth is handled automatically: whatever truth datasets exist in the
-    shards (event-level always written by create_shards.py; pixel-level with
-    its --with_pixel_truth/--with_extra_truth flags) are read and returned.
+    Event-level truth is returned automatically when the shards carry it.
+    Per-pixel tiers are opt-in (return_pixel_truth / return_extra_truth,
+    same API as APASparseMetaDataset / APAPackedDataset) because HDF5
+    datasets present in a shard are decompressed on every read — training
+    should leave them off even on full-truth shard sets.
 
     Each item yielded is a tuple (voxels, meta):
         voxels: batched Voxels of exactly batch_size samples
@@ -71,11 +73,17 @@ class APASparseShardedDataset(IterableDataset):
         batch_size: int = 100,
         buffer_size: int = 3000,
         shuffle: bool = True,
+        return_pixel_truth: bool = False,
+        return_extra_truth: bool = False,
     ):
         self.root_dir   = Path(root_dir)
         self.batch_size = batch_size
         self.buffer_size = buffer_size
         self.shuffle = shuffle
+        if return_extra_truth:
+            return_pixel_truth = True
+        self.return_pixel_truth = return_pixel_truth
+        self.return_extra_truth = return_extra_truth
 
         self.shards: List[Path] = sorted(self.root_dir.glob("shard_*.h5"))
         if not self.shards:
@@ -97,10 +105,27 @@ class APASparseShardedDataset(IterableDataset):
 
         self._n_batches = n_samples // batch_size
 
-        # Discover which truth datasets the shards actually carry.
+        # Discover which truth datasets the shards actually carry, then keep
+        # only the requested tiers: per-pixel truth in the shards is NOT free
+        # to read (unlike the packed .npz, HDF5 datasets present in a shard
+        # would be decompressed on every epoch), so it is opt-in like on
+        # APASparseMetaDataset / APAPackedDataset. Event truth (a few scalars
+        # per event) is always returned when present.
         with h5py.File(self.shards[0], "r") as f:
             self._has_event_truth = "labels" in f
-            self._pixel_keys: Tuple[str, ...] = tuple(k for k in _PIXEL_KEYS if k in f)
+            available = tuple(k for k in _PIXEL_KEYS if k in f)
+        wanted = []
+        if self.return_pixel_truth:
+            wanted.append("pixel_labels")
+        if self.return_extra_truth:
+            wanted += ["pixel_energyfrac", "pixel_trackid", "pixel_truth_q"]
+        missing = [k for k in wanted if k not in available]
+        if missing:
+            raise ValueError(
+                f"{root_dir}: shards have no {missing}; recreate with the "
+                f"matching create_shards.py --with_pixel_truth/--with_extra_truth flags."
+            )
+        self._pixel_keys: Tuple[str, ...] = tuple(wanted)
 
     # ------------------------------------------------------------------
     # IterableDataset protocol

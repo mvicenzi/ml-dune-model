@@ -23,8 +23,9 @@ metadata read). The per-pixel tiers are opt-in — on `APASparseMetaDataset`
 via the constructor flags `return_pixel_truth=True` (class labels) and
 `return_extra_truth=True` (energyfrac / trackid / truth charge); for shards
 they are baked in at creation time via `create_shards.py --with_pixel_truth`
-/ `--with_extra_truth` (plus `--n_shards N` for a small fixed diagnostics
-subset), and `APASparseShardedDataset` then auto-detects what is present.
+/ `--with_extra_truth`; on the readers they are opt-in flags
+(`return_pixel_truth`/`return_extra_truth`) so training never pays for
+truth it does not use.
 
 ## Productions
 

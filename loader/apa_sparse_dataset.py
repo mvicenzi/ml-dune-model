@@ -1,6 +1,7 @@
 # loader/apa_sparse_dataset.py
 
 import hashlib
+import os
 import h5py
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -113,7 +114,11 @@ class APASparseDataset(Dataset):
 
     def _save_index_pt(self, cache_file: Path, samples: List[APASampleIndex]):
         data = [(str(s.path), s.group) for s in samples]
-        torch.save(data, cache_file)
+        # Atomic write (tmp + rename): concurrent jobs sharing a cache dir
+        # can never observe a half-written index.
+        tmp = cache_file.with_suffix(f".tmp.{os.getpid()}")
+        torch.save(data, tmp)
+        os.replace(tmp, cache_file)
 
     def _load_index_pt(self, cache_file: Path) -> List[APASampleIndex]:
         data = torch.load(cache_file, map_location="cpu")

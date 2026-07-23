@@ -30,10 +30,9 @@ HDF5 layout per shard file:
 A metadata.json alongside records apa, view, n_samples, shard_size, seed and
 which truth tiers are present.
 
-Two use cases:
-  - Training shards: shard the FULL dataset (default) — omit --n_shards.
-  - Diagnostics shards: a small fixed random subset reused across checkpoint
-    extractions — pass --n_shards (e.g. 10) and --with_pixel_truth.
+The full dataset is always sharded. Checkpoint extraction/diagnostics read
+the same shard set deterministically (APASparseShardedDataset with
+shuffle=False + an image cap) — there is no separate diagnostics shard set.
 
 Usage:
     python -m loader.create_shards \\
@@ -41,7 +40,7 @@ Usage:
         --apa 0 --view W \\
         --outdir /path/to/shards \\
         --cache_dir /path/to/cache \\
-        [--shard_size 1000] [--seed 42] [--n_shards 10]
+        [--shard_size 1000] [--seed 42] [--num_workers 8]
         [--with_pixel_truth] [--with_extra_truth]
 
 The script skips existing shard files, so it can be safely re-run to resume
@@ -55,8 +54,10 @@ from pathlib import Path
 import h5py
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, Subset as TorchSubset
 
 from loader.apa_sparse_meta_dataset import APASparseMetaDataset
+from loader.pack_dataset import _Extract, _collate_first
 
 LABEL_FORMAT = "classes7_v1"
 CLASS_NAMES = ["Background", "Track", "Shower", "Michel", "DeltaRay", "Blip", "Other"]
@@ -76,12 +77,15 @@ def create_shards(
     cache_dir: str,
     shard_size: int = 1000,
     seed: int = 42,
-    n_shards: int = None,
     with_pixel_truth: bool = False,
     with_extra_truth: bool = False,
+    num_workers: int = 8,
 ) -> None:
     if with_extra_truth:
         with_pixel_truth = True
+
+    # Guard against fd exhaustion when streaming many worker results.
+    torch.multiprocessing.set_sharing_strategy("file_system")
 
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -101,14 +105,11 @@ def create_shards(
     rng = torch.Generator()
     rng.manual_seed(seed)
     indices = torch.randperm(n_total, generator=rng).tolist()
-
-    if n_shards is not None:
-        # Diagnostics mode: fixed random subset, reused across extractions.
-        indices = indices[: n_shards * shard_size]
     n_samples = len(indices)
 
     shards = [indices[i : i + shard_size] for i in range(0, n_samples, shard_size)]
-    print(f"Sharding     : {n_samples} samples → {len(shards)} x ~{shard_size} → {outdir}")
+    print(f"Sharding     : {n_samples} samples → {len(shards)} x ~{shard_size} → {outdir}"
+          f"  (num_workers={num_workers})")
 
     # Write metadata.json before the loop so a partial run is still usable.
     meta_out = {
@@ -126,11 +127,31 @@ def create_shards(
     with open(outdir / "metadata.json", "w") as fp:
         json.dump(meta_out, fp, indent=2)
 
-    for shard_idx, shard_indices in enumerate(shards):
+    # Parallel read: stream all events belonging to MISSING shards through
+    # worker processes (same _Extract pattern as pack_dataset), cutting the
+    # ordered stream into shards as it arrives. Existing shard files are
+    # skipped without reading their events, so interrupted runs resume fast.
+    pixel_keys = (("pixel_labels",) if with_pixel_truth else ()) + \
+                 (tuple(EXTRA_TRUTH_KEYS) if with_extra_truth else ())
+    missing = [(si, idxs) for si, idxs in enumerate(shards)
+               if not (outdir / f"shard_{si:05d}.h5").exists()]
+    n_skip = len(shards) - len(missing)
+    if n_skip:
+        print(f"  Resuming: {n_skip}/{len(shards)} shards already exist, skipped.")
+
+    flat_indices = [i for _, idxs in missing for i in idxs]
+    wrapped = TorchSubset(_Extract(dataset, pixel_keys), flat_indices)
+    loader = DataLoader(
+        wrapped,
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=_collate_first,
+    )
+    stream = iter(loader)
+
+    for shard_idx, shard_indices in missing:
         outpath = outdir / f"shard_{shard_idx:05d}.h5"
-        if outpath.exists():
-            print(f"  [{shard_idx + 1}/{len(shards)}] skip (exists): {outpath.name}")
-            continue
 
         coords_list, feats_list, pixlbl_list = [], [], []
         extra_lists = {k: [] for k in EXTRA_TRUTH_KEYS} if with_extra_truth else {}
@@ -139,10 +160,7 @@ def create_shards(
         vertex_xyz, event_keys = [], []
 
         for i, idx in enumerate(shard_indices):
-            voxels, meta = dataset[idx]
-
-            c = voxels.coordinate_tensor.numpy()   # (N, 2) int32
-            f = voxels.feature_tensor.numpy()      # (N, 1) float32
+            c, f, meta = next(stream)
 
             coords_list.append(c)
             feats_list.append(f)
@@ -163,7 +181,7 @@ def create_shards(
             nu_ccnc.append(meta["nu_ccnc"])
             nu_intType.append(meta["nu_intType"])
             nu_energy.append(float(meta["nu_energy"]))
-            vertex_xyz.append(meta["vertex_xyz"].numpy())   # (3,) float32
+            vertex_xyz.append(np.asarray(meta["vertex_xyz"], dtype=np.float32))
             event_keys.append(meta["event_key"].encode("utf-8"))
 
             if (i + 1) % 200 == 0 or (i + 1) == len(shard_indices):
@@ -210,14 +228,13 @@ def main() -> None:
     parser.add_argument("--cache_dir",  required=True,           help="Dataset index cache directory")
     parser.add_argument("--shard_size", type=int, default=1000,  help="Images per shard (default: 1000)")
     parser.add_argument("--seed",       type=int, default=42,    help="Random seed for the shuffle (default: 42)")
-    parser.add_argument("--n_shards",   type=int, default=None,
-                        help="Only shard a random subset of n_shards*shard_size samples "
-                             "(diagnostics mode); default: shard the full dataset")
     parser.add_argument("--with_pixel_truth", action="store_true",
                         help="Also store per-pixel class labels (pixel_labels)")
     parser.add_argument("--with_extra_truth", action="store_true",
                         help="Also store pixel_energyfrac/pixel_trackid/pixel_truth_q "
                              "(implies --with_pixel_truth)")
+    parser.add_argument("--num_workers", type=int, default=8,
+                        help="DataLoader workers for the raw read (default: 8)")
     args = parser.parse_args()
 
     create_shards(
@@ -228,9 +245,9 @@ def main() -> None:
         cache_dir=args.cache_dir,
         shard_size=args.shard_size,
         seed=args.seed,
-        n_shards=args.n_shards,
         with_pixel_truth=args.with_pixel_truth,
         with_extra_truth=args.with_extra_truth,
+        num_workers=args.num_workers,
     )
 
 

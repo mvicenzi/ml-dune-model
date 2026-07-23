@@ -202,7 +202,9 @@ def main(
                           Point this at the same persistent cache used during training
                           to avoid re-scanning the full dataset on every run.
         truth_shards_dir: Path to a truth shard set created by loader/create_shards.py
-                          (--n_shards N --with_pixel_truth).
+                          (--with_pixel_truth; the full training shard set —
+                          shuffle=False + max_images gives a deterministic
+                          subset, identical across checkpoints).
                           When provided, data is loaded from the pre-built shards instead of
                           the original dataset, giving fast sequential I/O regardless of
                           the underlying filesystem. The shard apa/view are asserted against
@@ -231,6 +233,7 @@ def main(
         # shuffle=False -> deterministic event order, identical across checkpoints.
         dataset = APASparseShardedDataset(
             truth_shards_dir, batch_size=batch_size, shuffle=False,
+            return_pixel_truth=True,
         )
         if dataset.apa is not None and dataset.apa != cfg.apa:
             raise ValueError(f"Shard apa={dataset.apa} != checkpoint apa={cfg.apa}")
