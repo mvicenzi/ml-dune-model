@@ -5,6 +5,9 @@ Helpers for setting up the environment and submitting jobs to the SDCC HTCondor 
 ## Layout
 
 - `build_env.sh` / `build.sub` — one-time environment setup (shared by all job types, see below).
+- `monitor.sh` — one-shot fleet snapshot: condor state, epoch progress, and latest
+  synced checkpoint per run (`bash monitor.sh [run_name ...]`; no args = every
+  `dino-*` batch in the queue; wrap in `watch` for a live view).
 - [datagen/](datagen/README.md) — dataset container generation (shards / packs), CPU-only jobs.
 - [train/](train/README.md) — training jobs, plus the run configuration JSONs.
 - [diagnostics/](diagnostics/README.md) — post-training feature extraction and diagnostics plots.

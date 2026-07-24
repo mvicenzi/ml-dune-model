@@ -35,8 +35,17 @@ GPU_REQUIREMENTS="${GPU_REQUIREMENTS:-(GPUs_DeviceName == \"NVIDIA L40S\") && (G
 
 
 # ---- Args / validation -----------------------------------------------------
+SMOKE=0
+if [ "${1:-}" = "--smoke" ]; then
+  SMOKE=1
+  shift
+fi
+
 if [ $# -ne 1 ]; then
-  echo "usage: $0 <run_config.json>" >&2
+  echo "usage: $0 [--smoke] <run_config.json>" >&2
+  echo "  --smoke  derive and submit a reduced-scale smoke run from the config" >&2
+  echo "           (run_name+=_smoke, epochs=\${SMOKE_EPOCHS:-2}," >&2
+  echo "            n_subset=\${SMOKE_NSUBSET:-2000}, save_every=1)" >&2
   exit 2
 fi
 
@@ -56,17 +65,45 @@ if [ -z "$run_name" ] || [ "$run_name" = "None" ]; then
   exit 1
 fi
 
+if [ "$SMOKE" -eq 1 ]; then
+  run_name="${run_name}_smoke"
+fi
+
 out_dir="${CONDOR_OUT}/${run_name}"
 
 if [ -d "$out_dir" ]; then
-  echo "ERROR: ${out_dir} already exists." >&2
-  echo "       Choose a new run_name or delete the directory and retry." >&2
-  exit 1
+  if [ "$SMOKE" -eq 1 ]; then
+    # Smoke runs are disposable and get re-run while iterating on a config.
+    echo "Removing previous smoke run directory: ${out_dir}"
+    rm -rf "$out_dir"
+  else
+    echo "ERROR: ${out_dir} already exists." >&2
+    echo "       Choose a new run_name or delete the directory and retry." >&2
+    exit 1
+  fi
 fi
 
 # ---- Layout ----------------------------------------------------------------
 echo "Creating run directory: ${out_dir}"
 mkdir -p "$out_dir"
+
+# Derive the reduced-scale smoke config next to the .sub for provenance.
+# warmup_epochs is clamped so the LR schedule leaves warmup within the run.
+if [ "$SMOKE" -eq 1 ]; then
+  SMOKE_EPOCHS="${SMOKE_EPOCHS:-2}"
+  SMOKE_NSUBSET="${SMOKE_NSUBSET:-2000}"
+  smoke_config="${out_dir}/${run_name}.json"
+  jq --arg rn "$run_name" --argjson e "$SMOKE_EPOCHS" --argjson n "$SMOKE_NSUBSET" \
+     '.run_name = $rn | .epochs = $e | .n_subset = $n | .save_every = 1
+      | .warmup_epochs = (if .warmup_epochs > $e then 1 else .warmup_epochs end)' \
+     "$config" > "$smoke_config"
+  config="$smoke_config"
+  echo "Smoke run: epochs=${SMOKE_EPOCHS} n_subset=${SMOKE_NSUBSET} (config: ${smoke_config})"
+fi
+
+# NB: with should_transfer_files=NO Condor executes trainjob.sh IN PLACE from
+# the repo on the shared filesystem -- do not edit it while jobs that use it
+# are queued or running (bash reads scripts incrementally as they execute).
 
 subfile="${out_dir}/${run_name}.sub"
 cat > "$subfile" <<EOF
@@ -75,6 +112,7 @@ notification            = never
 executable              = ${REPODIR}/gridutils/train/trainjob.sh
 arguments               = ${REPODIR} ${PYENV} ${config} ${out_dir} ${CACHE_DIR} ${run_name}
 environment             = "CLUSTER_ID=\$(ClusterId) JOB_ID=\$(ProcId)"
++JobBatchName           = "dino-${run_name}"
 output                  = ${out_dir}/\$(ClusterId).\$(ProcId).out
 error                   = ${out_dir}/\$(ClusterId).\$(ProcId).err
 log                     = ${out_dir}/\$(ClusterId).\$(ProcId).log
@@ -88,4 +126,8 @@ queue 1
 EOF
 
 echo "Submitting ${subfile}"
-condor_submit "$subfile"
+if [ "${DRYRUN:-0}" = "1" ]; then
+  echo "DRYRUN=1: not submitting."
+else
+  condor_submit "$subfile"
+fi
