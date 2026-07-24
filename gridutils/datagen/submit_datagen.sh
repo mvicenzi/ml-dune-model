@@ -3,21 +3,21 @@
 # Submit a CPU-only dataset-generation job (shard/pack creation) to Condor.
 #
 # Usage:
-#   bash gridutils/submit_datagen.sh <job_name> <module> [args...]
+#   bash gridutils/datagen/submit_datagen.sh <job_name> <module> [args...]
 #
 # Examples (DATA = production root; outputs under /gpfs01/lbne/users/fm/$USER):
 #   DATA=/gpfs01/lbne/users/bnayak/cffm-data/prod-jay-100k-truth-2026-06-11
 #   OUT=/gpfs01/lbne/users/fm/${USER}/cffm-data
 #
 #   # full training shards (full truth; extraction reads the same set):
-#   bash gridutils/submit_datagen.sh shards_mixed_apa0W \
+#   bash gridutils/datagen/submit_datagen.sh shards_mixed_apa0W \
 #       loader.create_shards --datadir $DATA --apa 0 --view W \
 #       --outdir $OUT/shards_prod-jay-2026-06-11_mixed_apa0W \
 #       --cache_dir /gpfs01/lbne/users/fm/${USER}/cache/data \
 #       --with_extra_truth --num_workers 8
 #
 #   # packed .npz (RAM-heavy: ~45 GB peak at 200k events):
-#   REQUEST_MEMORY=64000 bash gridutils/submit_datagen.sh pack_mixed_apa0W \
+#   REQUEST_MEMORY=64000 bash gridutils/datagen/submit_datagen.sh pack_mixed_apa0W \
 #       loader.pack_dataset --datadir $DATA --apa 0 --view W \
 #       --out_path $OUT/packed/prod-jay-2026-06-11_mixed_apa0W.npz \
 #       --cache_dir /gpfs01/lbne/users/fm/${USER}/cache/data --num_workers 8
@@ -62,7 +62,7 @@ subfile="${out_dir}/${job_name}.sub"
 cat > "$subfile" <<EOF
 universe                = vanilla
 notification            = never
-executable              = ${REPODIR}/gridutils/datajob.sh
+executable              = ${REPODIR}/gridutils/datagen/datajob.sh
 arguments               = ${REPODIR} ${PYENV} $*
 environment             = "CLUSTER_ID=\$(ClusterId) JOB_ID=\$(ProcId)"
 output                  = ${out_dir}/\$(ClusterId).\$(ProcId).out
