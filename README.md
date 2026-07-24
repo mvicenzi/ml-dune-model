@@ -37,7 +37,7 @@ The script uses [python-fire](https://github.com/google/python-fire) for CLI arg
 ```bash
 python dino/train_dino.py
 python dino/train_dino.py --backbone_name=attn_default --epochs=100 --batch_size=16 --mask_ratio=0.5
-python dino/train_dino.py --epochs=2 --batch_size=4 --test_mode=True --debug=True
+python dino/train_dino.py --epochs=2 --batch_size=4 --n_subset=2000 --debug=True
 ```
 
 ## Data loaders
