@@ -3,7 +3,7 @@
 # DINO training submission to SDCC GPU pool.
 #
 # Usage:
-#   bash gridutils/submit.sh <path/to/run_config.json>
+#   bash gridutils/train/submit.sh <path/to/run_config.json>
 #
 # The JSON config is the single source of truth for the run.  The submitter
 # extracts run_name from it, lays out ${CONDOR_OUT}/${run_name}/, generates
@@ -72,7 +72,7 @@ subfile="${out_dir}/${run_name}.sub"
 cat > "$subfile" <<EOF
 universe                = vanilla
 notification            = never
-executable              = ${REPODIR}/gridutils/trainjob.sh
+executable              = ${REPODIR}/gridutils/train/trainjob.sh
 arguments               = ${REPODIR} ${PYENV} ${config} ${out_dir} ${CACHE_DIR} ${run_name}
 environment             = "CLUSTER_ID=\$(ClusterId) JOB_ID=\$(ProcId)"
 output                  = ${out_dir}/\$(ClusterId).\$(ProcId).out

@@ -9,14 +9,16 @@ Usage:
 import fire
 import inspect
 import json
+import resource
 import sys
+import time
 import torch
 import torch.optim as optim
 from pathlib import Path
 from torch.utils.data import DataLoader
 
-from loader.apa_sparse_dataset import APASparseDataset
-from loader.collate import voxels_collate_fn
+from loader.apa_sparse_meta_dataset import APASparseMetaDataset
+from loader.collate import voxels_meta_collate_fn
 from loader.splits import Subset
 
 from .config import DINOConfig
@@ -68,7 +70,7 @@ def main(
     weight_decay: float = 0.04,
     weight_decay_end: float = 0.4,
     warmup_epochs: int = 1,
-    datadir: str = "/nfs/data/1/yuhw/cffm-data/prod-jay-100k-truth-2026-02-27",
+    datadir: str = "/gpfs01/lbne/users/bnayak/cffm-data/prod-jay-100k-truth-2026-06-11",
     cache_dir: str = "./data",
     use_log_transform: bool = True,
     feat_min_val: float = 3.75,
@@ -85,6 +87,8 @@ def main(
     use_sharded: bool = False,
     sharded_dir: str = "",
     buffer_size: int = 3000,
+    use_packed: bool = False,
+    packed_path: str = "",
 ):
     """
     DINO training loop for DUNE detector.
@@ -135,6 +139,11 @@ def main(
         run_name: Optional label; outputs go to debug_dir/run_name/ if set
         test_mode: Use small subset for quick smoke tests
         num_workers: Number of dataloader workers
+        use_sharded: Stream from pre-sharded HDF5 (loader/create_shards.py)
+        sharded_dir: Directory with shard_*.h5 + metadata.json
+        buffer_size: Shuffle-buffer size for the sharded reader
+        use_packed: Load a packed .npz fully into RAM (loader/pack_dataset.py)
+        packed_path: Path to the packed .npz file
     """
     # ============ Setup ============
     device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -205,6 +214,8 @@ def main(
         use_sharded=use_sharded,
         sharded_dir=sharded_dir,
         buffer_size=buffer_size,
+        use_packed=use_packed,
+        packed_path=packed_path,
     )
 
     print(f"Device: {device}")
@@ -259,6 +270,9 @@ def main(
     print(f"  var_gamma           = {cfg.var_gamma}")
 
     # ============ Data ============
+    if cfg.use_sharded and cfg.use_packed:
+        raise ValueError("use_sharded and use_packed are mutually exclusive")
+
     if cfg.use_sharded:
         from loader.apa_sparse_sharded_dataset import APASparseShardedDataset
         print(f"\nLoading sharded dataset: {cfg.sharded_dir}")
@@ -271,14 +285,37 @@ def main(
         )
         train_loader = DataLoader(
             dataset,
+            # The reader yields pre-batched (voxels, meta) and shuffles
+            # internally (epoch shard reshuffle + shuffle buffer); DataLoader
+            # batching/shuffling must stay off for an IterableDataset.
             batch_size=None,
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
         )
+    elif cfg.use_packed:
+        from loader.apa_packed_dataset import APAPackedDataset
+        print(f"\nLoading packed dataset: {cfg.packed_path}")
+        print(f"  batch_size = {batch_size}")
+        dataset = APAPackedDataset(cfg.packed_path)
+        train_loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            collate_fn=voxels_meta_collate_fn,
+            # drop_last matches the sharded reader's implicit drop of the
+            # trailing partial batch — identical steps/epoch, so LR/WD/momentum
+            # schedules line up exactly in packed-vs-sharded comparisons.
+            drop_last=True,
+            # Dedicated generator: the shuffle sequence is reproducible and
+            # independent of upstream RNG consumption.
+            generator=torch.Generator().manual_seed(42),
+        )
     else:
         print("\nLoading dataset:", cfg.datadir)
-        dataset = APASparseDataset(
+        dataset = APASparseMetaDataset(
             datadir=cfg.datadir,
             apa=cfg.apa,
             view=cfg.view,
@@ -288,7 +325,8 @@ def main(
         if test_mode:
             n_subset = 100000
             print(f"TEST MODE: using {n_subset} samples")
-            subset_indices = torch.randperm(len(dataset))[:n_subset]
+            rng = torch.Generator().manual_seed(42)
+            subset_indices = torch.randperm(len(dataset), generator=rng)[:n_subset]
             dataset = Subset(dataset, subset_indices)
         train_loader = DataLoader(
             dataset,
@@ -296,7 +334,10 @@ def main(
             shuffle=True,
             num_workers=num_workers,
             pin_memory=True,
-            collate_fn=voxels_collate_fn,
+            collate_fn=voxels_meta_collate_fn,
+            # Dedicated generator: shuffle order is a pure function of the
+            # seed, independent of upstream RNG consumption (see packed branch).
+            generator=torch.Generator().manual_seed(42),
         )
 
     print(f"Dataset size: {len(dataset)}")
@@ -421,7 +462,16 @@ def main(
         # set model to training mode
         model.train()
 
-        for batch_idx, xs in enumerate(train_loader):
+        # Per-epoch timing: wall clock + time spent waiting on the data loader.
+        epoch_t0 = time.perf_counter()
+        data_wait = 0.0
+        t_fetch = time.perf_counter()
+
+        for batch_idx, batch in enumerate(train_loader):
+            data_wait += time.perf_counter() - t_fetch
+
+            # Every data branch yields (voxels, meta); training ignores the truth.
+            xs, _ = batch
 
             iteration = (epoch - 1) * epoch_len + batch_idx
             xs = xs.to(device)
@@ -493,6 +543,21 @@ def main(
                 mem_str = f", gpu={debugger.last_peak_alloc_gib:.2f}GiB"
                 print(f"[{epoch}/{epochs}] iter {iteration}: loss={loss_val:.6f}, "
                       f"lr={lr_val:.2e}, mom={mom_val:.6f}{cov_str}{var_str}{mem_str}")
+
+            t_fetch = time.perf_counter()
+
+        # One line per epoch: wall clock, data-loader wait, throughput, peak RSS
+        # self = main process incl. in-RAM packed dataset
+        # workers = exited dataloader workers
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        wall = time.perf_counter() - epoch_t0
+        n_samples = epoch_len * batch_size
+        rss_self = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2
+        rss_kids = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024**2
+        print(f"[timing] epoch={epoch} wall={wall:.1f}s data_wait={data_wait:.1f}s "
+              f"({100*data_wait/max(wall,1e-9):.1f}%) samples_per_sec={n_samples/max(wall,1e-9):.1f} "
+              f"peak_rss_self={rss_self:.2f}GiB peak_rss_workers={rss_kids:.2f}GiB")
 
         # Save model checkpoint
         if epoch % save_every == 0 or epoch == epochs:

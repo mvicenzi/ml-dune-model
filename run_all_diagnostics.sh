@@ -63,8 +63,8 @@ echo
 #python -m dino.diagnostics.plot_knn "$FEATURES" --out_dir="$OUT_DIR"
 #echo
 
-echo "--- [2/2] plot_knn_pid (ep${EPOCH}) ---"
-python -m dino.diagnostics.plot_knn_pid "$FEATURES" --out_dir="$OUT_DIR"
+echo "--- [2/2] plot_knn_pixel (ep${EPOCH}) ---"
+python -m dino.diagnostics.plot_knn_pixel "$FEATURES" --out_dir="$OUT_DIR"
 echo
 
 echo "=== Done. ==="

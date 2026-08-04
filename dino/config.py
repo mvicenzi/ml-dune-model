@@ -11,7 +11,9 @@ class DINOConfig:
     run_name: str = ""                # optional label; outputs go to debug_dir/run_name/ if set
 
     # ============ Data ============
-    datadir: str = "/nfs/data/1/yuhw/cffm-data/prod-jay-100k-truth-2026-02-27"
+    # Production root: mixes nominal + nueswap flavors (point at a flavor
+    # subdirectory for a single-flavor dataset).
+    datadir: str = "/gpfs01/lbne/users/bnayak/cffm-data/prod-jay-100k-truth-2026-06-11"
     apa: int = 0                      # which APA to train on
     view: str = "W"                   # which wire plane view ("U", "V", or "W")
     image_h: int = 1500               # spatial resolution: height (time ticks)
@@ -23,6 +25,8 @@ class DINOConfig:
     use_sharded: bool = False           # use pre-sharded HDF5 dataset (loader/create_shards.py)
     sharded_dir: str = ""               # path to directory containing shard_*.h5 files
     buffer_size: int = 3000             # shuffle-buffer size (samples) for sharded dataset
+    use_packed: bool = False            # use packed .npz dataset (loader/pack_dataset.py)
+    packed_path: str = ""               # path to the packed .npz file
     use_log_transform: bool = True     # apply FeatureLogTransform to raw charge before model
     feat_min_val: float = 3.75        # 2nd percentile of raw charge [ADC]; anchors y = -1
     feat_max_val: float = 83861.2     # 99.999th percentile of raw charge [ADC]; anchors y = +1
