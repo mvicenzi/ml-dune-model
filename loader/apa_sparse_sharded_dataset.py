@@ -75,6 +75,7 @@ class APASparseShardedDataset(IterableDataset):
         shuffle: bool = True,
         return_pixel_truth: bool = False,
         return_extra_truth: bool = False,
+        n_subset: int = -1,
     ):
         self.root_dir   = Path(root_dir)
         self.batch_size = batch_size
@@ -102,6 +103,16 @@ class APASparseShardedDataset(IterableDataset):
             # fallback: assume full shards (last may be partial, this is approximate)
             n_samples = len(self.shards) * 1000
             print(f"Warning: metadata.json not found in {root_dir}, __len__ is approximate")
+
+        if n_subset > 0:
+            # Cap at shard granularity: shards are creation-shuffled, so a
+            # prefix of the shard list is an unbiased subsample. Lets smoke
+            # configs (n_subset in the run config) keep epochs short.
+            with h5py.File(self.shards[0], "r") as f:
+                per_shard = int(f["offsets"].shape[0]) - 1
+            n_keep = -(-n_subset // per_shard)  # ceil division
+            self.shards = self.shards[:n_keep]
+            n_samples = min(n_samples, n_keep * per_shard)
 
         self._n_batches = n_samples // batch_size
 

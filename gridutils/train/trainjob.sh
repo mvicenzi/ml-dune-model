@@ -81,8 +81,22 @@ sync_back() {
   # syncs from multiple jobs are safe.
   rsync -a "${wp_cache}/" "${wp_cache_gpfs}/" || true
 }
-trap sync_back EXIT                      # flush scratch -> GPFS on any normal/error exit
-trap 'sync_back; exit 143' SIGTERM       # on scheduler kill: flush, then exit 128+15 (SIGTERM)
+# Periodic mid-run sync: save_every-epoch checkpoints land in scratch as soon
+# as they're written, but via the EXIT trap alone they only reach GPFS when the
+# whole job ends -- invisible to monitoring/probing for the entire run. A
+# background loop re-runs the same idempotent sync_back every SYNC_INTERVAL
+# seconds. rsync writes each destination file to a temp name and renames, so
+# GPFS-visible files appear atomically; a checkpoint caught mid-write on the
+# source transfers truncated but is repaired on the next tick (and by the final
+# flush), so treat a checkpoint on GPFS as settled once a later one exists or
+# the mtime is > SYNC_INTERVAL old.
+SYNC_INTERVAL="${SYNC_INTERVAL:-300}"
+( while sleep "$SYNC_INTERVAL"; do sync_back; done ) &
+sync_loop_pid=$!
+stop_sync_loop() { kill "$sync_loop_pid" 2>/dev/null || true; }
+
+trap 'stop_sync_loop; sync_back' EXIT              # flush scratch -> GPFS on any normal/error exit
+trap 'stop_sync_loop; sync_back; exit 143' SIGTERM # on scheduler kill: flush, then exit 128+15 (SIGTERM)
 
 echo "Executing train_dino.py ..."
 

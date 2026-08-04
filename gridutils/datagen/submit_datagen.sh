@@ -65,6 +65,7 @@ notification            = never
 executable              = ${REPODIR}/gridutils/datagen/datajob.sh
 arguments               = ${REPODIR} ${PYENV} $*
 environment             = "CLUSTER_ID=\$(ClusterId) JOB_ID=\$(ProcId)"
++JobBatchName           = "datagen-${job_name}"
 output                  = ${out_dir}/\$(ClusterId).\$(ProcId).out
 error                   = ${out_dir}/\$(ClusterId).\$(ProcId).err
 log                     = ${out_dir}/\$(ClusterId).\$(ProcId).log

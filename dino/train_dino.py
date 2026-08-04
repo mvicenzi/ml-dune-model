@@ -3,7 +3,7 @@ DINO training script for DUNE sparse UNet backbone.
 
 Usage:
     python dino/train_dino.py --epochs=100 --batch_size=16 --backbone_name=attn_default
-    python dino/train_dino.py --epochs=2 --batch_size=4 --test_mode=True --debug=True
+    python dino/train_dino.py --epochs=2 --batch_size=4 --n_subset=2000 --debug=True
 """
 
 import fire
@@ -71,6 +71,7 @@ def main(
     weight_decay_end: float = 0.4,
     warmup_epochs: int = 1,
     datadir: str = "/gpfs01/lbne/users/bnayak/cffm-data/prod-jay-100k-truth-2026-06-11",
+    n_subset: int = -1,
     cache_dir: str = "./data",
     use_log_transform: bool = True,
     feat_min_val: float = 3.75,
@@ -82,7 +83,6 @@ def main(
     debug_every: int = 100,
     debug_dir: str = "./dino_debug",
     run_name: str = "",
-    test_mode: bool = True,
     num_workers: int = 4,
     use_sharded: bool = False,
     sharded_dir: str = "",
@@ -129,6 +129,8 @@ def main(
         weight_decay_end: Final weight decay (cosine annealed)
         warmup_epochs: Linear warmup duration
         datadir: Root directory of the sparse dataset on disk
+        n_subset: Cap the dataset at N samples (-1 = full dataset); applies to
+            all dataset paths (raw, sharded at shard granularity, packed)
         cache_dir: Where to cache the dataset index .pt file
         output_dir: Where to save checkpoints
         save_every: Save checkpoint every N epochs
@@ -137,7 +139,6 @@ def main(
         debug_every: Log scalars / stats / grad norms every N batches
         debug_dir: Base directory for debug outputs
         run_name: Optional label; outputs go to debug_dir/run_name/ if set
-        test_mode: Use small subset for quick smoke tests
         num_workers: Number of dataloader workers
         use_sharded: Stream from pre-sharded HDF5 (loader/create_shards.py)
         sharded_dir: Directory with shard_*.h5 + metadata.json
@@ -199,6 +200,7 @@ def main(
         warmup_epochs=warmup_epochs,
         epochs=epochs,
         datadir=datadir,
+        n_subset=n_subset,
         use_log_transform=use_log_transform,
         feat_min_val=feat_min_val,
         feat_max_val=feat_max_val,
@@ -278,10 +280,12 @@ def main(
         print(f"\nLoading sharded dataset: {cfg.sharded_dir}")
         print(f"  batch_size  = {batch_size}")
         print(f"  buffer_size = {cfg.buffer_size}")
+        print(f"  n_subset    = {cfg.n_subset}")
         dataset = APASparseShardedDataset(
             root_dir=cfg.sharded_dir,
             batch_size=batch_size,
             buffer_size=cfg.buffer_size,
+            n_subset=cfg.n_subset,
         )
         train_loader = DataLoader(
             dataset,
@@ -297,7 +301,12 @@ def main(
         from loader.apa_packed_dataset import APAPackedDataset
         print(f"\nLoading packed dataset: {cfg.packed_path}")
         print(f"  batch_size = {batch_size}")
+        print(f"  n_subset   = {cfg.n_subset}")
         dataset = APAPackedDataset(cfg.packed_path)
+        if cfg.n_subset > 0:
+            rng = torch.Generator().manual_seed(42)
+            subset_indices = torch.randperm(len(dataset), generator=rng)[: cfg.n_subset]
+            dataset = Subset(dataset, subset_indices)
         train_loader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -315,6 +324,7 @@ def main(
         )
     else:
         print("\nLoading dataset:", cfg.datadir)
+        print(f"  n_subset = {cfg.n_subset}")
         dataset = APASparseMetaDataset(
             datadir=cfg.datadir,
             apa=cfg.apa,
@@ -322,11 +332,10 @@ def main(
             use_cache=True,
             cache_dir=cfg.cache_dir,
         )
-        if test_mode:
-            n_subset = 100000
-            print(f"TEST MODE: using {n_subset} samples")
+        if cfg.n_subset > 0:
+            print(f"Using subset: {cfg.n_subset} samples")
             rng = torch.Generator().manual_seed(42)
-            subset_indices = torch.randperm(len(dataset), generator=rng)[:n_subset]
+            subset_indices = torch.randperm(len(dataset), generator=rng)[: cfg.n_subset]
             dataset = Subset(dataset, subset_indices)
         train_loader = DataLoader(
             dataset,
@@ -585,7 +594,6 @@ def from_config(
     config_path: str,
     run_name: str = "",
     device: str = "cuda",
-    test_mode: bool = False,
     **overrides,
 ):
     """
@@ -596,16 +604,15 @@ def from_config(
     so old configs with stale or missing keys work without errors.
     Missing fields fall back to main()'s defaults.
 
-    `run_name`, `device`, and `test_mode` are named parameters here (so they
-    appear in --help); everything else is passed as **overrides kwargs.  Any
-    main() parameter can be overridden either way.
+    `run_name` and `device` are named parameters here (so they appear in
+    --help); everything else is passed as **overrides kwargs.  Any main()
+    parameter can be overridden either way.
 
     Args:
         config_path: Path to the run_config.json file
         run_name: Override run name (determines output sub-directories)
         device: Override device ("cuda" or "cpu")
-        test_mode: Override test_mode flag
-        **overrides: Any additional main() parameter to override (e.g. use_cov_penalty=True)
+        **overrides: Any additional main() parameter to override (e.g. n_subset=2000)
     """
     with open(config_path) as f:
         raw = json.load(f)
@@ -633,7 +640,6 @@ def from_config(
     if run_name:
         kwargs["run_name"] = run_name
     kwargs["device"] = device
-    kwargs["test_mode"] = test_mode
     for k, v in overrides.items():
         if k in valid_params:
             kwargs[k] = v
