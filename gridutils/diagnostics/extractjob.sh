@@ -58,7 +58,7 @@ data_cache="${cache_dir}/data"
 mkdir -p "$data_cache"
 
 PYTHONPATH="$codedir${PYTHONPATH:+:$PYTHONPATH}" \
-    python -u -m dino.diagnostics.extract_features \
+    python -u -m probes.extract_features \
         "$checkpoint" \
         --pixel_truth \
         --device=cuda \

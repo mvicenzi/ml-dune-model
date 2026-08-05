@@ -20,7 +20,7 @@ For the environment setup and the SDCC directory layout, see [../README.md](../R
 ```
 
 Bare integers are parsed as epochs; `--flag` style args are forwarded verbatim
-to `dino.diagnostics.extract_features` (in addition to `--pixel_truth`, which
+to `probes.extract_features` (in addition to `--pixel_truth`, which
 is always passed; see [extractjob.sh](extractjob.sh)).
 Logs go to `${CONDOR_OUT}/<run_name>_extract/`.
 

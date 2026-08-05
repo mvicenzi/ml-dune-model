@@ -12,7 +12,7 @@
 #   submit_extract.sh myrun 10 --max_images=5000     # epoch 10, limit images
 #
 # Epoch numbers (bare integers) and --flag style args are told apart automatically.
-# Extra flags are forwarded verbatim to dino.diagnostics.extract_features
+# Extra flags are forwarded verbatim to probes.extract_features
 # (in addition to --pixel_truth which is always passed; see extractjob.sh).
 # One Condor job is submitted per checkpoint; logs go to ${CONDOR_OUT}/<run_name>_extract/.
 
@@ -104,6 +104,24 @@ if [ -d "$TRUTH_SHARDS_DIR" ]; then
   if ! $already_set; then
     extra_args+=("--truth_shards_dir=${TRUTH_SHARDS_DIR}")
     echo "Truth shards  -> ${TRUTH_SHARDS_DIR}"
+  fi
+fi
+
+# Auto-inject --extra_truth when the shard set carries the extra per-pixel tiers
+# (pixel_energyfrac / pixel_trackid / pixel_truth_q). The instance, charge and
+# overlap-strata probes need them; asking for them against a shard set that lacks
+# them would abort the job, hence the metadata check rather than a blind default.
+# Set EXTRA_TRUTH=0 to opt out.
+EXTRA_TRUTH="${EXTRA_TRUTH:-1}"
+meta="${TRUTH_SHARDS_DIR}/metadata.json"
+if [ "$EXTRA_TRUTH" = "1" ] && [ -f "$meta" ] && grep -q '"extra_truth"[[:space:]]*:[[:space:]]*true' "$meta"; then
+  already_set=false
+  for a in "${extra_args[@]}"; do
+    [[ "$a" == --extra_truth* ]] && already_set=true && break
+  done
+  if ! $already_set; then
+    extra_args+=("--extra_truth")
+    echo "Extra truth   -> enabled (shard metadata reports extra_truth: true)"
   fi
 fi
 

@@ -32,11 +32,22 @@ Output (.npz):
     pixel_labels      [N_valid]      int8      per-pixel class label (0=Background/no-truth,
                                                1=Track 2=Shower 3=Michel 4=DeltaRay 5=Blip 6=Other)
                                                only present when extracted with --pixel_truth
+    pixel_energyfrac  [N_valid]      float32   leading contributor's energy share (→ overlap score)
+    pixel_trackid     [N_valid]      int32     truth track id, signed (→ instance id via abs())
+    pixel_truth_q     [N_valid]      float32   truth deposited charge (electrons)
+                                               the three above only with --extra_truth
+
+Provenance scalars (always written; consumed by probes/protocol.py so a metric
+can never be mis-scored against the wrong charge transform):
+    epoch, backbone_name, encoding_range, feature_dim, apa, view,
+    use_log_transform, feat_min_val, feat_max_val, backbone_kwargs_applied,
+    extraction_source ("raw" | "shards" | "packed")
 """
 
 import fire
 import itertools
 import inspect
+import json
 import numpy as np
 import torch
 from pathlib import Path
@@ -50,19 +61,47 @@ from dino.config import DINOConfig
 from dino.projhead import DINOProjectionHead
 from dino.transforms import FeatureLogTransform
 
+# Per-pixel truth tiers and their stored dtypes. pixel_labels comes with
+# --pixel_truth; the rest need --extra_truth (all three readers support both).
+PIXEL_TRUTH_KEYS = {
+    "pixel_labels":     np.int8,
+    "pixel_energyfrac": np.float32,
+    "pixel_trackid":    np.int32,
+    "pixel_truth_q":    np.float32,
+}
+
 
 def _load_backbone(ckpt: dict, key: str, device: torch.device):
+    """Rebuild a backbone from a checkpoint, exactly as training built it.
+
+    The kwarg filter below is deliberately the same single-level
+    `inspect.signature` check `dino/model.py` uses, so a rebuilt backbone is the
+    architecture that was actually trained rather than the one the config
+    describes. Those differ today: MAE backbones declare `__init__(self, **kw)`,
+    which `inspect.signature` cannot see through, so `encoding_range` is dropped
+    on both sides and training silently used the hardcoded default. Reproducing
+    that faithfully is the point — "fixing" it here alone would score a network
+    against a positional encoding it was never trained with.
+
+    For the encoding specifically this is belt-and-braces: warpconvnet's
+    SinusoidalEncoding consumes data_range only to build its `freqs` buffer, and
+    that buffer is persistent, so load_state_dict restores the trained table
+    regardless. The strict load below is what actually guarantees the rebuild
+    matches: any architectural mismatch raises instead of leaving random weights.
+
+    Returns (model, applied_kwargs) — the kwargs are recorded in the output .npz.
+    """
     cfg = ckpt["cfg"]
     backbone_cls = BACKBONE_REGISTRY[cfg.backbone_name]
     backbone_kwargs = {}
     if "encoding_range" in inspect.signature(backbone_cls.__init__).parameters:
         backbone_kwargs["encoding_range"] = cfg.encoding_range
     model = backbone_cls(**backbone_kwargs).to(device)
-    model.load_state_dict(ckpt[key])
+    model.load_state_dict(ckpt[key])          # strict: mismatches must be loud
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
-    return model
+    return model, backbone_kwargs
 
 
 def _load_head(ckpt: dict, key: str, device: torch.device):
@@ -98,7 +137,7 @@ def _run_loader(student, teacher, loader, device, normalizer=None, student_head=
 
     labels_all, pdg_all, ccnc_all, intType_all, energy_all = [], [], [], [], []
     vertex_all, event_keys_all = [], []
-    pixel_labels_all = []
+    pixel_truth_all = {k: [] for k in PIXEL_TRUTH_KEYS}
 
     have_head = student_head is not None
 
@@ -113,6 +152,30 @@ def _run_loader(student, teacher, loader, device, normalizer=None, student_head=
 
         s_out = student(xs)                             # Voxels [N_active, D_bb]
         t_out = teacher(xs)                             # Voxels [N_active, D_bb]
+
+        # Per-pixel truth is CSR-aligned to the INPUT voxels, and features are
+        # sliced by the input offsets below, so output row i must still describe
+        # input pixel i. That holds by construction for these backbones — the
+        # decoder's transposed convs are geometry-guided (ConvTrBlock2D upsamples
+        # onto the skip tensor's coordinates) and the full-resolution skip is the
+        # stride-1 stem, so the active set and its order are the input's. The
+        # check costs an int compare per batch and converts a future generative or
+        # pruning layer from silently mislabelled features into a loud failure.
+        for name, out in (("student", s_out), ("teacher", t_out)):
+            if not torch.equal(out.offsets, xs.offsets):
+                raise RuntimeError(
+                    f"{name} backbone changed the per-event voxel counts "
+                    f"({out.offsets.tolist()[:5]}... vs input "
+                    f"{xs.offsets.tolist()[:5]}...). Per-pixel truth alignment is "
+                    f"no longer positional; extraction must join on coordinates."
+                )
+            if not torch.equal(out.coordinate_tensor, xs.coordinate_tensor):
+                n_diff = int((out.coordinate_tensor != xs.coordinate_tensor).any(1).sum())
+                raise RuntimeError(
+                    f"{name} backbone reordered or moved {n_diff} voxel coordinates. "
+                    f"Per-pixel truth alignment is no longer positional; extraction "
+                    f"must join features to truth on (channel, tick)."
+                )
 
         coords   = xs.coordinate_tensor.cpu()              # [N_active, 2]
         charges  = input_charges.cpu()                     # [N_active, 1]
@@ -149,11 +212,12 @@ def _run_loader(student, teacher, loader, device, normalizer=None, student_head=
         vertex_all.append(meta["vertex_xyz"].numpy())   # [B, 3]
         event_keys_all.extend(meta["event_key"])
 
-        # Optional pixel-level PID truth (list of B arrays, one per image)
-        if "pixel_labels" in meta:
-            pixel_labels_all.extend(meta["pixel_labels"])
+        # Optional per-pixel truth tiers (each a list of B arrays, one per image)
+        for key in PIXEL_TRUTH_KEYS:
+            if key in meta:
+                pixel_truth_all[key].extend(meta[key])
 
-    return {
+    out = {
         "student_features":      np.concatenate(s_feats_all, axis=0).astype(np.float16),
         "teacher_features":      np.concatenate(t_feats_all, axis=0).astype(np.float16),
         "student_head_features": (np.concatenate(s_head_all, axis=0).astype(np.float16) if have_head else None),
@@ -168,9 +232,11 @@ def _run_loader(student, teacher, loader, device, normalizer=None, student_head=
         "positions":  np.concatenate(pos_all,     axis=0).astype(np.int32),
         "charges":    np.concatenate(charges_all, axis=0).astype(np.float32),
         "offsets":    np.array(offsets, dtype=np.int64),
-        "pixel_labels": (np.concatenate(pixel_labels_all, axis=0).astype(np.int8)
-                       if pixel_labels_all else None),
     }
+    for key, dtype in PIXEL_TRUTH_KEYS.items():
+        parts = pixel_truth_all[key]
+        out[key] = np.concatenate(parts, axis=0).astype(dtype) if parts else None
+    return out
 
 
 def main(
@@ -181,8 +247,11 @@ def main(
     num_workers: int = 4,
     device: str = "cuda",
     pixel_truth: bool = False,
+    extra_truth: bool = False,
     cache_dir: str = "",
     truth_shards_dir: str = "",
+    packed_path: str = "",
+    output_prefix: str = "features_",
 ):
     """
     Extract DINO features from a trained checkpoint for PCA / probing.
@@ -196,8 +265,13 @@ def main(
         device:           "cuda" or "cpu"
         pixel_truth:      If True, also save per-pixel class labels (pixel_labels) from
                           frame_label_1st, enabling pixel-level PID k-NN analysis.
-                          Ignored when truth_shards_dir is set (pixel_labels present when
-                          the shards were created with --with_pixel_truth).
+                          With a shard set or pack, the container must have been
+                          built with the matching --with_pixel_truth flag.
+        extra_truth:      If True, additionally save pixel_energyfrac (→ overlap
+                          score), pixel_trackid (→ instance id) and pixel_truth_q
+                          (→ truth charge). Implies pixel_truth. These are what the
+                          instance / charge / overlap-strata probes need; the
+                          container must carry them (--with_extra_truth).
         cache_dir:        Directory for the dataset index cache. Defaults to ./data.
                           Point this at the same persistent cache used during training
                           to avoid re-scanning the full dataset on every run.
@@ -209,7 +283,21 @@ def main(
                           the original dataset, giving fast sequential I/O regardless of
                           the underlying filesystem. The shard apa/view are asserted against
                           the checkpoint config to catch mismatches early.
+        packed_path:      Path to a packed .npz built by loader/pack_dataset.py. Mutually
+                          exclusive with truth_shards_dir; same deterministic seeded
+                          subsetting as the raw path, so the event set matches across
+                          checkpoints.
+        output_prefix:    Basename prefix for the default output name
+                          (<prefix>ep<N>.npz). Use it to extract a second family
+                          of feature files alongside existing ones — e.g.
+                          --output_prefix=features_probe_ when adding the extra
+                          truth tiers without overwriting earlier extractions.
+                          Ignored when `output` is given explicitly.
     """
+    if extra_truth:
+        pixel_truth = True
+    if truth_shards_dir and packed_path:
+        raise ValueError("truth_shards_dir and packed_path are mutually exclusive")
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     ckpt_path = Path(checkpoint).resolve()
     if not ckpt_path.exists():
@@ -223,7 +311,7 @@ def main(
     print(f"  epoch={epoch}  backbone={cfg.backbone_name}  feature_dim={cfg.feature_dim}")
 
     if not output:
-        output = str(ckpt_path.parent / f"features_ep{epoch}.npz")
+        output = str(ckpt_path.parent / f"{output_prefix}ep{epoch}.npz")
     out_path = Path(output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -233,7 +321,7 @@ def main(
         # shuffle=False -> deterministic event order, identical across checkpoints.
         dataset = APASparseShardedDataset(
             truth_shards_dir, batch_size=batch_size, shuffle=False,
-            return_pixel_truth=True,
+            return_pixel_truth=True, return_extra_truth=extra_truth,
         )
         if dataset.apa is not None and dataset.apa != cfg.apa:
             raise ValueError(f"Shard apa={dataset.apa} != checkpoint apa={cfg.apa}")
@@ -241,6 +329,23 @@ def main(
             raise ValueError(f"Shard view={dataset.view!r} != checkpoint view={cfg.view!r}")
         n_images = len(dataset) * batch_size
         print(f"  apa={dataset.apa}  view={dataset.view}  images={n_images}")
+    elif packed_path:
+        from loader.apa_packed_dataset import APAPackedDataset
+        print(f"\nLoading packed dataset from {packed_path} ...")
+        dataset = APAPackedDataset(
+            packed_path, return_pixel_truth=pixel_truth, return_extra_truth=extra_truth,
+        )
+        if dataset.apa is not None and dataset.apa != cfg.apa:
+            raise ValueError(f"Pack apa={dataset.apa} != checkpoint apa={cfg.apa}")
+        if dataset.view is not None and dataset.view != cfg.view:
+            raise ValueError(f"Pack view={dataset.view!r} != checkpoint view={cfg.view!r}")
+        print(f"  apa={dataset.apa}  view={dataset.view}  events={len(dataset)}")
+        if 0 < max_images < len(dataset):
+            # Same seed as the raw path: identical event set across checkpoints.
+            rng = torch.Generator().manual_seed(42)
+            indices = torch.randperm(len(dataset), generator=rng)[:max_images]
+            dataset = Subset(dataset, indices)
+        print(f"  Images to process: {len(dataset)}")
     else:
         # Dataset (sparse, with full event metadata)
         print(f"\nLoading dataset from {cfg.datadir} ...")
@@ -251,6 +356,7 @@ def main(
             view=cfg.view,
             use_cache=True,
             return_pixel_truth=pixel_truth,
+            return_extra_truth=extra_truth,
             **dataset_kwargs,
         )
         if 0 < max_images < len(dataset):
@@ -280,8 +386,13 @@ def main(
 
     # Load both models
     print("\nLoading student and teacher backbones ...")
-    student = _load_backbone(ckpt, "student", device)
-    teacher = _load_backbone(ckpt, "teacher", device)
+    student, applied_kwargs = _load_backbone(ckpt, "student", device)
+    teacher, _ = _load_backbone(ckpt, "teacher", device)
+    print(f"  Backbone kwargs applied: {applied_kwargs}")
+    if "encoding_range" not in applied_kwargs:
+        print(f"  Note: cfg.encoding_range={cfg.encoding_range} is not a ctor kwarg for "
+              f"{cfg.backbone_name}; the positional encoding comes from the "
+              f"checkpoint's freqs buffer (see _load_backbone).")
 
     student_head = _load_head(ckpt, "student_head", device)
     teacher_head = _load_head(ckpt, "teacher_head", device)
@@ -322,9 +433,33 @@ def main(
     if results["student_head_features"] is not None:
         arrays["student_head_features"] = results["student_head_features"]
         arrays["teacher_head_features"] = results["teacher_head_features"]
+    for key in PIXEL_TRUTH_KEYS:
+        if results[key] is not None:
+            arrays[key] = results[key]
     if results["pixel_labels"] is not None:
-        arrays["pixel_labels"] = results["pixel_labels"]
         print(f"  Pixels with truth label: {(results['pixel_labels'] != 0).sum()}")
+    if results["pixel_truth_q"] is not None:
+        print(f"  Pixels with truth charge: {(results['pixel_truth_q'] > 0).sum()}")
+
+    # Provenance: what produced these features. The probes read this to score the
+    # raw floor with the charge transform the backbone was actually fed, and to
+    # keep results self-describing when JSONs from many runs are compared.
+    arrays.update(
+        epoch=np.array(epoch),
+        backbone_name=np.array(cfg.backbone_name),
+        encoding_range=np.array(cfg.encoding_range),
+        feature_dim=np.array(cfg.feature_dim),
+        apa=np.array(cfg.apa),
+        view=np.array(cfg.view),
+        use_log_transform=np.array(bool(cfg.use_log_transform)),
+        feat_min_val=np.array(cfg.feat_min_val),
+        feat_max_val=np.array(cfg.feat_max_val),
+        backbone_kwargs_applied=np.array(json.dumps(
+            {k: str(v) for k, v in applied_kwargs.items()})),
+        extraction_source=np.array(
+            "shards" if truth_shards_dir else ("packed" if packed_path else "raw")),
+        checkpoint_path=np.array(str(ckpt_path)),
+    )
 
     np.savez_compressed(out_path, **arrays)
     print(f"\nSaved: {out_path}")
