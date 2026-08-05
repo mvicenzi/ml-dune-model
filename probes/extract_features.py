@@ -1,24 +1,33 @@
 """
-Extract student and teacher features from a trained DINO checkpoint.
+Extract features from one branch of a trained DINO checkpoint.
 
 Features are collected at *valid* pixels — pixels that are active (non-zero)
 in the original image. The output .npz contains per-pixel feature vectors
 together with image-level truth (class, vertex, neutrino kinematics),
 suitable for PCA analysis and downstream k-NN / probing diagnostics.
 
+One branch per file: `--source=student` (default) or `--source=teacher`, never
+both. Each branch costs ~1.4 GB of backbone features per 2000 events (plus ~2.8 GB
+of head features when a projection head is present) and no probe reads both, so
+writing both doubled every file for nothing. Run the tool twice, into two output
+paths, if a student/teacher comparison is actually wanted.
+
 Usage:
-    python dino/extract_features.py path/to/checkpoint.pt
-    python dino/extract_features.py path/to/checkpoint.pt --max_images=5000
-    python dino/extract_features.py path/to/checkpoint.pt \
-        --output=./my_features.npz --batch_size=16
-    python dino/extract_features.py path/to/checkpoint.pt \
+    python -m probes.extract_features path/to/checkpoint.pt
+    python -m probes.extract_features path/to/checkpoint.pt --max_images=5000
+    python -m probes.extract_features path/to/checkpoint.pt --source=teacher \
+        --output=./teacher_features.npz --batch_size=16
+    python -m probes.extract_features path/to/checkpoint.pt \
         --truth_shards_dir=/path/to/truth_shards
 
-Output (.npz):
-    teacher_features       [N_valid, D_bb]   float16   teacher backbone features at valid pixels
-    student_features       [N_valid, D_bb]   float16   student backbone features at valid pixels
-    teacher_head_features  [N_valid, D_hd]   float16   teacher head features (only if head present)
-    student_head_features  [N_valid, D_hd]   float16   student head features (only if head present)
+Output (.npz), where <src> is the extracted branch:
+    <src>_features         [N_valid, D_bb]   float16   backbone features at valid pixels
+                                                       (backbone output, NOT passed
+                                                       through the projection head)
+    <src>_head_features    [N_valid, D_hd]   float16   projection-head features, written
+                                                       ONLY with --head_features; the
+                                                       head being in the checkpoint is
+                                                       not enough
     labels            [N_images]     int64     class label per image (0=numuCC, 1=nueCC, 2=NC, -1=unknown)
     nu_pdg            [N_images]     int64     neutrino pdg code per image
     nu_ccnc           [N_images]     int64     0=CC, 1=NC, -1=unknown
@@ -123,15 +132,18 @@ def _load_head(ckpt: dict, key: str, device: torch.device):
 
 
 @torch.no_grad()
-def _run_loader(student, teacher, loader, device, normalizer=None, student_head=None, teacher_head=None):
+def _run_loader(backbone, source, loader, device, normalizer=None, head=None):
     """
-    Run both student and teacher (+ optional heads) over the loader.
+    Run ONE branch (student or teacher) + its optional head over the loader.
+
+    Only one branch is extracted: the two sets of features are ~1.4 GB each per
+    2000 events and no probe reads both, so writing both doubled every feature
+    file for nothing. `source` names the branch and picks the output keys.
 
     Returns a dict of flat arrays — one row per valid (non-zero) pixel for
     pixel-level fields, one row per image for event-level fields.
     """
-    s_feats_all, t_feats_all = [], []
-    s_head_all,  t_head_all  = [], []
+    feats_all, head_all = [], []
     pos_all, charges_all = [], []
     offsets = [0]
 
@@ -139,7 +151,7 @@ def _run_loader(student, teacher, loader, device, normalizer=None, student_head=
     vertex_all, event_keys_all = [], []
     pixel_truth_all = {k: [] for k in PIXEL_TRUTH_KEYS}
 
-    have_head = student_head is not None
+    have_head = head is not None
 
     for xs, meta in loader:
         xs = xs.to(device)
@@ -150,8 +162,7 @@ def _run_loader(student, teacher, loader, device, normalizer=None, student_head=
         if normalizer is not None:
             xs = normalizer(xs)
 
-        s_out = student(xs)                             # Voxels [N_active, D_bb]
-        t_out = teacher(xs)                             # Voxels [N_active, D_bb]
+        out_v = backbone(xs)                            # Voxels [N_active, D_bb]
 
         # Per-pixel truth is CSR-aligned to the INPUT voxels, and features are
         # sliced by the input offsets below, so output row i must still describe
@@ -161,7 +172,7 @@ def _run_loader(student, teacher, loader, device, normalizer=None, student_head=
         # stride-1 stem, so the active set and its order are the input's. The
         # check costs an int compare per batch and converts a future generative or
         # pruning layer from silently mislabelled features into a loud failure.
-        for name, out in (("student", s_out), ("teacher", t_out)):
+        for name, out in ((source, out_v),):
             if not torch.equal(out.offsets, xs.offsets):
                 raise RuntimeError(
                     f"{name} backbone changed the per-event voxel counts "
@@ -179,13 +190,11 @@ def _run_loader(student, teacher, loader, device, normalizer=None, student_head=
 
         coords   = xs.coordinate_tensor.cpu()              # [N_active, 2]
         charges  = input_charges.cpu()                     # [N_active, 1]
-        s_feats  = s_out.feature_tensor.float().cpu()      # [N_active, D_bb]
-        t_feats  = t_out.feature_tensor.float().cpu()      # [N_active, D_bb]
-        img_offs = xs.offsets.cpu()                        # [B+1]
+        feats    = out_v.feature_tensor.float().cpu()       # [N_active, D_bb]
+        img_offs = xs.offsets.cpu()                         # [B+1]
 
         if have_head:
-            s_hd = student_head(s_out).feature_tensor.float().cpu()  # [N_active, D_hd]
-            t_hd = teacher_head(t_out).feature_tensor.float().cpu()
+            hd = head(out_v).feature_tensor.float().cpu()   # [N_active, D_hd]
 
         B = img_offs.shape[0] - 1
         for b in range(B):
@@ -193,15 +202,13 @@ def _run_loader(student, teacher, loader, device, normalizer=None, student_head=
             end   = int(img_offs[b + 1])
             n     = end - start
 
-            s_feats_all.append(s_feats[start:end].numpy())
-            t_feats_all.append(t_feats[start:end].numpy())
+            feats_all.append(feats[start:end].numpy())
             pos_all.append(coords[start:end].numpy())
             charges_all.append(charges[start:end].numpy())
             offsets.append(offsets[-1] + n)
 
             if have_head:
-                s_head_all.append(s_hd[start:end].numpy())
-                t_head_all.append(t_hd[start:end].numpy())
+                head_all.append(hd[start:end].numpy())
 
         # Event-level metadata (one row per image)
         labels_all.extend(meta["label"].tolist())
@@ -218,10 +225,10 @@ def _run_loader(student, teacher, loader, device, normalizer=None, student_head=
                 pixel_truth_all[key].extend(meta[key])
 
     out = {
-        "student_features":      np.concatenate(s_feats_all, axis=0).astype(np.float16),
-        "teacher_features":      np.concatenate(t_feats_all, axis=0).astype(np.float16),
-        "student_head_features": (np.concatenate(s_head_all, axis=0).astype(np.float16) if have_head else None),
-        "teacher_head_features": (np.concatenate(t_head_all, axis=0).astype(np.float16) if have_head else None),
+        f"{source}_features":      np.concatenate(feats_all, axis=0).astype(np.float16),
+        f"{source}_head_features": (np.concatenate(head_all, axis=0).astype(np.float16)
+                                    if have_head else None),
+        "source": source,
         "labels":     np.array(labels_all, dtype=np.int64),
         "nu_pdg":     np.array(pdg_all,    dtype=np.int64),
         "nu_ccnc":    np.array(ccnc_all,   dtype=np.int64),
@@ -242,7 +249,9 @@ def _run_loader(student, teacher, loader, device, normalizer=None, student_head=
 def main(
     checkpoint: str,
     output: str = "",
-    max_images: int = 2000,
+    max_images: int = 10000,
+    source: str = "student",
+    head_features: bool = False,
     batch_size: int = 32,
     num_workers: int = 4,
     device: str = "cuda",
@@ -259,7 +268,23 @@ def main(
     Args:
         checkpoint:       Path to a .pt checkpoint saved by train_dino.py
         output:           Output .npz path. Defaults to <checkpoint_dir>/features_ep<N>.npz
-        max_images:       Max number of images to process (-1 = full dataset)
+        max_images:       Max number of images to process (-1 = full dataset).
+                          10000 by default: at 2000 the pools behind the rare
+                          motifs came from too few events (Michel from 113 of
+                          397 validation events), which set the noise floor of
+                          every per-class average. Note the sharded reader
+                          rounds down to a whole number of batches, so 10000
+                          with batch_size=32 extracts 9984.
+        source:           Which branch to extract, "student" or "teacher" — one
+                          per file, never both. They are ~1.4 GB each per 2000
+                          events and no probe reads both; run the tool twice if
+                          a comparison is genuinely needed.
+        head_features:    Also save the projection-head features. Off by default:
+                          they are 2x the size of the backbone features (~2.8 GB
+                          per 2000 events) and no probe reads them — only the
+                          legacy dino/diagnostics/plot_features.py does. At
+                          max_images=10000 they add ~14 GB per checkpoint and the
+                          extraction needs ~64 GB of RAM rather than ~32 GB.
         batch_size:       Inference batch size
         num_workers:      DataLoader workers (ignored when truth_shards_dir is set)
         device:           "cuda" or "cpu"
@@ -294,6 +319,8 @@ def main(
                           truth tiers without overwriting earlier extractions.
                           Ignored when `output` is given explicitly.
     """
+    if source not in ("student", "teacher"):
+        raise ValueError(f'source must be "student" or "teacher", got {source!r}')
     if extra_truth:
         pixel_truth = True
     if truth_shards_dir and packed_path:
@@ -384,20 +411,38 @@ def main(
             collate_fn=voxels_meta_collate_fn,
         )
 
-    # Load both models
-    print("\nLoading student and teacher backbones ...")
-    student, applied_kwargs = _load_backbone(ckpt, "student", device)
-    teacher, _ = _load_backbone(ckpt, "teacher", device)
+    print(f"\nLoading {source} backbone ...")
+    backbone, applied_kwargs = _load_backbone(ckpt, source, device)
     print(f"  Backbone kwargs applied: {applied_kwargs}")
     if "encoding_range" not in applied_kwargs:
         print(f"  Note: cfg.encoding_range={cfg.encoding_range} is not a ctor kwarg for "
               f"{cfg.backbone_name}; the positional encoding comes from the "
               f"checkpoint's freqs buffer (see _load_backbone).")
 
-    student_head = _load_head(ckpt, "student_head", device)
-    teacher_head = _load_head(ckpt, "teacher_head", device)
-    if student_head is not None:
-        print(f"  Projection head found: {cfg.feature_dim}→{cfg.proj_head_output_dim}D")
+    # The projection head is extracted ONLY on explicit request. Presence in the
+    # checkpoint is not consent: every DINO (and our MAE) checkpoint carries one,
+    # and its features are 2x the size of the backbone's with no probe reading
+    # them. Asking for a head that is not in the checkpoint is an error, not a
+    # silent no-op — otherwise `--head_features` could appear to work and produce
+    # a file without them.
+    head = None
+    if head_features:
+        head_key = f"{source}_head"
+        head = _load_head(ckpt, head_key, device)
+        if head is None:
+            raise SystemExit(
+                f"--head_features was requested but {ckpt_path.name} has no "
+                f"{head_key!r} (checkpoint keys: {sorted(ckpt.keys())}). Extract "
+                f"without --head_features, or point at a checkpoint trained with "
+                f"a projection head."
+            )
+        print(f"  Projection head: extracting, "
+              f"{cfg.feature_dim}→{cfg.proj_head_output_dim}D "
+              f"(--head_features set)")
+    else:
+        in_ckpt = "present in checkpoint" if f"{source}_head" in ckpt else "absent"
+        print(f"  Projection head: NOT extracted ({in_ckpt}; pass --head_features "
+              f"to include it)")
 
     # Data normalizer (must match training config)
     normalizer = FeatureLogTransform(cfg.feat_min_val, cfg.feat_max_val) if cfg.use_log_transform else None
@@ -408,31 +453,29 @@ def main(
 
     # Extract
     print("Extracting features ...")
-    results = _run_loader(student, teacher, loader, device, normalizer, student_head, teacher_head)
+    results = _run_loader(backbone, source, loader, device, normalizer, head)
 
     print(f"  Images:        {len(results['labels'])}")
-    print(f"  Valid pixels:  {results['student_features'].shape[0]}")
-    print(f"  Backbone dim:  {results['student_features'].shape[1]}")
-    if results["student_head_features"] is not None:
-        print(f"  Head dim:      {results['student_head_features'].shape[1]}")
+    print(f"  Valid pixels:  {results[f'{source}_features'].shape[0]}")
+    print(f"  Backbone dim:  {results[f'{source}_features'].shape[1]}")
+    if results[f"{source}_head_features"] is not None:
+        print(f"  Head dim:      {results[f'{source}_head_features'].shape[1]}")
 
-    arrays = dict(
-        student_features=results["student_features"],
-        teacher_features=results["teacher_features"],
-        labels=results["labels"],
-        nu_pdg=results["nu_pdg"],
-        nu_ccnc=results["nu_ccnc"],
-        nu_intType=results["nu_intType"],
-        nu_energy=results["nu_energy"],
-        vertex_xyz=results["vertex_xyz"],
-        event_key=results["event_key"],
-        positions=results["positions"],
-        charges=results["charges"],
-        offsets=results["offsets"],
-    )
-    if results["student_head_features"] is not None:
-        arrays["student_head_features"] = results["student_head_features"]
-        arrays["teacher_head_features"] = results["teacher_head_features"]
+    arrays = {
+        f"{source}_features": results[f"{source}_features"],
+        "labels": results["labels"],
+        "nu_pdg": results["nu_pdg"],
+        "nu_ccnc": results["nu_ccnc"],
+        "nu_intType": results["nu_intType"],
+        "nu_energy": results["nu_energy"],
+        "vertex_xyz": results["vertex_xyz"],
+        "event_key": results["event_key"],
+        "positions": results["positions"],
+        "charges": results["charges"],
+        "offsets": results["offsets"],
+    }
+    if results[f"{source}_head_features"] is not None:
+        arrays[f"{source}_head_features"] = results[f"{source}_head_features"]
     for key in PIXEL_TRUTH_KEYS:
         if results[key] is not None:
             arrays[key] = results[key]
@@ -459,6 +502,7 @@ def main(
         extraction_source=np.array(
             "shards" if truth_shards_dir else ("packed" if packed_path else "raw")),
         checkpoint_path=np.array(str(ckpt_path)),
+        source=np.array(source),
     )
 
     np.savez_compressed(out_path, **arrays)

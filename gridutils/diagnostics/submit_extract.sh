@@ -108,7 +108,7 @@ if [ -d "$TRUTH_SHARDS_DIR" ]; then
 fi
 
 # Auto-inject --extra_truth when the shard set carries the extra per-pixel tiers
-# (pixel_energyfrac / pixel_trackid / pixel_truth_q). The instance, charge and
+# (pixel_energyfrac / pixel_trackid / pixel_truth_q). The instance and
 # overlap-strata probes need them; asking for them against a shard set that lacks
 # them would abort the job, hence the metadata check rather than a blind default.
 # Set EXTRA_TRUTH=0 to opt out.
