@@ -33,6 +33,7 @@ and cheap to re-run. One GPU extraction pass feeds every metric.
 ```bash
 python -m probes.probe_pid FEATURES.npz --out pid_ep100.json
 python -m probes.probe_knn_pid FEATURES.npz --out pixelknn_ep100.json
+python -m probes.event_probe FEATURES.npz --out event_ep100.json
 ```
 
 ## Available metrics
@@ -41,6 +42,7 @@ python -m probes.probe_knn_pid FEATURES.npz --out pixelknn_ep100.json
 |---|---|---|
 | PID | `probe_pid.py` | can a trained head read a pixel's particle type off the frozen features? |
 | kNN PID | `probe_knn_pid.py` | do a pixel's nearest neighbours in feature space already carry its class? |
+| Event flavor | `event_probe.py` | do whole events of the same interaction flavor land near each other once pooled? |
 
 
 ## PID
@@ -78,6 +80,16 @@ Procedure: without training anything, do k-NN clustering in cosine feature space
 - L2-normalize, then take a majority vote over the `--knn_k` (default 5) nearest neighbours by cosine similarity. No pixel is its own neighbour.
 - Score overall and per-class accuracy; per-type and macro F1 are reported alongside for the purity side. Student and teacher are scored side by side, and PNGs are written unless `--no_plots`. 
 - `--with_purity` adds neighbourhood label purity at several k, and `--plot_scatter` a 2-D UMAP/t-SNE view.
+
+## Event flavor
+
+Procedure: without training anything, average each event's pixel features into a single vector and do k-NN in cosine space, looking for the interaction flavor (numuCC, nueCC, NC).
+
+- Sample up to `--max_pixels_per_event` pixels per event (default 2000) and mean-pool them into one vector per event. Events smaller than the cap keep all their pixels, so only the large ones are thinned; both sides pool the same sampled pixels. Events with no pixels, or with an unknown flavor, are dropped and counted.
+- No balancing: the natural flavor mix is scored as it comes, and recorded next to every number. Nothing is trained here, so there is no prior for a head to learn.
+- L2-normalize, then take a majority vote over the k nearest events by cosine similarity, at k = 1, 5, 10, 20. No event is its own neighbour.
+- Score accuracy, macro-F1 and neighbour purity, next to two degenerate answers measured on the same events: guessing uniformly, and always predicting the most common flavor.
+- Repeat on the raw charge inputs only (`channel`, `tick` and log charge), mean-pooled the same way: the difference is what the backbone added, and it guards against a score that only reflects where an event sits or how much charge it deposited.
 
 ## Outputs
 
