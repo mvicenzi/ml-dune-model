@@ -33,6 +33,7 @@ and cheap to re-run. One GPU extraction pass feeds every metric.
 ```bash
 python -m probes.probe_pid FEATURES.npz --out pid_ep100.json
 python -m probes.probe_knn_pid FEATURES.npz --out pixelknn_ep100.json
+python -m probes.probe_overlap FEATURES.npz --out overlap_ep100.json
 python -m probes.event_probe FEATURES.npz --out event_ep100.json
 ```
 
@@ -42,6 +43,7 @@ python -m probes.event_probe FEATURES.npz --out event_ep100.json
 |---|---|---|
 | PID | `probe_pid.py` | can a trained head read a pixel's particle type off the frozen features? |
 | kNN PID | `probe_knn_pid.py` | do a pixel's nearest neighbours in feature space already carry its class? |
+| Overlap | `probe_overlap.py` | can a trained head tell that a pixel's charge is shared between particles? |
 | Event flavor | `event_probe.py` | do whole events of the same interaction flavor land near each other once pooled? |
 
 
@@ -80,6 +82,24 @@ Procedure: without training anything, do k-NN clustering in cosine feature space
 - L2-normalize, then take a majority vote over the `--knn_k` (default 5) nearest neighbours by cosine similarity. No pixel is its own neighbour.
 - Score overall and per-class accuracy; per-type and macro F1 are reported alongside for the purity side. Student and teacher are scored side by side, and PNGs are written unless `--no_plots`. 
 - `--with_purity` adds neighbourhood label purity at several k, and `--plot_scatter` a 2-D UMAP/t-SNE view.
+
+## Overlap
+
+Procedure: train a head to answer one yes/no question about each pixel — is more than a fraction `t` of its charge someone else's? — and compare with truth.
+
+- The target is `overlap = 1 - pixel_energyfrac`. `pixel_energyfrac` is the leading contributor's share of the pixel's energy, so `pixel_energyfrac = 1` gives `overlap = 0`, a pixel one particle owns outright, and two equal contributors give `overlap = 0.5`. Only pixels carrying truth take part; contamination is undefined without it.
+- Split samples 80/20 at the event level, as PID does, so no event is on both sides.
+- Sample a balanced training pool of `--train_per_class` pixels (default 20000) either side of the threshold. Balancing is on the training side only: it stops the head learning the prior, which is a training concern.
+- Score on the natural population, subsampled uniformly to `--val_pixels` so the real proportion of contaminated pixels is kept. Unlike PID this is affordable here — contaminated is about 14% of truth pixels, not a fraction of a percent, so precision is a real number and not an artefact of the prior.
+- Normalize the features, fitted on the training pixels only.
+- Train the same two heads PID uses, with the same fixed hyperparameters: a linear SVM and an MLP with one hidden layer of 128.
+- Score precision, efficiency and F1 for the contaminated class, against two degenerate answers measured on the same pixels: always answer "pure", and guess at random.
+- Repeat all of the above on the raw charge inputs only (`channel`, `tick` and log charge): the difference is what the backbone added.
+- Repeat at thresholds 0.1, 0.2 and 0.3, reporting each. The headline is 0.2; the sweep is there so a reader can see whether the answer depends on where the line was drawn. Each threshold is a different question, with its own proportion of contaminated pixels and its own chance level.
+- Break the headline down per particle type, reporting each type's own contaminated rate beside its efficiency and F1.
+
+### Notes:
+Types are contaminated at very different rates — Blip 8.7%, DeltaRay 35.4% — so a type's efficiency only means something next to its own rate. That spread is also why the natural population is the one scored: every type is contaminated less than half the time, so a head that knows only the particle type scores F1 = 0 and can contribute nothing to the result. On a balanced pool it would score above zero, and some of the result would be PID in disguise.
 
 ## Event flavor
 
