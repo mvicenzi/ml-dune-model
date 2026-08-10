@@ -46,7 +46,7 @@ Output (.npz), where <src> is the extracted branch:
     pixel_truth_q     [N_valid]      float32   truth deposited charge (electrons)
                                                the three above only with --extra_truth
 
-Provenance scalars (always written; consumed by probes/protocol.py so a metric
+Provenance scalars (always written; consumed by probes/features.py so a metric
 can never be mis-scored against the wrong charge transform):
     epoch, backbone_name, encoding_range, feature_dim, apa, view,
     use_log_transform, feat_min_val, feat_max_val, backbone_kwargs_applied,
@@ -202,13 +202,19 @@ def _run_loader(backbone, source, loader, device, normalizer=None, head=None):
             end   = int(img_offs[b + 1])
             n     = end - start
 
-            feats_all.append(feats[start:end].numpy())
+            # Cast to the on-disk dtype here rather than after the concatenate.
+            # The rounding is elementwise, so the result is bit-identical either
+            # way, but accumulating float32 costs 2x and then peaks at 5x the
+            # output while the list, the concatenated copy and the cast copy are
+            # all live: 35 GB of features alone at 10000 events, against a 32 GB
+            # condor request. Casting per slice keeps the peak at ~14 GB.
+            feats_all.append(feats[start:end].numpy().astype(np.float16))
             pos_all.append(coords[start:end].numpy())
             charges_all.append(charges[start:end].numpy())
             offsets.append(offsets[-1] + n)
 
             if have_head:
-                head_all.append(hd[start:end].numpy())
+                head_all.append(hd[start:end].numpy().astype(np.float16))
 
         # Event-level metadata (one row per image)
         labels_all.extend(meta["label"].tolist())
@@ -225,8 +231,9 @@ def _run_loader(backbone, source, loader, device, normalizer=None, head=None):
                 pixel_truth_all[key].extend(meta[key])
 
     out = {
-        f"{source}_features":      np.concatenate(feats_all, axis=0).astype(np.float16),
-        f"{source}_head_features": (np.concatenate(head_all, axis=0).astype(np.float16)
+        # Already float16 per slice (see the cast in the loop above).
+        f"{source}_features":      np.concatenate(feats_all, axis=0),
+        f"{source}_head_features": (np.concatenate(head_all, axis=0)
                                     if have_head else None),
         "source": source,
         "labels":     np.array(labels_all, dtype=np.int64),
