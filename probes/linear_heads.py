@@ -21,8 +21,11 @@ that one under one scoring procedure.
 
 fit_svm                         linear SVM, C fixed
 fit_mlp                         Linear(D,128) -> ReLU -> Linear(128,k), Adam
-fit_mlp_regress                 the same MLP with one output and MSE loss
-ridge_predict / r2_score        closed-form linear regression, and its score
+
+Both are classifiers: every metric in the suite now asks a yes/no or which-class
+question. The regression heads that used to live here went with the last
+regression metric — if one comes back, it should be the MLP at the same capacity
+as `fit_mlp`, not a linear ridge, or the two cannot be read side by side.
 
 Each returns predictions on the validation pool, never the fitted head: a head is
 trained fresh for every (checkpoint, feature source, metric) and scores exactly
@@ -97,57 +100,3 @@ def fit_mlp(Xtr, ytr, Xva, n_classes: int, seed: int, epochs: int = 30,
             opt.step()
     model.eval()
     return _predict_chunked(model, dev, Xva)
-
-
-def fit_mlp_regress(Xtr, ytr, Xva, seed: int, epochs: int = 30, lr: float = 5e-3,
-                    batch: int = 256, device: str = "cpu") -> np.ndarray:
-    """Same head as `fit_mlp`, one output and MSE loss: Linear(D,128) -> ReLU ->
-    Linear(128,1). Exists so a regression target is probed at the same capacity
-    as a classification one — a linear ridge understates what a nonlinear readout
-    could get, and mixing the two would make a metric's two halves incomparable.
-    """
-    import torch
-    import torch.nn as nn
-
-    dev = torch.device(device)
-    torch.manual_seed(seed)
-    model = nn.Sequential(nn.Linear(Xtr.shape[1], 128), nn.ReLU(),
-                          nn.Linear(128, 1)).to(dev)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    Xt = torch.from_numpy(np.ascontiguousarray(Xtr, dtype=np.float32)).to(dev)
-    yt = torch.from_numpy(np.ascontiguousarray(ytr, dtype=np.float32)).to(dev).view(-1, 1)
-    n = len(Xt)
-    for _ in range(epochs):
-        perm = torch.randperm(n, device=dev)
-        for st in range(0, n, batch):
-            idx = perm[st:st + batch]
-            opt.zero_grad()
-            nn.functional.mse_loss(model(Xt[idx]), yt[idx]).backward()
-            opt.step()
-    model.eval()
-    with torch.no_grad():
-        pred = model(torch.from_numpy(
-            np.ascontiguousarray(Xva, dtype=np.float32)).to(dev)).cpu().numpy()
-    return pred.reshape(-1)
-
-
-def ridge_predict(Xtr, ytr, Xva, alpha: float = 10.0):
-    """Closed-form ridge with a penalized bias column, standardized on train."""
-    Xtr = np.asarray(Xtr, dtype=np.float64)
-    Xva = np.asarray(Xva, dtype=np.float64)
-    mu = Xtr.mean(0)
-    sd = Xtr.std(0) + 1e-8
-    Xtr = np.hstack([(Xtr - mu) / sd, np.ones((len(Xtr), 1))])
-    Xva = np.hstack([(Xva - mu) / sd, np.ones((len(Xva), 1))])
-    ym = float(np.mean(ytr))
-    A = Xtr.T @ Xtr + alpha * np.eye(Xtr.shape[1])
-    w = np.linalg.solve(A, Xtr.T @ (np.asarray(ytr, dtype=np.float64) - ym))
-    return Xva @ w + ym
-
-
-def r2_score(y, pred) -> float:
-    y = np.asarray(y, dtype=np.float64)
-    pred = np.asarray(pred, dtype=np.float64)
-    ss_res = float(((y - pred) ** 2).sum())
-    ss_tot = float(((y - y.mean()) ** 2).sum()) + 1e-12
-    return 1.0 - ss_res / ss_tot

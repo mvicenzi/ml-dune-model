@@ -1,6 +1,6 @@
 """Pixel-level PID k-NN — the cheap non-parametric tracking metric.
 
-The complement to `pixel_probe.py`: instead of training a head, it asks whether a
+The complement to `probe_pid.py`: instead of training a head, it asks whether a
 pixel's nearest neighbours in cosine feature space already carry its class. Fast,
 no fitting, and it produces plots — useful as a per-epoch curve while a run
 trains.
@@ -31,7 +31,7 @@ Note this metric has no train/val split — queries and neighbours come from one
 pool — so it is a *relative* tracking curve, not a leakage-free score. Pool
 selection depends only on labels and offsets (never on features) and is seeded,
 so it is identical for every checkpoint and safe to compare across epochs. Do not
-quote it beside `pixel_probe` numbers as if the protocols matched.
+quote it beside `probe_pid` numbers as if the protocols matched.
 
 Usage:
     python -m probes.probe_knn_pid FEATURES.npz --out knn_pixel.json

@@ -35,6 +35,7 @@ python -m probes.probe_pid FEATURES.npz --out pid_ep100.json
 python -m probes.probe_knn_pid FEATURES.npz --out pixelknn_ep100.json
 python -m probes.probe_overlap FEATURES.npz --out overlap_ep100.json
 python -m probes.probe_instance FEATURES.npz --out instance_ep100.json
+python -m probes.probe_vertex FEATURES.npz --out vertex_ep100.json
 python -m probes.probe_event FEATURES.npz --out event_ep100.json
 ```
 
@@ -46,6 +47,7 @@ python -m probes.probe_event FEATURES.npz --out event_ep100.json
 | kNN PID | `probe_knn_pid.py` | do a pixel's nearest neighbours in feature space already carry its class? |
 | Overlap | `probe_overlap.py` | can a trained head tell that a pixel's charge is shared between particles? |
 | Instance | `probe_instance.py` | do a pixel's nearest neighbours belong to the same particle it does? |
+| Vertex | `probe_vertex.py` | can a trained head tell that a pixel sits close to the interaction point? |
 | Event flavor | `probe_event.py` | do whole events of the same interaction flavor land near each other once pooled? |
 
 
@@ -121,6 +123,29 @@ The score is per pixel, not per particle. Half of all particles have three pixel
 A pixel whose particle is a single pixel has no companion that could be voted for, so it is wrong whatever the features do. Those pixels are 0.7% of the total, and the ceiling reported beside each score is the fraction that could be right in principle.
 
 There is no confusion matrix here, unlike PID. Particle ids are per-event labels, so id 7 in one event has nothing to do with id 7 in another and predictions cannot be pooled into a shared set of classes. Only the accuracy is poolable.
+
+## Vertex
+
+Procedure: train a head to answer one yes/no question about each pixel — is it within `r` pixels of the interaction point? — and compare with truth.
+
+- The target is the distance from each pixel to the true vertex, measured in pixels. The event's 3D `vertex_xyz` is projected into this view's (channel, tick) with the wire geometry, and the distance is taken there, so the number is in the same units the pixels are stored in.
+- The interaction vertex only, which is the one the containers store. About 5% of pixels are near it at the headline radius. `vertex_kind` records this, since a production labelling more vertices would be a denser and easier task.
+- The projection needs one constant, the drift-to-tick offset `t0` (`--vertex_t0_ticks`, default -0.567). Events whose vertex lands outside the wire volume are dropped and counted rather than clamped to an edge.
+- Every pixel takes part, whether or not it carries truth. Distance to the vertex is geometry: a noise pixel beside the vertex is still beside the vertex.
+- Split samples 80/20 at the event level, as PID does. This matters more here than in the other probes: the distance varies smoothly across an event, so a pixel-level split would leave pixels of the same event on both sides and hand either head that event's answer.
+- Sample a balanced training pool of `--train_per_class` pixels (default 50000) either side of the radius. Balancing is on the training side only, exactly as in Overlap.
+- Score on the natural population, subsampled uniformly to `--val_pixels` (default 200000), so the real proportion of near-vertex pixels is kept — about 5% at the headline radius.
+- Normalize the features, fitted on the training pixels only.
+- Train one head: an MLP with one hidden layer of 128, the same fixed hyperparameters PID uses.
+- Score precision, efficiency and F1 for the near class, next to a random guess measured on the same pixels.
+- Repeat all of the above on the raw charge inputs only (`channel`, `tick` and log charge): the difference is what the backbone added.
+- Repeat at radii 10, 20 and 30 pixels, reporting each. The headline is 20; the sweep is there so a reader can see whether the answer depends on where the line was drawn. Each radius is a different question, with its own proportion of near-vertex pixels and its own chance level.
+- Report the number of near pixels actually scored at each radius, and flag when a radius could not fill its training pool. A tighter radius has fewer near pixels on both sides of the split, and the sweep is only comparable while every radius has enough of them.
+
+### Notes:
+The raw charge inputs are a strong baseline here by construction, more so than in the other probes: "near the vertex" is a statement about position, and `channel` and `tick` are position. A head given only those two can learn where vertices usually sit and score well without knowing anything about the event in front of it. This is still a fair comparison — the backbone is handed the same absolute coordinates, through the positional encoding at its bottleneck — but it means a negative feat-minus-raw difference says the features are a worse route to position than position itself, not that they are blind to the vertex.
+
+The random guess is not there to be beaten — the raw charge inputs are what the features are measured against. It is there because both sides of that comparison are trained heads, and a head can collapse to a constant answer and still produce a difference that looks healthy. A collapsed head cannot clear the random guess, so it is what separates a weak score from a broken one.
 
 ## Event flavor
 
