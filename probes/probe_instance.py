@@ -6,11 +6,11 @@ that is the pixel's own particle. Scored as the fraction of pixels where it is �
 a prediction compared with truth, the same shape as PID and kNN-PID. Nothing is
 trained.
 
-Averaged **per pixel**, not per instance. That is a deliberate break from the
-fork, which averaged per instance: half of all instances here have 3 pixels or
-fewer, so a per-instance average is dominated by particles that hold 2% of the
-charge, and it also averaged over a different population than it sampled. Per
-pixel, the population sampled and the population averaged are the same one.
+Averaged **per pixel**, not per instance, and the choice is deliberate: half of
+all instances here have 3 pixels or fewer, so a per-instance average is dominated
+by particles that hold 2% of the charge, and it averages over a different
+population than the one sampled. Per pixel, the population sampled and the
+population averaged are the same one.
 
 The cost of that choice is that big particles dominate — 85% of truthed pixels
 belong to particles of 100+ pixels — so the headline mostly describes tracks and

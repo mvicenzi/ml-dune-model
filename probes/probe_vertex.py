@@ -6,10 +6,10 @@ pixel within `r` pixels of the vertex? — and scores it exactly like the overla
 probe: a fixed head, the raw-charge inputs as the number to beat, and the
 degenerate answers measured on the same pixels.
 
-The radius is swept rather than chosen. `r = 20 px` is the headline (the fork's
-convention), but 10 and 30 are scored alongside it, so a reader can see whether
-the answer depends on where the line was drawn. Each radius is its own task with
-its own prevalence and its own chance level, all of which are reported.
+The radius is swept rather than chosen. `r = 20 px` is the headline, but 10 and
+30 are scored alongside it, so a reader can see whether the answer depends on
+where the line was drawn. Each radius is its own task with its own prevalence and
+its own chance level, all of which are reported.
 
 Scored on the **natural** validation population, not a balanced one — near-vertex
 pixels are ~5% of the image, so precision means something. Training is balanced,
@@ -17,9 +17,7 @@ because a head must not learn the prior; scoring is not, because the score must
 face it. That is doc 12 rule 3.
 
 Reported as precision / recall / F1, the same quantities as overlap and PID, so
-one number means one thing across the suite. AP and AUROC survive only as
-secondary keys: they are what the fork's `rich_pixel_probe.py` quoted, and doc 12
-rule 4 keeps normalised scores off a headline.
+one number means one thing across the suite.
 
 The split is by *event* (`class_balancing.pixel_split`). A per-pixel split would
 leak badly here — distance to the vertex is a smooth function of position within
@@ -47,10 +45,11 @@ from probes.linear_heads import fit_mlp
 from probes.probe_overlap import binary_scores
 from probes.results import run_header, run_label, write_json
 
-# Swept radii in pixels; the first is the headline. 20 px is the fork's
-# convention, which is why it leads. Note channel pitch and tick spacing are
-# different physical scales (~0.5 cm vs 0.321 cm), so each disc is anisotropic in
-# cm — as the fork's was.
+# Swept radii in pixels; the first is the headline. Note channel pitch and tick
+# spacing are different physical scales (~0.5 cm and 0.321 cm), so a disc of
+# constant pixel radius is an ellipse in cm: 20 px reaches ~10 cm across channels
+# and ~6.4 cm along drift. The sweep is what makes the choice of 20 auditable —
+# if the answer moves between 10 and 30, no single radius should be quoted.
 RADII_PX = (20.0, 10.0, 30.0)
 
 DEFAULT_TRAIN_PER_CLASS = 50_000
@@ -58,8 +57,8 @@ DEFAULT_TRAIN_PER_CLASS = 50_000
 # Capped only to bound memory and head time.
 DEFAULT_VAL_PIXELS = 200_000
 
-# The drift-to-tick offset is a stated constant inherited from the fork, not zero
-# and not a fit performed at run time.
+# The drift-to-tick offset: a measured constant, not zero and not a fit performed
+# at run time.
 #
 # The projection is `tick = drift_cm / 0.321126 + t0`; the channel half needs no
 # parameter. t0 absorbs the frame reference time, WireCell's response-plane
@@ -67,40 +66,32 @@ DEFAULT_VAL_PIXELS = 200_000
 # property of how the images were made rather than a physical constant — which is
 # why it is named here, overridable, and recorded in every result.
 #
-# The value is the fork's: its build_vertex_labels.py self-calibrates t0 per pack
-# from muon endpoints and stores the result in each .vtx.npz sidecar; all 18 in
-# its data_sdcc/ give -0.567 +- 0.007 (U -0.572..-0.578, V -0.559..-0.567,
-# W -0.556..-0.564). Adopting it keeps one constant across both implementations
-# and needs no genealogy tier our containers lack.
-#
-# Cross-checked, not assumed. Projecting charged-track 3D endpoints (mcpart
+# Measured, not assumed. Projecting charged-track 3D endpoints (mcpart
 # start/end_xyzts joined to their footprint pixels through track_ids) against the
 # pixels' actual tick, over 2116 measurements in 282 events of
 # prod-jay-100k-truth-2026-06-11, gives -0.649 ticks, 95% CI [-0.729, -0.596]
-# (event-clustered bootstrap). That is 0.08 tick = 0.026 cm = 0.08 px from the
-# fork's value: a real difference in production timing (the CIs do not overlap)
-# but far below anything this metric resolves — switching t0 by ten times as much
-# moves only 0.089% of pixels across the 20 px radius. Our fit is what rules out
-# the earlier t0=0 (which was wrong by 0.65 tick) and what makes the fork's number
-# usable here rather than merely inherited.
+# (event-clustered bootstrap). That is what rules out the earlier t0 = 0, which
+# was wrong by 0.65 tick.
 #
 # Most of the offset is a BINNING convention, not timing: a stored pixel tick is
 # an integer bin index (dtype int32) whose centre sits at index+0.5, while the
-# projection is continuous, so index-minus-continuous earns -0.5 for free. Both
-# fits carry it (fork packs are int32 (channel,tick) too); refitting ours against
-# bin centres leaves -0.149 [-0.229, -0.096], so the genuine frame/response-plane
-# term is ~0.15 tick, ~0.07 on the fork's production. The value to USE is the
-# index one, because the metric compares projected ticks against integer pixel
-# coords.
+# projection is continuous, so index-minus-continuous earns -0.5 for free.
+# Refitting against bin centres leaves -0.149 [-0.229, -0.096], so the genuine
+# frame/response-plane term is only ~0.15 tick. The value to USE is the index
+# one, because the metric compares projected ticks against integer pixel coords.
+#
+# How much precision this needs: moving t0 by 0.8 tick — five times the width of
+# the CI above — shifts only 0.089% of pixels across the 20 px radius. So the
+# metric is insensitive to this at the level it is known, and the reason to get it
+# right is to rule out a multi-tick error, not to chase the third decimal.
 #
 # A charge-density scan (median distance from the projected vertex to the nearest
 # charge pixel) is flat within +-2 ticks and rises beyond it, so that observable
-# rules out multi-tick errors but cannot resolve this value — see probes/README.md.
+# confirms there is no multi-tick error but cannot resolve the value itself.
 #
-# Override with --vertex_t0_ticks for a production that registers differently, or
-# with -0.649 to use our own prod-jay fit instead. Vertex numbers recorded before
-# 2026-08-05 were taken at t0=0 (README records the size of the difference).
-DEFAULT_VERTEX_T0_TICKS = -0.567
+# Override with --vertex_t0_ticks for a production that registers differently.
+# Vertex numbers recorded before 2026-08-05 were taken at t0 = 0.
+DEFAULT_VERTEX_T0_TICKS = -0.649
 
 
 def vertex_distance(fx: Features, t0_ticks: float):
@@ -146,26 +137,16 @@ def vertex_distance(fx: Features, t0_ticks: float):
 
 
 def _fit_and_score(Xtr, ytr, Xva, yva, seed: int, device: str):
-    """The fixed MLP head on one (train, val) pair, scored and ranked.
-
-    Returns precision/recall/F1 plus AP and AUROC off the same probabilities, so
-    the secondary ranking numbers cannot disagree with the headline — they are
-    that head's own scores, thresholded one way and ranked the other.
-    """
+    """The fixed MLP head on one (train, val) pair, scored on the near class."""
     from sklearn.preprocessing import StandardScaler
-    from sklearn.metrics import average_precision_score, roc_auc_score
 
     # Fitted on the training rows only. Without it the raw baseline's channel/tick
     # columns of magnitude 1e3 go straight into Adam at lr 5e-3 and the head
     # collapses to a constant — the failure doc 12 defect 6 records.
     sc = StandardScaler().fit(Xtr)
-    pred, prob = fit_mlp(sc.transform(Xtr), ytr, sc.transform(Xva),
-                         n_classes=2, seed=seed, device=device)
-    out = binary_scores(yva, pred)
-    if 0 < int(yva.sum()) < len(yva):
-        out["ap"] = float(average_precision_score(yva, prob[:, 1]))
-        out["auroc"] = float(roc_auc_score(yva, prob[:, 1]))
-    return out
+    pred, _ = fit_mlp(sc.transform(Xtr), ytr, sc.transform(Xva),
+                      n_classes=2, seed=seed, device=device)
+    return binary_scores(yva, pred)
 
 
 def vertex_metric(fx: Features, raw: np.ndarray, is_train: np.ndarray, seed: int,
@@ -190,9 +171,10 @@ def vertex_metric(fx: Features, raw: np.ndarray, is_train: np.ndarray, seed: int
     res = {"radii_px": [float(r) for r in RADII_PX],
            "headline_radius_px": float(RADII_PX[0]),
            "t0_ticks_assumed": float(t0_ticks),
-           # Interaction vertex only. The fork's sidecar carries secondary
-           # vertices too, which is why its prevalence is ~11% against our ~5%:
-           # a denser task with a different chance level, so its AP is not ours.
+           # Interaction vertex only, which is what the containers label. Recorded
+           # because a production labelling more vertices per event would be a
+           # denser task with a different chance level, and the two must not be
+           # read as one number.
            "vertex_kind": "interaction_only",
            "train_per_class": int(per_class),
            "n_val": int(len(va_all)),
@@ -254,12 +236,6 @@ def vertex_metric(fx: Features, raw: np.ndarray, is_train: np.ndarray, seed: int
         res["recall_mlp_feat"] = h["mlp_feat"]["recall"]
         res["precision_mlp_feat"] = h["mlp_feat"]["precision"]
         res["prevalence_val"] = h["prevalence_val"]
-        # Secondary, not the headline: what the fork quoted (its best was AP
-        # 0.492, on the denser taxonomy above). Kept so that line stays alive.
-        res["fork_comparable"] = {
-            "feat_ap": h["mlp_feat"].get("ap"), "raw_ap": h["mlp_raw"].get("ap"),
-            "feat_auroc": h["mlp_feat"].get("auroc"),
-            "raw_auroc": h["mlp_raw"].get("auroc")}
     return res
 
 
@@ -325,8 +301,8 @@ def main():
                     help="torch device for the MLP head (default: cpu)")
     ap.add_argument("--vertex_t0_ticks", type=float, default=DEFAULT_VERTEX_T0_TICKS,
                     help=f"drift-to-tick offset for the vertex projection (default: "
-                         f"{DEFAULT_VERTEX_T0_TICKS}, the fork's calibrated value; "
-                         f"pass -0.649 for our own prod-jay fit -- see "
+                         f"{DEFAULT_VERTEX_T0_TICKS}, measured on "
+                         f"prod-jay-100k-truth-2026-06-11 -- see "
                          f"DEFAULT_VERTEX_T0_TICKS). Recorded in the output JSON.")
     args = ap.parse_args()
 

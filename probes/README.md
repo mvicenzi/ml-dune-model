@@ -130,7 +130,7 @@ Procedure: train a head to answer one yes/no question about each pixel — is it
 
 - The target is the distance from each pixel to the true vertex, measured in pixels. The event's 3D `vertex_xyz` is projected into this view's (channel, tick) with the wire geometry, and the distance is taken there, so the number is in the same units the pixels are stored in.
 - The interaction vertex only, which is the one the containers store. About 5% of pixels are near it at the headline radius. `vertex_kind` records this, since a production labelling more vertices would be a denser and easier task.
-- The projection needs one constant, the drift-to-tick offset `t0` (`--vertex_t0_ticks`, default -0.567). Events whose vertex lands outside the wire volume are dropped and counted rather than clamped to an edge.
+- The projection needs one constant, the drift-to-tick offset `t0` (`--vertex_t0_ticks`, default -0.649, measured from charged-track endpoints — see the comment on `DEFAULT_VERTEX_T0_TICKS`). Events whose vertex lands outside the wire volume are dropped and counted rather than clamped to an edge.
 - Every pixel takes part, whether or not it carries truth. Distance to the vertex is geometry: a noise pixel beside the vertex is still beside the vertex.
 - Split samples 80/20 at the event level, as PID does. This matters more here than in the other probes: the distance varies smoothly across an event, so a pixel-level split would leave pixels of the same event on both sides and hand either head that event's answer.
 - Sample a balanced training pool of `--train_per_class` pixels (default 50000) either side of the radius. Balancing is on the training side only, exactly as in Overlap.

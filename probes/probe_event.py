@@ -21,10 +21,11 @@ Scored on the natural event population: nothing is balanced here, because no
 head is trained and so there is no prior for a readout to learn. The flavor mix
 is recorded next to every score, which is what makes accuracy interpretable.
 
-This is a coarse, cheap tracking metric: it moved little across the fork's
-ablations even where representations had visibly collapsed, so treat it as a
-sanity curve rather than a decider. `dino/diagnostics/plot_knn.py` produces the
-plotted version of the same idea; this one writes JSON for run-to-run tables.
+This is a coarse, cheap tracking metric: it has been seen to move very little
+across ablations whose representations had visibly collapsed on other metrics, so
+treat it as a sanity curve rather than a decider. `dino/diagnostics/plot_knn.py`
+produces the plotted version of the same idea; this one writes JSON for
+run-to-run tables.
 
 Usage:
   python -m probes.probe_event FEATURES.npz [MORE.npz ...] --out event_probe.json
