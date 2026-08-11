@@ -2,14 +2,15 @@
 
 The complement to `probe_pid.py`: instead of training a head, it asks whether a
 pixel's nearest neighbours in cosine feature space already carry its class. Fast,
-no fitting, and it produces plots — useful as a per-epoch curve while a run
-trains.
+no fitting — useful as a per-epoch curve while a run trains.
 
 Classes are the 7-class pixel taxonomy with Background (label 0) excluded, so
 this scores motifs 1-6 only. It reports majority-vote accuracy (per class =
-recall) plus a confusion matrix, optionally neighbourhood purity at several k,
-and optionally a 2-D UMAP/t-SNE scatter. Student and teacher features are scored
-side by side.
+recall) plus a confusion matrix, and optionally neighbourhood purity at several
+k. Student and teacher features are scored side by side.
+
+Writes JSON and nothing else. `probes/plot_probes.py` draws the per-class recall
+and the confusion matrix from it.
 
 Ported from `dino/diagnostics/plot_knn_pixel.py`, which is left untouched so its
 published numbers stay reproducible. Two differences here:
@@ -25,7 +26,7 @@ published numbers stay reproducible. Two differences here:
      Pass a negative value for the old uncapped behaviour; the two are NOT
      numerically comparable.
   2. **JSON output** keyed like every other probe, so results merge into
-     `probes.compare` tables alongside the trained-head metrics.
+     `probes.merge` tables alongside the trained-head metrics.
 
 Note this metric has no train/val split — queries and neighbours come from one
 pool — so it is a *relative* tracking curve, not a leakage-free score. Pool
@@ -43,9 +44,6 @@ import argparse
 import sys
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -247,128 +245,10 @@ def accuracy(preds: np.ndarray, labels: np.ndarray) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Plots
-# ---------------------------------------------------------------------------
-
-def _reduce_2d(X: np.ndarray, method: str = "auto"):
-    """[N, D] -> [N, 2] via UMAP (preferred) or t-SNE. Inlined so this package
-    does not depend on the retiring dino/diagnostics."""
-    if method in ("umap", "auto"):
-        try:
-            from umap import UMAP
-            print("    Using UMAP for 2-D reduction.")
-            return UMAP(n_components=2, metric="cosine",
-                        random_state=42, verbose=False).fit_transform(X), "UMAP"
-        except ImportError:
-            if method == "umap":
-                raise
-            print("    umap-learn not found — falling back to t-SNE.")
-    from sklearn.manifold import TSNE
-    print("    Using t-SNE for 2-D reduction.")
-    emb = TSNE(n_components=2, metric="cosine", init="pca",
-               random_state=42, n_jobs=-1).fit_transform(X)
-    return emb, "t-SNE"
-
-
-def _plot_accuracy(s_acc, t_acc, k, out_dir, tag):
-    n = len(PIXEL_CLASS_NAMES)
-    x = np.arange(n + 1)
-    fig, ax = plt.subplots(figsize=(9, 5))
-    s_vals = list(s_acc[1]) + [s_acc[0]]
-    t_vals = list(t_acc[1]) + [t_acc[0]]
-    ax.bar(x - 0.2, s_vals, width=0.4, label="Student")
-    ax.bar(x + 0.2, t_vals, width=0.4, label="Teacher")
-    for xi, (sv, tv) in enumerate(zip(s_vals, t_vals)):
-        if np.isfinite(sv):
-            ax.text(xi - 0.2, sv + 0.01, f"{sv:.2f}", ha="center", fontsize=8)
-        if np.isfinite(tv):
-            ax.text(xi + 0.2, tv + 0.01, f"{tv:.2f}", ha="center", fontsize=8)
-    ax.axhline(1.0 / n, color="red", linestyle="--", linewidth=1.2,
-               label=f"chance (1/{n})")
-    ax.set_xticks(x)
-    ax.set_xticklabels(PIXEL_CLASS_NAMES + ["Overall"], fontsize=10)
-    ax.set_ylabel("Accuracy")
-    ax.set_ylim(0, 1.05)
-    ax.legend(fontsize=9)
-    ax.grid(axis="y", alpha=0.3)
-    fig.suptitle(f"Pixel PID k-NN accuracy (majority vote, k={k})  [{tag}]", fontsize=13)
-    fig.tight_layout()
-    fig.savefig(out_dir / "knn_pixel_accuracy.png", dpi=100, bbox_inches="tight")
-    plt.close(fig)
-    print("  saved knn_pixel_accuracy.png")
-
-
-def _plot_confusion(s_preds, t_preds, labels, k, out_dir, tag):
-    from sklearn.metrics import confusion_matrix
-    n = len(PIXEL_CLASS_NAMES)
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    for ax, preds, name in zip(axes, [s_preds, t_preds], ["Student", "Teacher"]):
-        cm = confusion_matrix(labels, preds, labels=list(range(n)), normalize="true")
-        im = ax.imshow(cm, vmin=0, vmax=1, cmap="Blues")
-        plt.colorbar(im, ax=ax)
-        ax.set_xticks(range(n)); ax.set_yticks(range(n))
-        ax.set_xticklabels(PIXEL_CLASS_NAMES, rotation=30, ha="right")
-        ax.set_yticklabels(PIXEL_CLASS_NAMES)
-        ax.set_xlabel("Predicted"); ax.set_ylabel("True"); ax.set_title(name)
-        for i in range(n):
-            for j in range(n):
-                ax.text(j, i, f"{cm[i, j]:.2f}", ha="center", va="center",
-                        fontsize=8, color="white" if cm[i, j] > 0.5 else "black")
-    fig.suptitle(f"Pixel PID confusion (k={k})  [{tag}]", fontsize=12)
-    fig.tight_layout()
-    fig.savefig(out_dir / "knn_pixel_confusion.png", dpi=100, bbox_inches="tight")
-    plt.close(fig)
-    print("  saved knn_pixel_confusion.png")
-
-
-def _plot_purity(s_purity, t_purity, out_dir, tag):
-    ks = sorted(s_purity)
-    n = len(PIXEL_CLASS_NAMES)
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
-    x = np.arange(n + 1)
-    width = 0.8 / len(ks)
-    for ax, purity, name in zip(axes, [s_purity, t_purity], ["Student", "Teacher"]):
-        for ki, k in enumerate(ks):
-            overall, per_class, _ = purity[k]
-            ax.bar(x + ki * width - 0.4 + width / 2, list(per_class) + [overall],
-                   width=width, label=f"k={k}")
-        ax.axhline(1.0 / n, color="red", linestyle="--", linewidth=1.2,
-                   label=f"chance (1/{n})")
-        ax.set_xticks(x)
-        ax.set_xticklabels(PIXEL_CLASS_NAMES + ["Overall"], fontsize=10)
-        ax.set_ylabel("Label purity"); ax.set_ylim(0, 1.05); ax.set_title(name)
-        ax.legend(fontsize=8); ax.grid(axis="y", alpha=0.3)
-    fig.suptitle(f"Pixel PID k-NN label purity  [{tag}]", fontsize=13)
-    fig.tight_layout()
-    fig.savefig(out_dir / "knn_pixel_purity.png", dpi=100, bbox_inches="tight")
-    plt.close(fig)
-    print("  saved knn_pixel_purity.png")
-
-
-def _plot_scatter(s_emb, t_emb, labels, reducer_name, out_dir, tag):
-    n = len(PIXEL_CLASS_NAMES)
-    colors = plt.cm.tab10(np.linspace(0, 1, n))
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    for ax, emb, name in zip(axes, [s_emb, t_emb], ["Student", "Teacher"]):
-        for c in range(n):
-            m = labels == c
-            ax.scatter(emb[m, 0], emb[m, 1], s=1.5, alpha=0.2, color=colors[c],
-                       label=PIXEL_CLASS_NAMES[c], rasterized=True)
-        ax.set_title(name)
-        ax.set_xlabel(f"{reducer_name} 1"); ax.set_ylabel(f"{reducer_name} 2")
-        ax.legend(markerscale=5, fontsize=8)
-    fig.suptitle(f"Pixel PID {reducer_name} scatter  [{tag}]", fontsize=12)
-    fig.tight_layout()
-    fig.savefig(out_dir / "knn_pixel_scatter.png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print("  saved knn_pixel_scatter.png")
-
-
-# ---------------------------------------------------------------------------
 # driver
 # ---------------------------------------------------------------------------
 
-def run_one(npz_path: Path, args, out_dir: Path) -> dict:
+def run_one(npz_path: Path, args) -> dict:
     # Which branches the file carries. `load_features` takes one at a time, so
     # peek at the archive index first (np.load is lazy — this reads no arrays).
     sources = [b for b in ("student", "teacher")
@@ -462,14 +342,6 @@ def run_one(npz_path: Path, args, out_dir: Path) -> dict:
                 pix_cls, pr, labels=list(range(len(PIXEL_CLASS_NAMES)))).tolist(),
         }}
 
-    if not args.no_plots:
-        # Plots take a student/teacher pair; with one branch it is plotted alone.
-        pair_acc = [accs[src] for src in sources]
-        pair_pred = [preds[src] for src in sources]
-        _plot_accuracy(pair_acc[0], pair_acc[-1], args.knn_k, out_dir, npz_path.stem)
-        _plot_confusion(pair_pred[0], pair_pred[-1], pix_cls, args.knn_k,
-                        out_dir, npz_path.stem)
-
     if args.with_purity:
         ks = [int(k) for k in args.ks.split(",")]
         pur = {src: knn_purity(X, pix_cls, ks, device, args.batch_size)
@@ -480,16 +352,6 @@ def run_one(npz_path: Path, args, out_dir: Path) -> dict:
         for src in sources:
             entries[run_label(npz_path, src)]["knn_pixel"]["purity"] = {
                 str(k): pur[src][k][0] for k in ks}
-        if not args.no_plots:
-            pair = [pur[src] for src in sources]
-            _plot_purity(pair[0], pair[-1], out_dir, npz_path.stem)
-
-    if args.plot_scatter and not args.no_plots:
-        stack = [pix_by_src[src] for src in sources]
-        emb, rname = _reduce_2d(np.concatenate(stack, axis=0), method=args.reducer)
-        N = len(pix_cls)
-        _plot_scatter(emb[:N], emb[N:] if len(stack) > 1 else emb[:N],
-                      pix_cls, rname, out_dir, npz_path.stem)
 
     return entries
 
@@ -499,8 +361,6 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("features", nargs="+", help="feature .npz file(s)")
     ap.add_argument("--out", default="pixel_knn.json", help="output JSON path")
-    ap.add_argument("--out_dir", default="", help="directory for the PNGs "
-                                                  "(default: alongside --out)")
     ap.add_argument("--max_pixels_per_class", type=int, default=50_000,
                     help="max pixels sampled per class (default: 50000)")
     ap.add_argument("--max_pixels_per_image", type=int, default=0,
@@ -512,25 +372,19 @@ def main():
     ap.add_argument("--ks", default="1,5,10,20", help="k values for --with_purity")
     ap.add_argument("--with_purity", action="store_true",
                     help="also compute neighbourhood label purity")
-    ap.add_argument("--plot_scatter", action="store_true", help="2-D UMAP/t-SNE scatter")
-    ap.add_argument("--reducer", default="auto", choices=["auto", "umap", "tsne"])
-    ap.add_argument("--no_plots", action="store_true", help="JSON only, skip the PNGs")
     ap.add_argument("--device", default="", help="torch device (default: cuda if available)")
     ap.add_argument("--batch_size", type=int, default=2048, help="k-NN query batch size")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
     out_path = Path(args.out)
-    out_dir = Path(args.out_dir) if args.out_dir else out_path.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     results = {}
     for p in args.features:
         path = Path(p).resolve()
         if not path.exists():
             print(f"[skip] {path}: not found")
             continue
-        results.update(run_one(path, args, out_dir))
+        results.update(run_one(path, args))
         write_json(results, out_path)
 
     if not results:

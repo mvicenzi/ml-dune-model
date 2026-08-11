@@ -24,12 +24,30 @@ def run_label(path, source: str) -> str:
 
 
 def write_json(results: dict, out_path) -> None:
-    """Write results incrementally, so a long multi-checkpoint run is crash-safe."""
+    """Write results incrementally, so a long multi-checkpoint run is crash-safe.
+
+    Atomic: written to a temp beside the target and renamed over it, because a
+    plain `open(path, "w")` truncates first and leaves the file unreadable for as
+    long as the dump takes. Epoch jobs run concurrently and each one globs the
+    whole directory, so a reader landing in that window would get a decode error
+    on a file that is perfectly good a moment later. `os.replace` is atomic within
+    a filesystem, and the temp is in the same directory to keep it so.
+    """
     import json
+    import os
+    import tempfile
+
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "w") as f:
-        json.dump(results, f, indent=2, sort_keys=True)
+    fd, tmp = tempfile.mkstemp(dir=str(out.parent), prefix=f".{out.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(results, f, indent=2, sort_keys=True)
+        os.replace(tmp, out)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def run_header(fx: Features, seed: int, per_class: int) -> dict:

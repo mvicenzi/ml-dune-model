@@ -157,10 +157,38 @@ Procedure: without training anything, average each event's pixel features into a
 - Score accuracy, macro-F1 and neighbour purity, next to two degenerate answers measured on the same events: guessing uniformly, and always predicting the most common flavor.
 - Repeat on the raw charge inputs only (`channel`, `tick` and log charge), mean-pooled the same way: the difference is what the backbone added, and it guards against a score that only reflects where an event sits or how much charge it deposited.
 
+## 2-D maps (pictures, not metrics)
+
+`plot_embedding.py` reduces the frozen features to 2-D and colours them — by
+pixel particle type (`--mode pid`) or by event flavor (`--mode event`), the same
+two questions the PID and Event-flavor metrics score. `--mode both` does the two
+from a single read.
+
+It is the one plot that cannot be drawn from a result JSON: it needs the feature
+vectors themselves, and decompressing the ~7 GB `.npz` is minutes of
+single-threaded zlib that a login node will not survive. So it runs on a worker
+(`PROBE_STAGES=embed`, see
+[gridutils/diagnostics](../gridutils/diagnostics/README.md)) and caches the 2-D
+points to a few-MB `.npz`. Restyle from that cache locally:
+
+```bash
+python -m probes.plot_embedding embedding_pid_features_10k_ep100.npz --out_dir figures/
+```
+
+Sampling decides whether the picture means anything. `pid` reuses
+`probe_knn_pid.collect`, capping how many pixels of one class come from any one
+event — without that cap an abundant class fills its quota from a handful of
+events and the plot shows one shower rather than showers. `event` reuses
+`probe_event.mean_pool` and its per-event cap.
+
+Read it alongside the numbers, never instead of them: a 2-D reduction distorts
+neighbourhoods by construction, and the distance between two clusters means
+nothing.
+
 ## Outputs
 
 Result JSONs are keyed `<run>:<epoch tag>:<source>`, which is what lets
-`compare.py` merge files from different metrics, epochs and trainings with no
+`merge.py` combine files from different metrics, epochs and trainings with no
 bookkeeping. Each entry embeds its own provenance (checkpoint, epoch, backbone,
 charge-transform parameters, extraction source) and the settings that produced it
 (seed, pool size). Writes are incremental, so a long multi-file run stays

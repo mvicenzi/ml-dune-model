@@ -3,8 +3,8 @@
 The 3D true vertex is projected into this view and every pixel gets its distance
 to it in pixel space. The probe asks a yes/no question about that number — is this
 pixel within `r` pixels of the vertex? — and scores it exactly like the overlap
-probe: a fixed head, the raw-charge inputs as the number to beat, and the
-degenerate answers measured on the same pixels.
+probe: a fixed head, the raw-charge inputs as the number to beat, and a random
+guess measured on the same pixels.
 
 The radius is swept rather than chosen. `r = 20 px` is the headline, but 10 and
 30 are scored alongside it, so a reader can see whether the answer depends on

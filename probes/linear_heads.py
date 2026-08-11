@@ -22,10 +22,10 @@ that one under one scoring procedure.
 fit_svm                         linear SVM, C fixed
 fit_mlp                         Linear(D,128) -> ReLU -> Linear(128,k), Adam
 
-Both are classifiers: every metric in the suite now asks a yes/no or which-class
-question. The regression heads that used to live here went with the last
-regression metric — if one comes back, it should be the MLP at the same capacity
-as `fit_mlp`, not a linear ridge, or the two cannot be read side by side.
+Both are classifiers: every metric in the suite asks a yes/no or which-class
+question. A regression head, if one is ever needed, must be the MLP at the same
+capacity as `fit_mlp` rather than a linear ridge, or its numbers cannot be read
+beside a classification one.
 
 Each returns predictions on the validation pool, never the fitted head: a head is
 trained fresh for every (checkpoint, feature source, metric) and scores exactly

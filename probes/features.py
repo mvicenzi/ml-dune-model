@@ -151,7 +151,7 @@ def log_charge(charge: np.ndarray, min_val: Optional[float] = None,
 def raw_charge_kind(fx: Features) -> str:
     """Which charge transform the raw-charge input uses: `trained` or `log10_1p`.
 
-    Recorded with every result and checked by compare.py, because the two are
+    Recorded with every result and checked by merge.py, because the two are
     different raw-charge inputs: a `trained` delta is not comparable with a
     `log10_1p` one even for the same checkpoint.
     """
