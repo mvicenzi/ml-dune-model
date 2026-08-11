@@ -34,7 +34,8 @@ and cheap to re-run. One GPU extraction pass feeds every metric.
 python -m probes.probe_pid FEATURES.npz --out pid_ep100.json
 python -m probes.probe_knn_pid FEATURES.npz --out pixelknn_ep100.json
 python -m probes.probe_overlap FEATURES.npz --out overlap_ep100.json
-python -m probes.event_probe FEATURES.npz --out event_ep100.json
+python -m probes.probe_instance FEATURES.npz --out instance_ep100.json
+python -m probes.probe_event FEATURES.npz --out event_ep100.json
 ```
 
 ## Available metrics
@@ -44,7 +45,8 @@ python -m probes.event_probe FEATURES.npz --out event_ep100.json
 | PID | `probe_pid.py` | can a trained head read a pixel's particle type off the frozen features? |
 | kNN PID | `probe_knn_pid.py` | do a pixel's nearest neighbours in feature space already carry its class? |
 | Overlap | `probe_overlap.py` | can a trained head tell that a pixel's charge is shared between particles? |
-| Event flavor | `event_probe.py` | do whole events of the same interaction flavor land near each other once pooled? |
+| Instance | `probe_instance.py` | do a pixel's nearest neighbours belong to the same particle it does? |
+| Event flavor | `probe_event.py` | do whole events of the same interaction flavor land near each other once pooled? |
 
 
 ## PID
@@ -100,6 +102,25 @@ Procedure: train a head to answer one yes/no question about each pixel — is mo
 
 ### Notes:
 Types are contaminated at very different rates — Blip 8.7%, DeltaRay 35.4% — so a type's efficiency only means something next to its own rate. That spread is also why the natural population is the one scored: every type is contaminated less than half the time, so a head that knows only the particle type scores F1 = 0 and can contribute nothing to the result. On a balanced pool it would score above zero, and some of the result would be PID in disguise.
+
+## Instance
+
+Procedure: without training anything, look at each pixel's nearest neighbours inside its own event and predict which particle it belongs to, then compare with truth.
+
+- Only pixels carrying instance truth take part. `pixel_trackid` is 0 where there is none, and taking its absolute value would merge every such pixel into one huge fake particle whose members all neighbour each other.
+- Draw up to `--max_queries` pixels (default 100000) uniformly across all events, so each event contributes in proportion to its size.
+- Within the pixel's own event, L2-normalize and take the `--knn_k` (default 5) nearest neighbours by cosine similarity. No pixel is its own neighbour. Neighbours are drawn from the whole event, not just the sampled pixels.
+- The prediction is the most common particle among those neighbours. Score the fraction of pixels where that is the pixel's own particle.
+- Repeat on the raw charge inputs only (`channel`, `tick` and log charge): the difference is what the backbone added.
+- Repeat again on neighbours picked at random from the same event. This is chance, and it is not small: a particle holding half its event is the most common answer among random neighbours most of the time, so a big-particle score cannot be read without it.
+- Report the score again for each size of the pixel's own particle (1, 2-3, 4-9, 10-99, 100-999, 1000+), each next to the fraction of pixels it holds.
+
+### Notes:
+The score is per pixel, not per particle. Half of all particles have three pixels or fewer, so averaging per particle would let particles holding 2% of the charge decide the number; it would also average over a different population than the one sampled. The cost is that big particles dominate — 85% of pixels belong to particles of 100+ — which is what the size breakdown is there to expose.
+
+A pixel whose particle is a single pixel has no companion that could be voted for, so it is wrong whatever the features do. Those pixels are 0.7% of the total, and the ceiling reported beside each score is the fraction that could be right in principle.
+
+There is no confusion matrix here, unlike PID. Particle ids are per-event labels, so id 7 in one event has nothing to do with id 7 in another and predictions cannot be pooled into a shared set of classes. Only the accuracy is poolable.
 
 ## Event flavor
 

@@ -27,7 +27,7 @@ sanity curve rather than a decider. `dino/diagnostics/plot_knn.py` produces the
 plotted version of the same idea; this one writes JSON for run-to-run tables.
 
 Usage:
-  python -m probes.event_probe FEATURES.npz [MORE.npz ...] --out event_probe.json
+  python -m probes.probe_event FEATURES.npz [MORE.npz ...] --out event_probe.json
 """
 
 import argparse
