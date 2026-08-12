@@ -23,6 +23,7 @@ from the CSV are skipped, so a partial suite still plots.
 
 import argparse
 import csv
+import glob
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -72,7 +73,19 @@ def _chance_vertex(entry):
 
 
 def _chance_event(entry):
-    return walk(entry, ["chance"])
+    """The majority-class floor, not the uniform one.
+
+    The panel plots accuracy, and always predicting the most common flavor is the
+    reference a reader needs there: it is the higher of the two floors (0.378 vs
+    0.332 on the mixed production) and the one an accuracy has to clear to mean
+    anything. The F1 panels use `uniform` because a majority guess scores F1 = 0
+    on a minority class, which is no reference at all.
+
+    The second path reads files written before the metric moved under `event_knn`,
+    where `chance` was the majority fraction as a bare number.
+    """
+    return (walk(entry, ["event_knn", "chance", "majority", "accuracy"])
+            or walk(entry, ["chance"]))
 
 
 # (title, feature column, raw column or None, chance accessor or None). A margin
@@ -203,7 +216,14 @@ def plot_trajectories(rows, columns, merged, out_dir: Path, stem: str) -> None:
         if used:
             axes[max(used)][c].set_xlabel("epoch")
 
-    flat[0].legend(fontsize=8)
+    # One legend per panel rather than one for the figure: the chance entry is
+    # written by _draw_chance and carries that panel's own level and spread, so a
+    # single shared legend would show one panel's chance against every panel's
+    # curves. Panels with nothing labelled are skipped, which is what matplotlib
+    # warns about otherwise.
+    for ax in flat[:len(panels)]:
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=8)
     fig.suptitle("Probe scores vs epoch — solid = frozen features, "
                  "dashed = raw charge (channel, tick, log charge), "
                  "dotted = chance", fontsize=12)
@@ -239,8 +259,12 @@ def plot_pid_per_class(merged, out_dir: Path, stem: str) -> None:
 
     ncol = 3
     nrow = (len(types) + ncol - 1) // ncol
+    # Each type scales to its own range, so the shape of a trajectory is visible
+    # even where the numbers are small. The cost is that panel heights no longer
+    # compare: Other peaks near 0.09 and Track near 0.50, and both fill their
+    # panel. Read the axis, not the height.
     fig, axes = plt.subplots(nrow, ncol, figsize=(4.2 * ncol, 3.2 * nrow),
-                             sharex=True, sharey=True, squeeze=False)
+                             sharex=True, squeeze=False)
     flat = axes.ravel()
     drew = False
 
@@ -271,7 +295,9 @@ def plot_pid_per_class(merged, out_dir: Path, stem: str) -> None:
         used = [r for r in range(nrow) if r * ncol + c < len(types)]
         if used:
             axes[max(used)][c].set_xlabel("epoch")
-    flat[0].legend(fontsize=8)
+    for ax in flat[:len(types)]:
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=8)
     fig.suptitle("Per-type PID F1 vs epoch, MLP head, balanced pool "
                  "(solid = features, dashed = raw charge)", fontsize=12)
     fig.tight_layout()
@@ -288,15 +314,17 @@ def plot_knn_pid(merged, out_dir: Path, stem: str) -> None:
 
     One row per entry: with several epochs or runs in the merge this draws each
     of them, which is the point — a confusion matrix is read by comparing it with
-    another one.
+    another one. Rows run in epoch order for that reason; sorting the labels as
+    plain strings puts ep100 above ep10.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    have = [(l, e["knn_pixel"]) for l, e in sorted(merged.items())
-            if isinstance(e.get("knn_pixel"), dict)
-            and e["knn_pixel"].get("confusion")]
+    order = sorted(merged, key=lambda s: (s.split(":")[0], epoch_of(s), s))
+    have = [(l, merged[l]["knn_pixel"]) for l in order
+            if isinstance(merged[l].get("knn_pixel"), dict)
+            and merged[l]["knn_pixel"].get("confusion")]
     if not have:
         return
 
@@ -371,9 +399,15 @@ def main():
         raise SystemExit(f"{path}: no rows")
     print(f"{len(rows)} row(s), {len(columns)} column(s) from {path}")
 
-    merged = load_all(args.json) if args.json else {}
-    if args.json:
-        print(f"{len(merged)} entrie(s) from {len(args.json)} JSON path(s) "
+    # Expanded here, because the usage above quotes the pattern to keep it off the
+    # positional argument — so the shell hands it over unexpanded and nothing else
+    # would. A pattern that matches nothing is passed through, so a mistyped path
+    # still reports itself as not found instead of vanishing.
+    paths = [m for p in args.json for m in (sorted(glob.glob(p)) or [p])]
+
+    merged = load_all(paths) if paths else {}
+    if paths:
+        print(f"{len(merged)} entrie(s) from {len(paths)} JSON file(s) "
               f"for chance and per-class")
     else:
         print("no --json given: chance lines and the per-class figure are skipped")

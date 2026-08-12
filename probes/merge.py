@@ -47,6 +47,16 @@ COLUMNS = [
     ("ov_f1",      "overlap.f1_mlp_feat",               4),
     ("ov_f1_raw",  "overlap.f1_mlp_raw",                4),
     ("d_ov_f1",    "overlap.delta_f1_mlp",              4),
+    # The delta's sign is not the same for both heads — on the mixed production
+    # the SVM makes the features win the same call the MLP makes them lose. The
+    # headline stays the MLP; this column is here so that disagreement is on the
+    # table rather than one head's answer standing in for "the" result.
+    ("d_ov_f1_svm", "overlap.delta_f1_svm",             4),
+    # A random guess on the same pixels, so the F1 columns above can be read.
+    # Reached through the sweep because only the scores are flattened to the top
+    # of the probe's entry; the headline sweep key is hardcoded, and
+    # check_comparability warns when rows do not share it.
+    ("ov_chance",  ["overlap", "sweep", "0.2", "chance", "uniform", "f1"], 4),
     # Instance: macro over particle-size bins of the margin over chance. NOT an
     # accuracy — chance runs from 0.00 in the small bins to 0.72 in the largest,
     # so the raw accuracy is not comparable across bins and the pooled figure
@@ -58,9 +68,21 @@ COLUMNS = [
     ("vtx_f1",     "vertex.f1_mlp_feat",                4),
     ("vtx_f1_raw", "vertex.f1_mlp_raw",                 4),
     ("d_vtx_f1",   "vertex.delta_f1_mlp",               4),
-    ("knn10",      "feat.10.accuracy",                  4),
-    ("d_knn10",    "delta_accuracy.10",                 4),
-    ("knn10_f1",   "feat.10.macro_f1",                  4),
+    # Coin-flip F1 on the same pixels. Worth reading before the delta: near-vertex
+    # pixels are ~5% of the image and both sides land close to this floor, which
+    # a bare F1 of 0.13 against 0.16 does not show.
+    ("vtx_chance", ["vertex", "sweep", "20", "chance", "f1"], 4),
+    ("knn10",      ("event_knn.feat.10.accuracy",
+                    "feat.10.accuracy"),                4),
+    ("d_knn10",    ("event_knn.delta_accuracy.10",
+                    "delta_accuracy.10"),               4),
+    ("knn10_f1",   ("event_knn.feat.10.macro_f1",
+                    "feat.10.macro_f1"),                4),
+    # Always predicting the most common flavor. The majority floor rather than the
+    # uniform one because the column beside it is an accuracy, and that is the
+    # floor an accuracy has to clear. Older files stored it as a bare number.
+    ("evt_chance", ("event_knn.chance.majority.accuracy",
+                    "chance"),                          4),
     # Non-parametric pixel k-NN (probes.probe_knn_pid). Not leakage-free —
     # a relative tracking curve, not comparable with the trained-head columns.
     ("knnpix",     "knn_pixel.overall_accuracy",        4),
@@ -78,7 +100,8 @@ METRIC_PROBES = [
     ("overlap",       ("overlap",),        ("overlap.",)),
     ("instance",      ("instance",),       ("instance.",)),
     ("vertex",        ("vertex",),         ("vertex.",)),
-    ("event flavor",  ("delta_accuracy",), ("feat.", "delta_accuracy.")),
+    ("event flavor",  ("event_knn", "delta_accuracy"),
+                      ("event_knn.", "feat.", "delta_accuracy.")),
     ("kNN PID",       ("knn_pixel",),      ("knn_pixel.",)),
 ]
 
@@ -86,8 +109,14 @@ METRIC_PROBES = [
 def dig(entry: dict, path):
     """Follow a dotted path; None if any step is missing or not a mapping.
 
-    `path` may be a tuple of alternatives, tried in order — used for keys that
-    were renamed, so old and new result files merge into one table.
+    `path` may be:
+      "a.b.c"        dotted, the usual form
+      ["a", "0.2"]   an explicit key list, for keys that contain a dot — the
+                     sweeps are keyed by their threshold, and overlap's headline
+                     is the literal key "0.2", which a dotted path would split
+                     into "0" and "2"
+      (p1, p2)       alternatives, tried in order — used for keys that were
+                     renamed, so old and new result files merge into one table
     """
     if isinstance(path, tuple):
         for alt in path:
@@ -96,11 +125,16 @@ def dig(entry: dict, path):
                 return v
         return None
     cur = entry
-    for part in path.split("."):
+    for part in (path if isinstance(path, list) else path.split(".")):
         if not isinstance(cur, dict) or part not in cur:
             return None
         cur = cur[part]
     return cur
+
+
+def path_str(path) -> str:
+    """A dotted rendering of any `dig` path, for the coverage check's prefixes."""
+    return ".".join(path) if isinstance(path, list) else path
 
 
 def epoch_of(label: str) -> int:
@@ -204,7 +238,8 @@ def report_coverage(merged: dict, active) -> None:
     """
     paths = []
     for _, path, _ in active:
-        paths.extend(path if isinstance(path, tuple) else [path])
+        alts = path if isinstance(path, tuple) else (path,)
+        paths.extend(path_str(a) for a in alts)
 
     missing, mismatched = [], []
     for label, namespaces, prefixes in METRIC_PROBES:
@@ -255,6 +290,13 @@ def main():
         raise SystemExit("no results found")
     check_comparability(merged)
     header, rows = build_rows(merged)
+
+    # What the `_raw` and `d_` columns are measured against. Named here because
+    # "raw" reads as charge alone, and two of its three columns are the pixel's
+    # position — so a negative delta on a spatial task says the features did not
+    # beat knowing where the pixel is, which is not the same claim.
+    print("raw baseline = [channel, tick, log_charge] per pixel (probes/features.py)."
+          "  d_ = feat - raw.\n")
 
     widths = {c: max(len(c), *(len(r[c]) for r in rows)) for c in header}
     if args.markdown:
