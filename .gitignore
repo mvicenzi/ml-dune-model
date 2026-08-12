@@ -1,5 +1,6 @@
 __pycache__
 /data/*.pt
+/data/*.npz
 checkpoints*
 dino_debug
 dino_checkpoints
