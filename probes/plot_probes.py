@@ -16,9 +16,15 @@ the two sources cannot drift apart.
   python -m probes.plot_probes table.csv --json '.../probes/*_ep*.json' \
       --out_dir figures/
 
-One panel per metric, one colour per run, solid for the frozen features, dashed
-for the raw charge inputs, dotted for chance. Panels whose columns are absent
-from the CSV are skipped, so a partial suite still plots.
+One panel per metric, one colour per run. Every drawn series is named in the
+panel's legend — the runs, the raw-charge baseline and chance alike — so no line
+style has to be decoded from a caption. Panels whose columns are absent from the
+CSV are skipped, so a partial suite still plots.
+
+Everything here is a trajectory across epochs, which is what a comparison between
+runs needs. `--pid_confusion EPOCH` is the exception and is off by default: a
+confusion matrix portrays one model at one checkpoint rather than comparing a
+sweep, so it is asked for explicitly.
 """
 
 import argparse
@@ -148,6 +154,33 @@ def _run_keys(labels):
                    if epoch_of(l) >= 0})
 
 
+def _draw_raw(ax, raw_by_key, colors, n_sources):
+    """The raw-charge baseline, as a labelled series.
+
+    Raw charge is scored with no learned weights, so every run reading the same
+    extraction must reproduce it to full precision. When they do it is one line,
+    drawn neutral because it belongs to no run — labelling it per run would claim
+    two measurements where there is one. When they disagree the runs were scored
+    over different events and the comparison is void, so each is drawn and named:
+    the discrepancy has to be visible, not hidden under whichever draws last.
+    """
+    if not raw_by_key:
+        return
+    every = list(raw_by_key.values())
+    first = every[0]
+    agree = all(len(s) == len(first)
+                and all(a == b for a, b in zip(s, first)) for s in every)
+    if agree:
+        ax.plot([p[0] for p in first], [p[1] for p in first], color="#666666",
+                label="raw charge (channel, tick, log q)", **RAW_STYLE)
+        return
+    for key, pts in raw_by_key.items():
+        run, source = key
+        name = f"{run} ({source})" if n_sources > 1 else run
+        ax.plot([p[0] for p in pts], [p[1] for p in pts],
+                color=colors[key], label=f"{name} — raw charge", **RAW_STYLE)
+
+
 def _draw_chance(ax, values):
     """One dotted line for chance, with its spread if it moves across epochs.
 
@@ -192,9 +225,7 @@ def plot_trajectories(rows, columns, merged, out_dir: Path, stem: str) -> None:
             label = f"{run} ({source})" if n_sources > 1 else run
             ax.plot([p[0] for p in pts], [p[1] for p in pts],
                     color=colors[key], label=label, **FEAT_STYLE)
-            if key in raw:
-                ax.plot([p[0] for p in raw[key]], [p[1] for p in raw[key]],
-                        color=colors[key], **RAW_STYLE)
+        _draw_raw(ax, raw, colors, n_sources)
         if chance == "zero":
             ax.axhline(0.0, color="#666666", linestyle=":", linewidth=1.2,
                        label="chance (subtracted)")
@@ -216,17 +247,16 @@ def plot_trajectories(rows, columns, merged, out_dir: Path, stem: str) -> None:
         if used:
             axes[max(used)][c].set_xlabel("epoch")
 
-    # One legend per panel rather than one for the figure: the chance entry is
-    # written by _draw_chance and carries that panel's own level and spread, so a
-    # single shared legend would show one panel's chance against every panel's
-    # curves. Panels with nothing labelled are skipped, which is what matplotlib
+    # One legend per panel rather than one for the figure: the chance and raw
+    # entries are written per panel and carry that panel's own level, so a single
+    # shared legend would show one panel's baselines against every panel's curves.
+    # Every drawn series is labelled, so nothing needs a line-style key outside the
+    # axes. Panels with nothing labelled are skipped, which is what matplotlib
     # warns about otherwise.
     for ax in flat[:len(panels)]:
         if ax.get_legend_handles_labels()[0]:
             ax.legend(fontsize=8)
-    fig.suptitle("Probe scores vs epoch — solid = frozen features, "
-                 "dashed = raw charge (channel, tick, log charge), "
-                 "dotted = chance", fontsize=12)
+    fig.suptitle("Probe scores vs epoch", fontsize=12)
     fig.tight_layout()
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -269,17 +299,16 @@ def plot_pid_per_class(merged, out_dir: Path, stem: str) -> None:
     drew = False
 
     for ax, t in zip(flat, types):
-        for src, style in (("mlp_feat", FEAT_STYLE), ("mlp_raw", RAW_STYLE)):
-            s = json_series(merged,
-                            lambda e, t=t, src=src: walk(
-                                e, ["pid", "per_class_f1", src, t]))
-            for key, pts in s.items():
-                run, source = key
-                label = (f"{run} ({source})" if n_sources > 1 else run) \
-                    if src == "mlp_feat" else None
-                ax.plot([p[0] for p in pts], [p[1] for p in pts],
-                        color=colors[key], label=label, **style)
-                drew = True
+        feat = json_series(merged, lambda e, t=t: walk(
+            e, ["pid", "per_class_f1", "mlp_feat", t]))
+        for key, pts in feat.items():
+            run, source = key
+            label = f"{run} ({source})" if n_sources > 1 else run
+            ax.plot([p[0] for p in pts], [p[1] for p in pts],
+                    color=colors[key], label=label, **FEAT_STYLE)
+            drew = True
+        _draw_raw(ax, json_series(merged, lambda e, t=t: walk(
+            e, ["pid", "per_class_f1", "mlp_raw", t])), colors, n_sources)
         ax.set_title(t, fontsize=11)
         ax.grid(alpha=0.3, linewidth=0.6)
 
@@ -298,8 +327,7 @@ def plot_pid_per_class(merged, out_dir: Path, stem: str) -> None:
     for ax in flat[:len(types)]:
         if ax.get_legend_handles_labels()[0]:
             ax.legend(fontsize=8)
-    fig.suptitle("Per-type PID F1 vs epoch, MLP head, balanced pool "
-                 "(solid = features, dashed = raw charge)", fontsize=12)
+    fig.suptitle("Per-type PID F1 vs epoch, MLP head, balanced pool", fontsize=12)
     fig.tight_layout()
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -309,73 +337,150 @@ def plot_pid_per_class(merged, out_dir: Path, stem: str) -> None:
     print(f"  saved {path}  ({len(types)} types)")
 
 
-def plot_knn_pid(merged, out_dir: Path, stem: str) -> None:
-    """kNN-PID per-class recall and the confusion matrix, from the JSON.
+def _knn_classes(merged):
+    for entry in merged.values():
+        kp = entry.get("knn_pixel")
+        if isinstance(kp, dict) and kp.get("classes"):
+            return list(kp["classes"])
+    return []
 
-    One row per entry: with several epochs or runs in the merge this draws each
-    of them, which is the point — a confusion matrix is read by comparing it with
-    another one. Rows run in epoch order for that reason; sorting the labels as
-    plain strings puts ep100 above ep10.
+
+def plot_knn_recall(merged, out_dir: Path, stem: str) -> None:
+    """kNN-PID per-class recall against epoch, one panel per class.
+
+    The untrained k-NN answers "is the class separable in feature space at all",
+    so what matters is how each class moves with training and how the runs differ
+    — a trajectory. Drawing the classes as bars per checkpoint instead gives one
+    chart per checkpoint and no way to compare across them.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    order = sorted(merged, key=lambda s: (s.split(":")[0], epoch_of(s), s))
-    have = [(l, merged[l]["knn_pixel"]) for l in order
-            if isinstance(merged[l].get("knn_pixel"), dict)
-            and merged[l]["knn_pixel"].get("confusion")]
-    if not have:
+    classes = _knn_classes(merged)
+    if not classes:
         return
 
-    fig, axes = plt.subplots(len(have), 2, figsize=(11, 4.2 * len(have)),
-                             squeeze=False)
-    for row, (label, kp) in enumerate(have):
-        classes = kp.get("classes") or []
-        # Per-class recall, next to the macro and overall figures.
-        ax = axes[row][0]
-        acc = kp.get("per_class_accuracy") or {}
-        vals = [acc.get(c) for c in classes]
-        ok = [(c, v) for c, v in zip(classes, vals) if v is not None]
-        if ok:
-            ax.bar([c for c, _ in ok], [v for _, v in ok], color="#0072B2")
-            for i, (_, v) in enumerate(ok):
-                ax.text(i, v, f"{v:.3f}", ha="center", va="bottom", fontsize=8)
-        ax.axhline(kp.get("overall_accuracy", 0.0), color="#666666",
-                   linestyle=":", linewidth=1.2,
-                   label=f"overall {kp.get('overall_accuracy', float('nan')):.3f}")
-        ax.set_ylabel("recall")
-        ax.set_title(f"{label}\nper-class recall  (macro-F1 "
-                     f"{kp.get('macro_f1', float('nan')):.3f}, k={kp.get('knn_k')})",
-                     fontsize=10)
-        ax.tick_params(axis="x", rotation=45)
-        ax.legend(fontsize=8)
+    runs = _run_keys(merged)
+    colors = {k: RUN_COLORS[i % len(RUN_COLORS)] for i, k in enumerate(runs)}
+    n_sources = len({k[1] for k in runs})
 
-        # Row-normalised confusion: each row is "of the pixels really this class,
-        # where did they go", which is what makes the diagonal comparable across
-        # classes drawn from pools of different size.
-        ax = axes[row][1]
-        cm = kp["confusion"]
-        norm = []
-        for r in cm:
-            tot = sum(r)
-            norm.append([v / tot if tot else 0.0 for v in r])
+    ncol = 3
+    nrow = (len(classes) + ncol - 1) // ncol
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4.2 * ncol, 3.2 * nrow),
+                             sharex=True, squeeze=False)
+    flat = axes.ravel()
+    drew = False
+
+    for ax, c in zip(flat, classes):
+        s = json_series(merged, lambda e, c=c: walk(
+            e, ["knn_pixel", "per_class_accuracy", c]))
+        for key, pts in s.items():
+            run, source = key
+            label = f"{run} ({source})" if n_sources > 1 else run
+            ax.plot([p[0] for p in pts], [p[1] for p in pts],
+                    color=colors[key], label=label, **FEAT_STYLE)
+            drew = True
+        ax.set_title(c, fontsize=11)
+        ax.grid(alpha=0.3, linewidth=0.6)
+
+    if not drew:
+        plt.close(fig)
+        return
+
+    for ax in flat[len(classes):]:
+        ax.axis("off")
+    for r in range(nrow):
+        axes[r][0].set_ylabel("recall")
+    for c in range(ncol):
+        used = [r for r in range(nrow) if r * ncol + c < len(classes)]
+        if used:
+            axes[max(used)][c].set_xlabel("epoch")
+    # One legend for the figure, not per panel: every panel carries the same two
+    # series, and six identical boxes sit on top of the curves they explain. The
+    # trajectory figure keeps per-panel legends because its chance and raw lines
+    # differ from panel to panel; these do not.
+    handles, labels = flat[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, fontsize=9, ncol=len(labels),
+                   loc="lower center", bbox_to_anchor=(0.5, -0.01))
+    fig.suptitle("kNN PID per-class recall vs epoch (untrained, balanced pool)",
+                 fontsize=12)
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{stem}.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {path}  ({len(classes)} classes, {len(runs)} run(s))")
+
+
+def plot_pid_confusion(merged, out_dir: Path, stem: str, epoch: int) -> None:
+    """The 7-class PID confusion at ONE checkpoint, features beside raw charge.
+
+    Row-normalised, so a row reads "of the pixels really this class, where did
+    they go" — which is what makes the diagonal comparable across classes drawn
+    from pools of very different size.
+
+    One checkpoint on purpose: a confusion matrix is a portrait of a model, not a
+    trajectory, and stacking one per epoch produces a strip nobody can read. The
+    epoch-by-epoch story belongs in the per-class F1 figure. The raw-charge panel
+    is the one comparison worth making here, because it is measured on the same
+    pixels at the same checkpoint and shows what the features add.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    want = [l for l in merged if epoch_of(l) == epoch
+            and walk(merged[l], ["pid", "confusion", "mlp_feat"])]
+    if not want:
+        print(f"  no PID confusion at epoch {epoch}; skipping")
+        return
+    want.sort()
+
+    classes = walk(merged[want[0]], ["pid", "classes"]) or []
+    n_sources = len({l.split(":")[-1] for l in want})
+
+    panels = []
+    for label in want:
+        run, source = label.split(":")[0], label.split(":")[-1]
+        name = f"{run} ({source})" if n_sources > 1 else run
+        panels.append((name, walk(merged[label], ["pid", "confusion", "mlp_feat"])))
+    # Raw carries no learned weights, so every run at this checkpoint reproduces
+    # it; drawing it once says one measurement rather than implying several.
+    raw = walk(merged[want[0]], ["pid", "confusion", "mlp_raw"])
+    if raw:
+        panels.append(("raw charge (channel, tick, log q)", raw))
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(5.0 * len(panels), 4.6),
+                             squeeze=False)
+    for ax, (name, cm) in zip(axes[0], panels):
+        norm = [[v / sum(r) if sum(r) else 0.0 for v in r] for r in cm]
         im = ax.imshow(norm, cmap="viridis", vmin=0.0, vmax=1.0)
-        plt.colorbar(im, ax=ax)
+        plt.colorbar(im, ax=ax, fraction=0.046)
+        # 7x7 at one checkpoint has room for the numbers, and a diagonal read off
+        # a colourbar is a guess. Ink flips on the dark end so both stay legible.
+        for i, row in enumerate(norm):
+            for j, v in enumerate(row):
+                ax.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=7,
+                        color="white" if v < 0.5 else "black")
+        ax.set_title(f"{name}  ep{epoch}", fontsize=10)
         ax.set_xticks(range(len(classes)))
         ax.set_xticklabels(classes, rotation=45, ha="right", fontsize=8)
         ax.set_yticks(range(len(classes)))
         ax.set_yticklabels(classes, fontsize=8)
         ax.set_xlabel("predicted")
         ax.set_ylabel("true")
-        ax.set_title("confusion (row-normalised)", fontsize=10)
 
+    fig.suptitle(f"PID confusion, MLP head, row-normalised — epoch {epoch}",
+                 fontsize=12)
     fig.tight_layout()
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{stem}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  saved {path}  ({len(have)} entrie(s))")
+    print(f"  saved {path}  ({len(panels)} panel(s), {len(classes)} classes)")
 
 
 def main():
@@ -389,6 +494,11 @@ def main():
                     help="directory to write the PNGs to (default: figures)")
     ap.add_argument("--name", default="probe_trajectories",
                     help="output file stem (default: probe_trajectories)")
+    # Opt-in and single-epoch: a confusion matrix portrays one model rather than
+    # comparing a sweep, so it is not part of the trajectory suite.
+    ap.add_argument("--pid_confusion", type=int, metavar="EPOCH",
+                    help="also draw the 7-class PID confusion at this epoch "
+                         "(needs --json); off by default")
     args = ap.parse_args()
 
     path = Path(args.csv)
@@ -415,7 +525,11 @@ def main():
     plot_trajectories(rows, columns, merged, Path(args.out_dir), args.name)
     if merged:
         plot_pid_per_class(merged, Path(args.out_dir), "pid_per_class")
-        plot_knn_pid(merged, Path(args.out_dir), "knn_pid")
+        plot_knn_recall(merged, Path(args.out_dir), "knn_pid")
+        if args.pid_confusion is not None:
+            plot_pid_confusion(merged, Path(args.out_dir),
+                               f"pid_confusion_ep{args.pid_confusion}",
+                               args.pid_confusion)
 
 
 if __name__ == "__main__":
