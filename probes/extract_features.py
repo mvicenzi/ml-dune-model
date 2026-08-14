@@ -55,7 +55,6 @@ can never be mis-scored against the wrong charge transform):
 
 import fire
 import itertools
-import inspect
 import json
 import numpy as np
 import torch
@@ -65,7 +64,7 @@ from torch.utils.data import DataLoader
 from loader.apa_sparse_meta_dataset import APASparseMetaDataset
 from loader.collate import voxels_meta_collate_fn
 from loader.splits import Subset
-from models import BACKBONE_REGISTRY
+from models import BACKBONE_REGISTRY, backbone_kwargs
 from dino.config import DINOConfig
 from dino.projhead import DINOProjectionHead
 from dino.transforms import FeatureLogTransform
@@ -80,37 +79,57 @@ PIXEL_TRUTH_KEYS = {
 }
 
 
+# SinusoidalEncoding registers num_channels // 2 frequencies as a persistent buffer, so a
+# checkpoint states the encoding width it was trained at.
+FREQS_KEY = "bottleneck.attn.to_attn.encoding.0.freqs"
+
+
+def _encoding_dim(state_dict: dict, cfg) -> int:
+    """Encoding width from the checkpoint weights, falling back to the config.
+
+    `cfg` is an unpickled dataclass, so a field absent from an older pickle resolves to
+    the *current* class default rather than to what the run used. Reading the width off
+    the weights instead means a future change to that default cannot silently rebuild an
+    old checkpoint at the wrong width.
+    """
+    freqs = state_dict.get(FREQS_KEY)
+    if freqs is None:
+        return cfg.encoding_dim          # backbone without a positional encoding
+    measured = 2 * freqs.shape[0]
+    if measured != cfg.encoding_dim:
+        print(f"  Note: checkpoint encoding_dim={measured} differs from "
+              f"cfg.encoding_dim={cfg.encoding_dim}; using the checkpoint's.")
+    return measured
+
+
 def _load_backbone(ckpt: dict, key: str, device: torch.device):
     """Rebuild a backbone from a checkpoint, exactly as training built it.
 
-    The kwarg filter below is deliberately the same single-level
-    `inspect.signature` check `dino/model.py` uses, so a rebuilt backbone is the
-    architecture that was actually trained rather than the one the config
-    describes. Those differ today: MAE backbones declare `__init__(self, **kw)`,
-    which `inspect.signature` cannot see through, so `encoding_range` is dropped
-    on both sides and training silently used the hardcoded default. Reproducing
-    that faithfully is the point — "fixing" it here alone would score a network
-    against a positional encoding it was never trained with.
+    Uses the same kwarg check as `dino/model.py`, so the rebuilt backbone is the
+    architecture training constructed from this config.
 
-    For the encoding specifically this is belt-and-braces: warpconvnet's
-    SinusoidalEncoding consumes data_range only to build its `freqs` buffer, and
-    that buffer is persistent, so load_state_dict restores the trained table
-    regardless. The strict load below is what actually guarantees the rebuild
-    matches: any architectural mismatch raises instead of leaving random weights.
+    For the encoding this is belt-and-braces: warpconvnet's SinusoidalEncoding consumes
+    data_range only to build its `freqs` buffer, and that buffer is persistent, so
+    load_state_dict restores the trained table whatever value is passed here. The strict
+    load is what actually guarantees the rebuild matches — any architectural mismatch,
+    including an encoding width that disagrees with the checkpoint, raises instead of
+    leaving random weights.
 
     Returns (model, applied_kwargs) — the kwargs are recorded in the output .npz.
     """
     cfg = ckpt["cfg"]
     backbone_cls = BACKBONE_REGISTRY[cfg.backbone_name]
-    backbone_kwargs = {}
-    if "encoding_range" in inspect.signature(backbone_cls.__init__).parameters:
-        backbone_kwargs["encoding_range"] = cfg.encoding_range
-    model = backbone_cls(**backbone_kwargs).to(device)
+    kwargs = backbone_kwargs(
+        backbone_cls,
+        encoding_range=cfg.encoding_range,
+        encoding_dim=_encoding_dim(ckpt[key], cfg),
+    )
+    model = backbone_cls(**kwargs).to(device)
     model.load_state_dict(ckpt[key])          # strict: mismatches must be loud
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
-    return model, backbone_kwargs
+    return model, kwargs
 
 
 def _load_head(ckpt: dict, key: str, device: torch.device):
@@ -421,10 +440,6 @@ def main(
     print(f"\nLoading {source} backbone ...")
     backbone, applied_kwargs = _load_backbone(ckpt, source, device)
     print(f"  Backbone kwargs applied: {applied_kwargs}")
-    if "encoding_range" not in applied_kwargs:
-        print(f"  Note: cfg.encoding_range={cfg.encoding_range} is not a ctor kwarg for "
-              f"{cfg.backbone_name}; the positional encoding comes from the "
-              f"checkpoint's freqs buffer (see _load_backbone).")
 
     # The projection head is extracted ONLY on explicit request. Presence in the
     # checkpoint is not consent: every DINO (and our MAE) checkpoint carries one,
