@@ -69,7 +69,6 @@ OUT_DIR="${condor_out}/${run_name}/probes"
 mkdir -p "$OUT_DIR"
 
 PROBE_STAGES="${PROBE_STAGES:-pid,knn,overlap,instance,vertex,event}"
-stage_on() { [[ ",${PROBE_STAGES}," == *",$1,"* ]]; }
 echo "Stages: ${PROBE_STAGES}"
 
 # Pin the BLAS/torch thread pools to the CPUs condor actually allocated.
@@ -90,88 +89,26 @@ echo "=== Probes for run: ${run_name}  epoch: ${epoch} ==="
 echo "    Output dir: ${OUT_DIR}"
 echo ""
 
-if stage_on pid; then
-    echo "--- [1/8] probe_pid (particle type, trained head) ---"
-    python -u -m probes.probe_pid "$features" \
-        --out="${OUT_DIR}/pid_ep${epoch}.json" \
-        ${PID_EXTRA_ARGS:-$extra_args}
-    echo ""
-fi
-
-
-# Pool size is modest on purpose: this k-NN is all-pairs over the pool, so cost
-# grows quadratically and this job has no GPU. 10k/class (60k pixels) is a couple
-# of minutes on 4 cores; the 50k/class default would be ~an hour. Raise
-# KNN_MAX_PER_CLASS only when running somewhere with a GPU (--device=cuda).
-if stage_on knn; then
-    echo "--- [2/8] probe_knn_pid (particle type, untrained k-NN) ---"
-    python -u -m probes.probe_knn_pid "$features" \
-        --out="${OUT_DIR}/pixelknn_ep${epoch}.json" \
-        --max_pixels_per_class="${KNN_MAX_PER_CLASS:-10000}" \
-        --device=cpu \
-        ${KNN_EXTRA_ARGS:-}
-    echo ""
-fi
-
-
-if stage_on overlap; then
-    echo "--- [3/8] probe_overlap (is a pixel's charge shared?) ---"
-    python -u -m probes.probe_overlap "$features" \
-        --out="${OUT_DIR}/overlap_ep${epoch}.json" \
-        ${OVERLAP_EXTRA_ARGS:-$extra_args}
-    echo ""
-fi
-
-
-if stage_on instance; then
-    echo "--- [4/8] probe_instance (do neighbours share a particle?) ---"
-    python -u -m probes.probe_instance "$features" \
-        --out="${OUT_DIR}/instance_ep${epoch}.json" \
-        ${INSTANCE_EXTRA_ARGS:-$extra_args}
-    echo ""
-fi
-
-
-# Needs `apa`/`view` provenance in the features file to project the vertex; an
-# extraction predating those aborts here with a message saying so.
-if stage_on vertex; then
-    echo "--- [5/8] probe_vertex (is a pixel near the interaction point?) ---"
-    python -u -m probes.probe_vertex "$features" \
-        --out="${OUT_DIR}/vertex_ep${epoch}.json" \
-        ${VERTEX_EXTRA_ARGS:-$extra_args}
-    echo ""
-fi
-
-
-if stage_on event; then
-    echo "--- [6/8] probe_event (interaction flavor, pooled k-NN) ---"
-    python -u -m probes.probe_event "$features" \
-        --out="${OUT_DIR}/event_ep${epoch}.json" \
-        ${EVENT_EXTRA_ARGS:-$extra_args}
-    echo ""
-fi
-
-
-# Off by default (see PROBE_STAGES above): this one produces a picture, not a
-# number, so it does not belong in every sweep. `--mode both` draws the pixel-PID
-# and the event-flavor view from a single read of the features file, which is
-# minutes of single-threaded zlib and dwarfs the reducing itself.
+# One process for every stage. The runner owns the per-probe flags and reads the
+# same *_EXTRA_ARGS / KNN_MAX_PER_CLASS variables this script used to expand, so
+# submit_probes.sh forwards them unchanged.
 #
-# `$extra_args` is deliberately NOT the fallback here, unlike pid/overlap/instance
-# /vertex/event: it is documented as carrying --device, which plot_embedding does
-# not accept and would abort on. Same reasoning as the knn stage.
+# Why one process: each probe calls `load_features`, and as separate invocations
+# they each read and inflate the whole ~7 GB .npz off GPFS. That repetition, not
+# the arithmetic, is what the job spends its time on -- a four-stage job measured
+# 8 minutes of user CPU against 87 minutes of system time. In one process the
+# first stage pays for the read and the rest reuse the cached object.
 #
-# Per-epoch outputs, matching where the k-NN figures already go:
-#   probes/ep<N>/embedding_{pid,event}.png
-#   probes/ep<N>/embedding_{pid,event}_<features stem>.npz   <- redraw from this
-if stage_on embed; then
-    echo "--- [7/8] plot_embedding (2-D map, pixel PID + event flavor) ---"
-    python -u -m probes.plot_embedding "$features" \
-        --mode=both \
-        --out_dir="${OUT_DIR}/ep${epoch}" \
-        ${EMBED_EXTRA_ARGS:-}
-    echo ""
-fi
+# Held non-fatal so `merge` still runs over whatever completed: the runner keeps
+# going after a failed stage and reports which ones failed in its exit status,
+# which this script re-raises at the end.
+probe_status=0
+python -u -m probes.run_probes "$features" \
+    --out_dir="$OUT_DIR" \
+    --epoch="$epoch" \
+    --stages="$PROBE_STAGES" \
+    $extra_args || probe_status=$?
+echo ""
 
 
 # Merge every result JSON in the directory, so the table grows into a trajectory
@@ -186,7 +123,7 @@ fi
 # is read back out of the per-probe JSONs, which are already on disk and are the
 # real result. Letting a rendering step fail the job would throw away hours of
 # completed probe work and force a rerun that regenerates identical files.
-echo "--- [8/8] merge (all epochs present so far) ---"
+echo "--- merge (all epochs present so far) ---"
 shopt -s nullglob
 result_files=(
     "${OUT_DIR}"/pid_ep*.json
@@ -215,5 +152,12 @@ else
     fi
 fi
 echo ""
+
+# The merge above is deliberately non-fatal, but a failed probe is not: exiting
+# non-zero is what stops a sweep from looking successful while missing metrics.
+if [ "$probe_status" -ne 0 ]; then
+    echo "=== Probes FAILED (see the runner's summary above) ==="
+    exit "$probe_status"
+fi
 
 echo "=== Probes complete! ==="

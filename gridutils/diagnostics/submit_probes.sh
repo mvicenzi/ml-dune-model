@@ -32,17 +32,21 @@ PYENV="${PYENV:-/gpfs01/lbne/users/fm/${USER}/uvenv}"
 # separate probe-ready extraction (e.g. features_probe_ep100.npz).
 FEATURES_PREFIX="${FEATURES_PREFIX:-features_}"
 
-# Sized to the job, not copied from the GPU extraction script. Scoring one 10000-
-# event feature file peaks near 12 GB: the float16 features decompress to 7.0 GB,
-# the truth channels and positions add ~1.4 GB, and building the input baseline
-# costs a transient ~1.8 GB in float64 before the cast. 16 GB leaves ~30% headroom.
+# Measured, not estimated: the runner scores every stage in one process, and
+# condor reported MemoryUsage 17090 MB for a 4-stage sweep and 14649 MB for a
+# 6-stage one. That is above the ~12 GB a single stage needs, because the ~7 GB
+# loaded file stays resident for the whole sweep while python does not return
+# each stage's freed working set to the OS. 24 GB is ~40% over the observed peak.
 #
-# This is not just tidiness — it decides whether the jobs run at all. Asking for
-# 32000 MB *and* 4 CPUs matched **4 slots in the whole pool** and sat idle;
-# 16000 MB with 4 CPUs matches ~44, so a 10-epoch sweep runs concurrently.
-# Check with:
-#   condor_status -const 'Memory >= 16000 && Cpus >= 4' -af Name | wc -l
-REQUEST_MEMORY="${REQUEST_MEMORY:-16000}"
+# Do not drop this to 16000 on the reasoning that one stage fits there — that
+# sizes the old one-process-per-stage layout, and the 4-stage sweep above would
+# be killed. Raise it if a heavier stage is added.
+#
+# The CPU count matters more than the memory for matching: 32000 MB *and* 4 CPUs
+# matched 4 slots in the whole pool and sat idle, while at Cpus>=1 there are ~33
+# slots at 24000 MB. Check with:
+#   condor_status -const 'Memory >= 24000 && Cpus >= 1' -af Name | wc -l
+REQUEST_MEMORY="${REQUEST_MEMORY:-24000}"
 
 # One CPU, because the work is single-threaded and asking for more does not just
 # waste the allocation — it starves the job. This pool is carved into Cpus=1

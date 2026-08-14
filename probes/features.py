@@ -17,6 +17,8 @@ extracted over the same events must produce the same score from it.
 Features are consumed from disk and never recomputed.
 """
 
+import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -26,6 +28,29 @@ import numpy as np
 # Per-pixel truth channels the probes may use, and the extraction flag that
 # writes them. `pixel_labels` needs --pixel_truth; the rest --extra_truth.
 PIXEL_TRUTH_KEYS = ("pixel_labels", "pixel_energyfrac", "pixel_trackid", "pixel_truth_q")
+
+
+# Loaded feature files, keyed by (resolved path, source). Entries are held for
+# the life of the process and are several GB each, so only a runner scoring one
+# file with several probes benefits; a single-probe process loads one and exits.
+#
+# Capped because an entry is ~7 GB: two is enough for the one case that wants a
+# second (probe_knn_pid scores student and teacher together), and the cap keeps a
+# caller that walks several files from accumulating them all in memory.
+_FEATURE_CACHE: dict = {}
+_FEATURE_CACHE_MAX = 2
+
+
+# Wall time of the load, printed once per cache miss. On by default because the
+# load is the single largest line item in a probe job and is not attributable from
+# the outside: `run_probes.run_stage` reports `[Ns total for <stage>]`, which wraps
+# this call, while each probe's own `[Ns]` starts after it.
+#
+# The cost is dominated by neither I/O nor decompression -- on one worker a 581.9 s
+# load read its bytes in 9.0 s (777 MB/s) and inflated them in 69.9 s; the rest is
+# allocator work and page faults for the ~9 GB resident set. So this number tracks
+# memory pressure on the slot, not the file. Set PROBE_LOAD_TIMING=0 to silence.
+_LOAD_TIMING = os.environ.get("PROBE_LOAD_TIMING", "1") != "0"
 
 
 # ---------------------------------------------------------------------------
@@ -75,10 +100,23 @@ def load_features(npz_path, source: str = "student") -> Features:
     Features keep their on-disk dtype (float16). A full-array upcast would cost
     ~2.8 GB on a 10 M-pixel file for no benefit: every consumer indexes a pool
     or one event first, so the cast happens on the small slice instead.
+
+    The result is cached per (file, source) for the life of the process, so a
+    runner that scores several probes in one process reads and inflates the file
+    once instead of once per probe. The file is ~7 GB of compressed npz and no
+    probe mutates what it returns, so the copies would be identical anyway.
     """
     if source not in ("student", "teacher"):
         raise ValueError(f"source must be 'student' or 'teacher', got {source!r}")
     path = Path(npz_path)
+
+    cache_key = (str(path.resolve()), source)
+    hit = _FEATURE_CACHE.get(cache_key)
+    if hit is not None:
+        return hit
+
+    t_start = time.time()
+
     d = np.load(path, allow_pickle=True)
     key = f"{source}_features"
     if key not in d.files:
@@ -112,7 +150,7 @@ def load_features(npz_path, source: str = "student") -> Features:
             v = d[k]
             prov[k] = v.item() if getattr(v, "ndim", 1) == 0 else v.tolist()
 
-    return Features(
+    fx = Features(
         path=path, source=source, feat=feat,
         positions=d["positions"].astype(np.int32),
         charges=np.asarray(d["charges"]).reshape(-1).astype(np.float32),
@@ -122,6 +160,15 @@ def load_features(npz_path, source: str = "student") -> Features:
         vertex_xyz=d["vertex_xyz"].astype(np.float64),
         truth=truth, provenance=prov,
     )
+
+    if _LOAD_TIMING:
+        print(f"  [load_features {time.time() - t_start:.0f}s]", flush=True)
+    # Drop the oldest rather than grow: holding a stale 7 GB entry alongside the
+    # one in use is what would push a 16 GB slot over.
+    while len(_FEATURE_CACHE) >= _FEATURE_CACHE_MAX:
+        del _FEATURE_CACHE[next(iter(_FEATURE_CACHE))]
+    _FEATURE_CACHE[cache_key] = fx
+    return fx
 
 
 # ---------------------------------------------------------------------------
