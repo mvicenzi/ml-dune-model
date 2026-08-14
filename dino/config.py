@@ -34,6 +34,7 @@ class DINOConfig:
     # ============ Backbone ============
     backbone_name: str = "attn_default"  # key into BACKBONE_REGISTRY
     encoding_range: float = 125.0        # sinusoidal positional encoding range
+    encoding_dim: int = 32               # sinusoidal encoding channels per spatial axis
     feature_dim: int = 64                # backbone output channels; must match model's output
     use_proj_head: bool = True           # attach MLP projection head between backbone and loss
     proj_head_hidden_dim: int = 256      # inner MLP width

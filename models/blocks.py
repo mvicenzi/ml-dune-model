@@ -157,9 +157,18 @@ class ResidualSparseBlock2D(nn.Module):
 
 class BottleneckSparseAttention2D(nn.Module):
     """
-    Sparse transformer-style bottleneck using WarpConvNet's PatchAttention.
-    Operates directly on Geometry (e.g. Voxels), so we never densify.
-    Flow: norm -> PathAttention -> residual -> MLP -> residual.
+    Sparse transformer-style bottleneck built on SpatialFeatureAttention2D
+    (models/attention2D.py), which subclasses WarpConvNet's Attention with a
+    positional encoding over 2D coordinates. Operates directly on Geometry
+    (e.g. Voxels), so we never densify.
+
+    Flow: 1x1 conv in -> norm -> attention -> residual
+                      -> norm -> MLP       -> residual -> 1x1 conv out.
+
+    The norm/residual layout is stream-norm (`x = norm(x); x = sublayer(x) + x`),
+    so the residual stream itself stays normalised and gradients flow through the
+    norm on the skip path. This matches WarpConvNet's `StreamNormBlock`, one of
+    the three variants in its `BLOCK_REGISTRY`; it is not pre-norm.
     """
     def __init__(self, channels: int, attn_channels: int, heads: int = 4, 
                  attn_drop: float = 0.0, proj_drop: float = 0.0, mlp_ratio: float = 2.0,

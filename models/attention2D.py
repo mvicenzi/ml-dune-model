@@ -28,10 +28,6 @@ class ToAttentionSmart(BaseSpatialModule):
         concat_input: bool = True,
         num_spatial_features: int = 3,
         out_type: Literal["nested", "cat"] = "cat",
-        # NEW: how wide should pos_enc be?
-        # - "per_head" -> out_channels // num_heads  (for non-flash: add to Q/K)
-        # - "full"     -> out_channels              (for flash: add to x)
-        pos_enc_mode: Literal["per_head", "full"] = "per_head",
     ):
         super().__init__()
         self.out_type = out_type
@@ -42,12 +38,10 @@ class ToAttentionSmart(BaseSpatialModule):
             assert encoding_range is not None, "encoding_range must be provided"
             assert out_channels % num_heads == 0, "out_channels must be divisible by num_heads"
 
-            if pos_enc_mode == "per_head":
-                pos_out = out_channels // num_heads
-            elif pos_enc_mode == "full":
-                pos_out = out_channels
-            else:
-                raise ValueError(f"Unknown pos_enc_mode={pos_enc_mode}")
+            # The encoding is injected into q and k after the qkv projection, where a
+            # head-dim-wide tensor broadcasts across heads. Both attention paths do this,
+            # so a single width serves them.
+            pos_out = out_channels // num_heads
 
             in_feats = num_encoding_channels * num_spatial_features + (
                 num_spatial_features if concat_input else 0
@@ -84,10 +78,20 @@ class ToAttentionSmart(BaseSpatialModule):
             pos_enc = cat_to_pad_tensor(pos_enc_cat, offsets)            # [B, N, pos_out]
         else:
             pos_enc = None
-            pos_enc_cat = None
 
         mask = offset_to_mask(features, offsets, features.shape[1])      # [B, 1, N, N] (bool)
-        return features, pos_enc, pos_enc_cat, mask, num_points
+        return features, pos_enc, mask, num_points
+
+    def forward_flash(self, x: Geometry):
+        """Positional encoding alone, on the concatenated [M, C] layout.
+
+        The varlen flash kernel consumes the concatenated features directly, so the
+        padded features, the padded encoding and the quadratic [B, 1, N, N] mask that
+        forward() builds for the dense path are never read on that branch.
+        """
+        if not self.use_encoding:
+            return None
+        return self.encoding(x.coordinate_tensor)                        # [M, pos_out]
 
 
 ### This is based on what offered by WarpConvNet but adjusting
@@ -100,7 +104,9 @@ class SpatialFeatureAttention2D(Attention):
     Supports:
       - flash ON/OFF
       - encoding ON/OFF
-    and chooses positional encoding width to be compatible with the injection site.
+    Both paths inject the positional encoding the same way: head-dim wide, into q and
+    k after the qkv projection. They differ only in the attention kernel and in whether
+    the features are padded, so they compute the same operator.
     """
 
     def __init__(
@@ -129,11 +135,6 @@ class SpatialFeatureAttention2D(Attention):
             use_batched_qkv=use_batched_qkv,
         )
 
-        # Decide how wide pos_enc should be:
-        # - flash path adds pos_enc to x -> needs full C
-        # - non-flash adds pos_enc to q/k per head -> head_dim
-        pos_enc_mode = "full" if (enable_flash and use_encoding) else "per_head"
-
         self.to_attn = ToAttentionSmart(
             out_channels=dim,
             use_encoding=use_encoding,
@@ -143,25 +144,22 @@ class SpatialFeatureAttention2D(Attention):
             concat_input=True,
             num_spatial_features=2,     # <-- the whole point: 2D
             out_type="cat",
-            pos_enc_mode=pos_enc_mode,  # <-- new: resolves flash/encoding mismatch
         )
         self.from_attn = ToSpatialFeatures()
 
     def forward(self, x: Geometry) -> Geometry:
 
-        # extract padded tensors from the original concatenated tensor
-        # this is used for the non flash path with an appropriate mask
-        features, pos_enc, pos_enc_cat, mask, num_points = self.to_attn(x)
-
         if not self.enable_flash:
+            # extract padded tensors from the original concatenated tensor
+            # this path needs them, plus an appropriate mask
+            features, pos_enc, mask, num_points = self.to_attn(x)
+
             B, N, C = features.shape
             qkv = self.qkv(features).reshape(B, N, 3, C)
 
             # Reshape to [B, N, 3, num_heads, head_dim]
             qkv = qkv.reshape(B, N, 3, self.num_heads, C // self.num_heads)
 
-            # Note: with flash + encoding, pos_enc is [B, N, C] so x + pos_enc works.
-            # With non-flash + encoding, pos_enc is [B, N, head_dim] so q/k addition works.
             qkv = qkv.permute(2, 0, 3, 1, 4)
             q, k, v = (
                 qkv[0],
@@ -196,12 +194,18 @@ class SpatialFeatureAttention2D(Attention):
             return self.from_attn(y, x)
         # use flash_attn on the concatenated tensor directly, no need to use padded and convert it back
         else:
+            pos_enc_cat = self.to_attn.forward_flash(x)                   # [M, head_dim]
             feats, offsets = x.features, x.offsets
             M, C = feats.shape[:2]
-            if pos_enc_cat is not None:
-                feats = feats + pos_enc_cat
 
             qkv = self.qkv(feats).reshape(M, 3, self.num_heads, C // self.num_heads)
+            # Inject the encoding per-head into q and k only, never v, so it acts as a
+            # pure attention bias instead of leaking position into aggregated content.
+            # Done before the fp16 cast below so the encoding keeps full precision.
+            if pos_enc_cat is not None:
+                pe = pos_enc_cat.unsqueeze(1)                             # [M, 1, head_dim]
+                qkv = torch.stack([qkv[:, 0] + pe, qkv[:, 1] + pe, qkv[:, 2]], dim=1)
+
             if qkv.dtype not in [torch.float16, torch.bfloat16]:
                 qkv = qkv.to(torch.float16)
             # Warning: When the loss is NaN, this module will fail during backward with
@@ -223,4 +227,3 @@ class SpatialFeatureAttention2D(Attention):
             out_feat = self.proj_drop(out_feat)
 
             return x.replace(batched_features=out_feat.to(feats.dtype))
-        return

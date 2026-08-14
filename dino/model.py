@@ -9,7 +9,7 @@ from torch import Tensor
 
 from warpconvnet.geometry.types.voxels import Voxels
 
-from models import BACKBONE_REGISTRY
+from models import BACKBONE_REGISTRY, backbone_kwargs
 from .projhead import DINOProjectionHead
 
 
@@ -149,6 +149,7 @@ class DINODuneModel(nn.Module):
         proj_head_output_dim: int = 256,
         proj_head_n_layers: int = 4,
         encoding_range: float = 125.0,
+        encoding_dim: int = 32,
     ):
         """
         Args:
@@ -158,15 +159,17 @@ class DINODuneModel(nn.Module):
             proj_head_output_dim: Output dimension of the final FC layer
             proj_head_n_layers:   Number of MLP layers before the final FC
             encoding_range:       Sinusoidal positional encoding range passed to the backbone
+            encoding_dim:         Number of sinusoidal encoding channels per spatial axis
         """
         super().__init__()
 
         # Instantiate both backbones (sparse: Voxels -> Voxels)
-        # Only pass encoding_range to backbones that accept it (attn_* variants).
         backbone_cls = BACKBONE_REGISTRY[backbone_name]
-        backbone_kwargs = {}
-        if "encoding_range" in inspect.signature(backbone_cls.__init__).parameters:
-            backbone_kwargs["encoding_range"] = encoding_range
+        kwargs = backbone_kwargs(
+            backbone_cls,
+            encoding_range=encoding_range,
+            encoding_dim=encoding_dim,
+        )
 
         # Detect whether this backbone supports masked_coords injection (MAE backbones).
         self._student_accepts_masked_coords = (
@@ -174,9 +177,9 @@ class DINODuneModel(nn.Module):
         )
 
         print("Initializing STUDENT backbone:")
-        self.student = backbone_cls(**backbone_kwargs)
+        self.student = backbone_cls(**kwargs)
         print("Initializing TEACHER backbone:")
-        self.teacher = backbone_cls(**backbone_kwargs)
+        self.teacher = backbone_cls(**kwargs)
 
         # Initialize teacher with student weights
         self.teacher.load_state_dict(self.student.state_dict())

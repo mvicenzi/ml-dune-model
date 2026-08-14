@@ -11,6 +11,8 @@ Backbone naming convention:
 - Classifiers: backbone + classification head, return [B, 4] class logits
 """
 
+import inspect
+
 # ============ Sparse backbone classes (Voxels → Voxels) ============
 from .minkunet import MinkUNetSparse
 from .minkunet_attention import (
@@ -69,3 +71,32 @@ BACKBONE_REGISTRY = {
     # Backbone without attention
     "base":             MinkUNetSparse,
 }
+
+
+# ============ Backbone construction ============
+
+def backbone_kwargs(backbone_cls, **requested):
+    """Check that `backbone_cls` accepts every requested constructor flag.
+
+    inspect.signature() on the leaf class does not see through `def __init__(self, **kw)`,
+    which every backbone variant uses to forward to its base — the architecture flags are
+    named only on MinkUNetSparseAttention.__init__, so a leaf-only check reports that the
+    backbone accepts nothing and the flags fall back to their hardcoded defaults. Merging
+    each class's own parameters across the MRO recovers the true accepted set.
+
+    A flag the backbone cannot honour raises rather than being dropped: a silently ignored
+    flag trains a different network than the config describes.
+    """
+    accepted = set()
+    for cls in backbone_cls.__mro__:
+        if "__init__" in cls.__dict__:
+            accepted.update(inspect.signature(cls.__init__).parameters)
+
+    unsupported = sorted(set(requested) - accepted)
+    if unsupported:
+        raise ValueError(
+            f"backbone {backbone_cls.__name__} does not accept "
+            f"{', '.join(unsupported)} — drop the key from the config, or choose a "
+            f"backbone that supports it"
+        )
+    return dict(requested)

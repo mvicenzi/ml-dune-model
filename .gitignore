@@ -8,5 +8,4 @@ dino/fig
 *.whl
 metrics
 viz*
-run_*
 *.swp

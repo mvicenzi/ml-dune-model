@@ -86,8 +86,50 @@ Per-probe knobs go through `<STAGE>_EXTRA_ARGS` (`EMBED_EXTRA_ARGS` for this one
 because `getenv = False` and a bare extra arg is forwarded to *every* probe.
 Logs go to `${CONDOR_OUT}/<run_name>_probes/`.
 
-## One-off submit files
+## Collecting a whole run
 
-The `*.sub` files in this directory (`diag_remaining_*.sub`,
-`scatter_ep100_*.sub`) are hand-written one-off submit files from past
-campaigns, kept for reference. They hardcode absolute paths.
+- [collect_probes.sh](collect_probes.sh): drives extraction and probes over many
+  checkpoints, waiting for each.
+
+Unlike the `submit_*.sh` scripts above, this one does **not** submit a job and
+return — it runs on the login node and blocks, submitting work as each
+checkpoint becomes available. That is what lets it be pointed at a training job
+that is still running.
+
+```bash
+./collect_probes.sh <run_name> [epoch...] [options] [extraction flags...]
+
+# examples:
+./collect_probes.sh myrun                              # every checkpoint present now
+./collect_probes.sh myrun 60 70 80 90 100              # wait for each in turn
+./collect_probes.sh myrun 100 --max_images=10000 --features_prefix=features_10k_
+
+# left running against a live training job:
+nohup bash collect_probes.sh myrun 60 70 80 90 100 \
+    --max_images=10000 --features_prefix=features_10k_ > collect.log 2>&1 &
+```
+
+Bare integers are epochs; unrecognised `--flags` are forwarded to
+`submit_extract.sh`. `--features_prefix` is also passed on as
+`--output_prefix`, so extraction and scoring cannot name different files.
+
+It is safe to re-run: an epoch whose result JSONs already exist is skipped
+unless `--force` is given. Epochs it gave up waiting for are listed as
+*abandoned* and make the script exit non-zero, so a merge chained after it
+cannot quietly tabulate an incomplete sweep.
+
+Three guards are worth knowing about, all of them responses to failures seen in
+practice:
+
+- **Serialisation.** Only `--parallel` probe sweeps (default 1) are allowed in
+  the queue at once. Two concurrent sweeps contend on GPFS badly: `probe_overlap`
+  measured 2905 s and 4043 s with two jobs in flight against 1963 s alone.
+- **`.npz` integrity.** A features file is checked by opening the zip and
+  requiring the members every extraction writes — not by size or mtime, both of
+  which look correct on a file that is still being written. The check must hold
+  twice, `--settle` seconds apart, because a duplicate extraction overwriting the
+  file in place looks complete both before and after but not during.
+- **Duplicate extraction.** An epoch is skipped when an extraction for that
+  checkpoint is already queued. Note this is tested with `condor_q -af Cmd Args`:
+  `condor_q -nobatch` prints arguments truncated to the terminal width, and a
+  checkpoint path sits far enough into `extractjob.sh`'s arguments to be cut off.

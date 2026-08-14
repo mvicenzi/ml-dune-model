@@ -34,6 +34,13 @@ from .debug import DINODebugger
 def main(
     backbone_name: str = "attn_default",
     encoding_range: float = 125.0,
+    encoding_dim: int = 32,
+    feature_dim: int = 64,
+    apa: int = 0,
+    view: str = "W",
+    image_h: int = 1500,
+    image_w: int = 1050,
+    min_lr: float = 1e-6,
     epochs: int = 100,
     batch_size: int = 50,
     lr: float = 1e-4,
@@ -163,6 +170,13 @@ def main(
     cfg = DINOConfig(
         backbone_name=backbone_name,
         encoding_range=encoding_range,
+        encoding_dim=encoding_dim,
+        feature_dim=feature_dim,
+        apa=apa,
+        view=view,
+        image_h=image_h,
+        image_w=image_w,
+        min_lr=min_lr,
         use_cropping=use_cropping,
         use_masking=use_masking,
         mask_type=mask_type,
@@ -225,6 +239,8 @@ def main(
     print("Model:")
     print(f"  backbone_name        = {cfg.backbone_name}")
     print(f"  encoding_range       = {cfg.encoding_range}")
+    print(f"  encoding_dim         = {cfg.encoding_dim}")
+    print(f"  feature_dim          = {cfg.feature_dim}")
     print(f"  use_proj_head        = {cfg.use_proj_head}")
     print(f"  proj_head_hidden_dim = {cfg.proj_head_hidden_dim}")
     print(f"  proj_head_output_dim = {cfg.proj_head_output_dim}")
@@ -359,6 +375,7 @@ def main(
     model = DINODuneModel(
         backbone_name=backbone_name,
         encoding_range=cfg.encoding_range,
+        encoding_dim=cfg.encoding_dim,
         use_proj_head=use_proj_head,
         proj_head_hidden_dim=proj_head_hidden_dim,
         proj_head_output_dim=proj_head_output_dim,
@@ -590,6 +607,12 @@ def main(
     print(f"Checkpoints saved to: {output_dir}")
 
 
+# Keys a saved run_config.json carries that are not knobs: `timestamp` is run metadata
+# added by the dump, `normalize_features` is derived from use_proj_head inside main().
+# They are accepted and ignored so a dumped config feeds straight back into from_config.
+NON_PARAM_CONFIG_KEYS = {"timestamp", "normalize_features"}
+
+
 def from_config(
     config_path: str,
     run_name: str = "",
@@ -600,8 +623,7 @@ def from_config(
     Start training from a saved run_config.json file.
 
     Loads training parameters from a previously saved run_config.json.
-    Any JSON field that does not match a parameter of main() is silently ignored, 
-    so old configs with stale or missing keys work without errors.
+    Every JSON field must name a parameter of main(); anything else is an error.
     Missing fields fall back to main()'s defaults.
 
     `run_name` and `device` are named parameters here (so they appear in
@@ -621,8 +643,16 @@ def from_config(
     sig = inspect.signature(main)
     valid_params = set(sig.parameters)
 
-    # Build kwargs: only keep JSON keys that main() understands
-    kwargs = {k: v for k, v in raw.items() if k in valid_params}
+    # Every key must name a main() parameter or be run metadata. Dropping an unrecognised
+    # key silently trains with a default nobody asked for, which is indistinguishable
+    # from the config having been honoured.
+    unknown = sorted(set(raw) - valid_params - NON_PARAM_CONFIG_KEYS)
+    if unknown:
+        raise ValueError(
+            f"{config_path}: unrecognised config key(s) {', '.join(unknown)} — "
+            f"remove them, or add them to main() if they are meant to be settable"
+        )
+    kwargs = {k: v for k, v in raw.items() if k not in NON_PARAM_CONFIG_KEYS}
 
     # The JSON stores debug_dir and output_dir as fully-nested paths (base/run_name).
     # main() will re-append run_name, so we strip the suffix here to avoid
@@ -641,8 +671,11 @@ def from_config(
         kwargs["run_name"] = run_name
     kwargs["device"] = device
     for k, v in overrides.items():
-        if k in valid_params:
-            kwargs[k] = v
+        if k not in valid_params:
+            raise ValueError(
+                f"unrecognised override {k!r} — not a parameter of main()"
+            )
+        kwargs[k] = v
 
     main(**kwargs)
 
