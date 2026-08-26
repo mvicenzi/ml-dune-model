@@ -293,6 +293,12 @@ class DINODuneModel(nn.Module):
         (k == g) are skipped only when multiple views exist; with a single view
         the masking pair (k=0, g=0) is the only valid pair and must be kept.
 
+        A masked student view is not a copy of the teacher's: the student sees
+        mask tokens where the teacher sees charge, so the same-index pair carries
+        the masked-prediction signal at that view's scale and is kept. With
+        crop_n_global=1 the global view's only candidate pair is (0, 0), so
+        skipping it would encode that view and then discard it.
+
         Args:
             xs:           batched Voxels (from the sparse dataloader, on device)
             cropper:      SparseCropper instance, or None when use_cropping=False
@@ -320,6 +326,13 @@ class DINODuneModel(nn.Module):
             n_global  = 1
         n_crops = len(all_views)
 
+        # A masked same-index pair only differs from a self-comparison when the
+        # backbone puts mask tokens back at the dropped coordinates: the student
+        # then has to predict the teacher's features there. A backbone that just
+        # drops the masked voxels gives back the teacher's own view minus some
+        # points, so its same-index pair stays skipped.
+        keep_same_index = use_masking and self._student_accepts_masked_coords
+
         # ── 2. Teacher: encode global views, frozen, no gradient ───────────
         with torch.no_grad():
             teacher_encoded = [self.encode_teacher(all_views[g]) for g in range(n_global)]
@@ -346,8 +359,11 @@ class DINODuneModel(nn.Module):
             for g in range(n_global):
                 # skip same-index pairs only when multiple views exist
                 # (with one view, the single masking pair must not be skipped)
-                # basically: never compare a global view with itself
-                if k == g and n_crops > 1:
+                # basically: never compare a global view with itself --
+                # unless the student view is masked, which makes it a different
+                # input than the teacher's copy and the pair a masked-prediction
+                # term rather than a self-comparison
+                if k == g and n_crops > 1 and not keep_same_index:
                     continue
 
                 teacher_backbone_g, teacher_out_g = teacher_encoded[g]
