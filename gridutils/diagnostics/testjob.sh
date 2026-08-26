@@ -30,7 +30,8 @@ echo "Copying WarpConvNet benchmark cache to local scratch..."
 cp -r "$wp_cache_gpfs" "$wp_cache"
 
 echo "Running $CLUSTER_ID.$JOB_ID on $(hostname)"
-echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+# Default: a CPU-only test slot has no CUDA_VISIBLE_DEVICES, and set -u would abort.
+echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<none>}"
 echo "  _CONDOR_SCRATCH_DIR=${_CONDOR_SCRATCH_DIR}"
 echo ""
 

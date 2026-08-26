@@ -58,6 +58,12 @@ class APASparseShardedDataset(IterableDataset):
 
     With num_workers > 0 the shard list is split round-robin across workers so
     every sample is seen exactly once per epoch and workers never duplicate work.
+
+    Under DDP (world_size > 1) the split is over `world_size * num_workers`
+    readers instead, so ranks do not read each other's shards. That path also
+    equalises the work: DDP's gradient all-reduce is a collective, so a rank
+    that runs out of batches early leaves the others blocked in it. See
+    `_ddp_shards` for how equal batch counts are guaranteed.
     Each worker maintains its own independent buffer.
 
     Samples that don't fill a complete final batch are dropped (implicit drop_last).
@@ -76,9 +82,23 @@ class APASparseShardedDataset(IterableDataset):
         return_pixel_truth: bool = False,
         return_extra_truth: bool = False,
         n_subset: int = -1,
+        rank: int = 0,
+        world_size: int = 1,
+        num_workers: int = 0,
+        seed: int = 42,
     ):
         self.root_dir   = Path(root_dir)
         self.batch_size = batch_size
+        self.rank = rank
+        self.world_size = world_size
+        # Needed at construction (not just in __iter__) because __len__ must report
+        # the batches THIS rank runs: the schedules are built from it. It must match
+        # the DataLoader's num_workers -- __iter__ reads the real count from
+        # get_worker_info(), so a mismatch makes __len__ disagree with the steps an
+        # epoch actually takes, and the schedules drift from the run.
+        self.num_workers = num_workers
+        self.seed = seed
+        self.epoch = 0
         self.buffer_size = buffer_size
         self.shuffle = shuffle
         if return_extra_truth:
@@ -114,7 +134,28 @@ class APASparseShardedDataset(IterableDataset):
             self.shards = self.shards[:n_keep]
             n_samples = min(n_samples, n_keep * per_shard)
 
-        self._n_batches = n_samples // batch_size
+        # Per-shard sample count, read once: shard 0 is full by construction, and
+        # metadata gives the total, so a short trailing shard is arithmetic rather
+        # than 200 file opens at startup.
+        with h5py.File(self.shards[0], "r") as f:
+            self._per_shard = int(f["offsets"].shape[0]) - 1
+        self._n_full_shards = min(n_samples // self._per_shard, len(self.shards))
+
+        if world_size > 1:
+            readers = world_size * max(num_workers, 1)
+            if self._n_full_shards < readers:
+                raise ValueError(
+                    f"{root_dir}: {self._n_full_shards} full shards cannot feed "
+                    f"{readers} readers ({world_size} ranks x {max(num_workers, 1)} "
+                    f"workers) — lower num_workers or use fewer ranks"
+                )
+            per_reader = -(-self._n_full_shards // readers)   # ceil
+            # Every reader gets the same number of equally sized shards, so every
+            # reader yields the same number of batches and the ranks stay in step.
+            per_reader_batches = (per_reader * self._per_shard) // batch_size
+            self._n_batches = per_reader_batches * max(num_workers, 1)
+        else:
+            self._n_batches = n_samples // batch_size
 
         # Discover which truth datasets the shards actually carry, then keep
         # only the requested tiers: per-pixel truth in the shards is NOT free
@@ -146,17 +187,65 @@ class APASparseShardedDataset(IterableDataset):
         """Number of batches per epoch (used by DataLoader and schedulers)."""
         return self._n_batches
 
-    def __iter__(self) -> Iterator[Tuple[Voxels, dict]]:
-        # Split shards round-robin across DataLoader workers.
-        worker_info = torch.utils.data.get_worker_info()
-        shards = self.shards
-        if worker_info is not None:
-            shards = shards[worker_info.id :: worker_info.num_workers]
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch used to seed the shared shard shuffle (DDP path).
 
-        if self.shuffle:
-            # Shuffle shard order for this epoch.
-            order  = torch.randperm(len(shards)).tolist()
-            shards = [shards[i] for i in order]
+        Every rank must shuffle the full shard list the same way before splitting it,
+        or two readers are handed the same shard while another is never read. The
+        training loop calls this once per epoch, like DistributedSampler.set_epoch.
+        """
+        self.epoch = epoch
+
+    def _ddp_shards(self, worker_id: int, num_workers: int) -> List[Path]:
+        """This reader's shards under DDP: an equal, non-overlapping slice.
+
+        Three properties the collective depends on:
+
+        - the shuffle is seeded from (seed, epoch) alone, so every rank permutes the
+          full list identically and the split below is a true partition;
+        - only full shards take part. A short trailing shard would give its reader
+          fewer batches than the others, and the ranks that finish early leave the
+          rest blocked in the gradient all-reduce until the job is killed;
+        - readers are levelled up to ceil(n_full / readers) shards, not down to
+          floor. The full-shard count is rarely divisible by the reader count (here
+          it is 199, a prime), and truncating would idle up to readers-1 shards every
+          epoch — 39 of 199 at 40 readers. Padding instead repeats a handful of
+          shards, so every shard is still read each epoch and only the padding is
+          seen twice, which is what DistributedSampler does for the same reason.
+        """
+        shards = self.shards[: self._n_full_shards]
+
+        g = torch.Generator().manual_seed(self.seed + self.epoch)
+        order = torch.randperm(len(shards), generator=g).tolist()
+        shards = [shards[i] for i in order]
+
+        readers = self.world_size * num_workers
+        reader_id = self.rank * num_workers + worker_id
+        per_reader = -(-len(shards) // readers)               # ceil
+
+        # Pad the permuted list up to readers * per_reader by wrapping around, so the
+        # round-robin slice below hands every reader exactly per_reader shards. The
+        # repeats land on different shards each epoch because the order is reshuffled.
+        padded = shards + shards[: readers * per_reader - len(shards)]
+        return padded[reader_id::readers]
+
+    def __iter__(self) -> Iterator[Tuple[Voxels, dict]]:
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+
+        if self.world_size > 1:
+            shards = self._ddp_shards(worker_id, num_workers)
+        else:
+            # Single process: split shards round-robin across DataLoader workers.
+            shards = self.shards
+            if worker_info is not None:
+                shards = shards[worker_id::num_workers]
+
+            if self.shuffle:
+                # Shuffle shard order for this epoch.
+                order  = torch.randperm(len(shards)).tolist()
+                shards = [shards[i] for i in order]
 
         # Buffer: list of (coords, feats, meta_row) tuples, one entry per sample.
         buffer: List[tuple] = []

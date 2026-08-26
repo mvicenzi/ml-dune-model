@@ -90,7 +90,8 @@ def main(
     debug_every: int = 100,
     debug_dir: str = "./dino_debug",
     run_name: str = "",
-    num_workers: int = 4,
+    num_workers: int = 5,
+    seed: int = 42,
     use_sharded: bool = False,
     sharded_dir: str = "",
     buffer_size: int = 3000,
@@ -147,6 +148,7 @@ def main(
         debug_dir: Base directory for debug outputs
         run_name: Optional label; outputs go to debug_dir/run_name/ if set
         num_workers: Number of dataloader workers
+        seed: RNG seed for torch, the loader shuffles and the DDP shard order
         use_sharded: Stream from pre-sharded HDF5 (loader/create_shards.py)
         sharded_dir: Directory with shard_*.h5 + metadata.json
         buffer_size: Shuffle-buffer size for the sharded reader
@@ -155,7 +157,7 @@ def main(
     """
     # ============ Setup ============
     device = torch.device(device if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(42)
+    torch.manual_seed(seed)
 
     # If a run name is given, nest outputs under debug_dir/run_name/ and output_dir/run_name/
     if run_name:
@@ -227,6 +229,7 @@ def main(
         debug_dir=debug_dir,
         run_name=run_name,
         num_workers=num_workers,
+        seed=seed,
         use_sharded=use_sharded,
         sharded_dir=sharded_dir,
         buffer_size=buffer_size,
@@ -251,8 +254,29 @@ def main(
     print(f"  lr             = {cfg.lr}")
     print(f"  batch_size     = {cfg.batch_size}")
     print(f"  warmup_epochs  = {cfg.warmup_epochs}")
+    print(f"  seed           = {cfg.seed}")
     print(f"  momentum_start = {cfg.momentum_start}")
     print(f"  momentum_end   = {cfg.momentum_end}")
+
+    # Validated here rather than at load time so the summary below cannot print a
+    # container the run is not going to use.
+    if cfg.use_sharded and cfg.use_packed:
+        raise ValueError("use_sharded and use_packed are mutually exclusive")
+    if cfg.use_sharded:
+        source, path = "sharded", cfg.sharded_dir
+    elif cfg.use_packed:
+        source, path = "packed", cfg.packed_path
+    else:
+        source, path = "raw", cfg.datadir
+
+    print("Dataset:")
+    print(f"  source         = {source}")
+    print(f"  path           = {path}")
+    print(f"  apa / view     = {cfg.apa} / {cfg.view}")
+    print(f"  image_h x w    = {cfg.image_h} x {cfg.image_w}")
+    print(f"  n_subset       = {cfg.n_subset}")
+    print(f"  num_workers    = {cfg.num_workers}")
+    print(f"  buffer_size    = {cfg.buffer_size}")
 
     print("Augmentation:")
     print(f"  use_cropping           = {cfg.use_cropping}")
@@ -288,20 +312,17 @@ def main(
     print(f"  var_gamma           = {cfg.var_gamma}")
 
     # ============ Data ============
-    if cfg.use_sharded and cfg.use_packed:
-        raise ValueError("use_sharded and use_packed are mutually exclusive")
-
     if cfg.use_sharded:
         from loader.apa_sparse_sharded_dataset import APASparseShardedDataset
         print(f"\nLoading sharded dataset: {cfg.sharded_dir}")
-        print(f"  batch_size  = {batch_size}")
-        print(f"  buffer_size = {cfg.buffer_size}")
-        print(f"  n_subset    = {cfg.n_subset}")
         dataset = APASparseShardedDataset(
             root_dir=cfg.sharded_dir,
             batch_size=batch_size,
             buffer_size=cfg.buffer_size,
             n_subset=cfg.n_subset,
+            # num_workers must match the DataLoader below: __len__ is built from it.
+            num_workers=num_workers,
+            seed=cfg.seed,
         )
         train_loader = DataLoader(
             dataset,
@@ -316,11 +337,9 @@ def main(
     elif cfg.use_packed:
         from loader.apa_packed_dataset import APAPackedDataset
         print(f"\nLoading packed dataset: {cfg.packed_path}")
-        print(f"  batch_size = {batch_size}")
-        print(f"  n_subset   = {cfg.n_subset}")
         dataset = APAPackedDataset(cfg.packed_path)
         if cfg.n_subset > 0:
-            rng = torch.Generator().manual_seed(42)
+            rng = torch.Generator().manual_seed(cfg.seed)
             subset_indices = torch.randperm(len(dataset), generator=rng)[: cfg.n_subset]
             dataset = Subset(dataset, subset_indices)
         train_loader = DataLoader(
@@ -336,11 +355,10 @@ def main(
             drop_last=True,
             # Dedicated generator: the shuffle sequence is reproducible and
             # independent of upstream RNG consumption.
-            generator=torch.Generator().manual_seed(42),
+            generator=torch.Generator().manual_seed(cfg.seed),
         )
     else:
         print("\nLoading dataset:", cfg.datadir)
-        print(f"  n_subset = {cfg.n_subset}")
         dataset = APASparseMetaDataset(
             datadir=cfg.datadir,
             apa=cfg.apa,
@@ -349,8 +367,7 @@ def main(
             cache_dir=cfg.cache_dir,
         )
         if cfg.n_subset > 0:
-            print(f"Using subset: {cfg.n_subset} samples")
-            rng = torch.Generator().manual_seed(42)
+            rng = torch.Generator().manual_seed(cfg.seed)
             subset_indices = torch.randperm(len(dataset), generator=rng)[: cfg.n_subset]
             dataset = Subset(dataset, subset_indices)
         train_loader = DataLoader(
@@ -362,7 +379,7 @@ def main(
             collate_fn=voxels_meta_collate_fn,
             # Dedicated generator: shuffle order is a pure function of the
             # seed, independent of upstream RNG consumption (see packed branch).
-            generator=torch.Generator().manual_seed(42),
+            generator=torch.Generator().manual_seed(cfg.seed),
         )
 
     print(f"Dataset size: {len(dataset)}")

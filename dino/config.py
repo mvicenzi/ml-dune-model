@@ -9,6 +9,8 @@ class DINOConfig:
 
     # ============ Run ============
     run_name: str = ""                # optional label; outputs go to debug_dir/run_name/ if set
+    seed: int = 42                    # torch RNG, loader shuffles and the DDP shard order;
+                                      # change it to repeat a run as an independent sample
 
     # ============ Data ============
     # Production root: mixes nominal + nueswap flavors (point at a flavor
@@ -19,8 +21,8 @@ class DINOConfig:
     image_h: int = 1500               # spatial resolution: height (time ticks)
     image_w: int = 1050               # spatial resolution: width (wire channels)
     n_subset: int = -1                # -1 = full dataset; otherwise cap at N samples
-    batch_size: int = 16
-    num_workers: int = 4
+    batch_size: int = 16          # per rank under DDP: effective batch is batch_size * world_size
+    num_workers: int = 5          # 5 x 8 ranks divides the 199 full shards with one repeat; 4 costs 25
     cache_dir: str = "./data"           # directory for cached dataset index .pt file
     use_sharded: bool = False           # use pre-sharded HDF5 dataset (loader/create_shards.py)
     sharded_dir: str = ""               # path to directory containing shard_*.h5 files
