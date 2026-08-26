@@ -28,7 +28,7 @@ from .cropping import CropConfig, SparseCropper
 from .loss import PixelDINOLoss
 from .scheduler import CosineScheduler
 from .model import DINODuneModel
-from .debug import DINODebugger
+from .debug import DINODebugger, StageTimer
 
 
 def main(
@@ -477,6 +477,10 @@ def main(
 
     # ============ Debugging ============
     debugger = DINODebugger(cfg, enabled=True)
+
+    # Always-on: the per-epoch stage breakdown is part of the [timing] line, sampled
+    # one step in 50 so the synchronize it needs stays off the critical path.
+    stage_timer = StageTimer(enabled=(device.type == "cuda"))
     debugger.log_config(cfg)
 
     # ============ Training loop ============
@@ -516,6 +520,7 @@ def main(
                 param_group["weight_decay"] = wd_val
 
             # Forward + backward
+            stage_timer.step(iteration)
             optimizer.zero_grad()
 
             # execute forward/backward pass, returning loss and other metrics
@@ -523,16 +528,18 @@ def main(
              kl, cov_penalty, var_penalty,
              loss_masked, loss_unmasked,
              student_backbone_out, teacher_backbone_out,
-             student_out, teacher_out) = model.forward_backward(xs, cropper, masker, loss_fn, use_cropping, use_masking)
+             student_out, teacher_out) = model.forward_backward(xs, cropper, masker, loss_fn, use_cropping, use_masking, stage_timer)
             
-            # "three steps forward, two steps back"
-            optimizer.step()
+            with stage_timer.stage("upd"):
+                # "three steps forward, two steps back"
+                optimizer.step()
 
-            # EMA teacher update
-            model.update_teacher(mom_val)
+                # EMA teacher update
+                model.update_teacher(mom_val)
 
-            # centering: update teacher center for next iteration
-            loss_fn.update_center(teacher_out)
+                # centering: update teacher center for next iteration
+                loss_fn.update_center(teacher_out)
+            stage_timer.flush()
             debugger.log_center_stats(iteration, loss_fn)
 
             # scalar logging: the (teacher_entropy, student_entropy, kl) trio already
@@ -581,9 +588,12 @@ def main(
         n_samples = epoch_len * batch_size
         rss_self = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2
         rss_kids = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024**2
+        stages = stage_timer.summary()
+        stage_str = f" stage_pct(n={stage_timer.n})={stages}" if stages else ""
         print(f"[timing] epoch={epoch} wall={wall:.1f}s data_wait={data_wait:.1f}s "
               f"({100*data_wait/max(wall,1e-9):.1f}%) samples_per_sec={n_samples/max(wall,1e-9):.1f} "
-              f"peak_rss_self={rss_self:.2f}GiB peak_rss_workers={rss_kids:.2f}GiB")
+              f"peak_rss_self={rss_self:.2f}GiB peak_rss_workers={rss_kids:.2f}GiB{stage_str}")
+        stage_timer.reset()
 
         # Save model checkpoint
         if epoch % save_every == 0 or epoch == epochs:

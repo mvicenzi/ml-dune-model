@@ -1,5 +1,6 @@
 """Debug utilities: logging and history tracking for DINO training."""
 
+import contextlib
 import dataclasses
 import json
 import logging
@@ -9,6 +10,84 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch import Tensor
+
+
+class StageTimer:
+    """Where a training step spends its GPU time, sampled a few times per epoch.
+
+    CUDA launches are asynchronous, so wall-clock around a call measures the launch and
+    not the work. This brackets each stage with CUDA events and reads them after one
+    synchronize at the end of the sampled step -- the only sync it costs.
+
+    Sampling rather than timing every step keeps that sync off the critical path: at the
+    default one step in 25 a full epoch contributes ~80 samples and a smoke run still
+    contributes a handful, enough to place a stage to a percent or so, at a cost far
+    below the noise between epochs. The first steps of a run are skipped because
+    warpconvnet autotunes its kernels there and those timings describe the autotuner,
+    not the model.
+
+    Always on: the per-epoch breakdown is a permanent line in the training log, not a
+    debug-only extra, so a regression in one stage is visible in the run that caused it.
+    """
+
+    # Short names: this goes in the per-epoch [timing] line, which is already long.
+    STAGES = ("crop", "mask", "teach", "stud", "match", "loss", "bwd", "upd")
+
+    def __init__(self, every: int = 25, warmup: int = 10, enabled: bool = True):
+        self.every = every if enabled else 0
+        self.warmup = warmup
+        self.totals = {k: 0.0 for k in self.STAGES}   # milliseconds
+        self.n = 0
+        self._sampling = False
+        self._pending = []
+
+    def step(self, iteration: int) -> None:
+        """Decide whether this step is sampled. Call once per iteration, before any stage."""
+        self._sampling = self.every > 0 and iteration >= self.warmup and iteration % self.every == 0
+
+    @contextlib.contextmanager
+    def stage(self, name: str):
+        """Time one stage. Several calls with the same name in a step add up."""
+        if not self._sampling:
+            yield
+            return
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        try:
+            yield
+        finally:
+            end.record()
+            self._pending.append((name, start, end))
+
+    def flush(self) -> None:
+        """Read the sampled step's events. Call once per iteration, after the last stage."""
+        if not self._pending:
+            return
+        torch.cuda.synchronize()
+        for name, start, end in self._pending:
+            self.totals[name] += start.elapsed_time(end)
+        self._pending.clear()
+        self.n += 1
+
+    def summary(self) -> str:
+        """Per-stage share of sampled step time, as `crop:12,mask:3,...`, or "" if unsampled."""
+        if self.n == 0:
+            return ""
+        total = sum(self.totals.values())
+        if total <= 0:
+            return ""
+        return ",".join(f"{k}:{100 * self.totals[k] / total:.0f}" for k in self.STAGES)
+
+    def reset(self) -> None:
+        """Start a new epoch's accounting."""
+        self.totals = {k: 0.0 for k in self.STAGES}
+        self.n = 0
+        self._pending.clear()
+
+
+# Stand-in for callers that pass no timer: every stage() is a bare yield.
+NULL_TIMER = StageTimer(enabled=False)
 
 
 class DINODebugger:

@@ -10,6 +10,7 @@ from torch import Tensor
 from warpconvnet.geometry.types.voxels import Voxels
 
 from models import BACKBONE_REGISTRY, backbone_kwargs
+from .debug import NULL_TIMER
 from .projhead import DINOProjectionHead
 
 
@@ -23,9 +24,13 @@ def match_and_gather(
     Match student and teacher output voxels by spatial coordinates and
     return pre-aligned feature tensors ready for the loss.
 
-    Uses flat coordinate keys (y * W + x) with searchsorted for efficient
-    intersection.  No LUTs or index bookkeeping from the cropper are needed.
-    Coordinates are intrinsic to the backbone output.
+    Each voxel gets a flat integer key `b * S + y * W + x`. The batch index in the
+    key keeps images apart, so one sort and one searchsorted over the whole batch
+    do the work of B independent per-image intersections. Keys are unique (a
+    coordinate appears once per image), so the sort has no ties to break.
+
+    Coordinates are intrinsic to the backbone output -- no LUTs or index
+    bookkeeping from the cropper are needed.
 
     Args:
         s_out:      Student head output (Voxels).
@@ -39,94 +44,77 @@ def match_and_gather(
         counts:     [B] int64 per-image matched voxel counts
         is_masked:  [N_matched] bool — True for positions that were masked in the
                     student input (i.e. the backbone received a mask token there);
-                    None when masked_coords_per_batch is not provided
+                    None when masked_coords_per_batch is not provided, and also
+                    when nothing matched at all
     """
     B = len(s_out.offsets) - 1
     device = s_out.feature_tensor.device
 
-    # Flat key = y * W + x maps each 2D coordinate to a unique integer.
-    # W must exceed the max x-coordinate across both inputs.
-    W = 1
-    if s_out.coordinate_tensor.shape[0] > 0:
-        W = max(W, int(s_out.coordinate_tensor[:, 0].max().item()) + 1)
-    if t_out.coordinate_tensor.shape[0] > 0:
-        W = max(W, int(t_out.coordinate_tensor[:, 0].max().item()) + 1)
+    s_coords = s_out.coordinate_tensor
+    t_coords = t_out.coordinate_tensor
 
-    # Collect global indices (into the flat batched feature tensors) for all
-    # matched voxels across all batch items.
-    s_global_idx = []
-    t_global_idx = []
-    counts_list = []
-    is_masked_list = [] if masked_coords_per_batch is not None else None
+    def _empty():
+        s_feats    = s_out.feature_tensor.new_zeros(0, s_out.feature_tensor.shape[1])
+        s_bb_feats = s_backbone.feature_tensor.new_zeros(0, s_backbone.feature_tensor.shape[1])
+        t_feats    = t_out.feature_tensor.new_zeros(0, t_out.feature_tensor.shape[1])
+        counts     = torch.zeros(B, dtype=torch.int64, device=device)
+        return s_feats, s_bb_feats, t_feats, counts, None
 
-    for b in range(B):
-        s_start, s_end = int(s_out.offsets[b]), int(s_out.offsets[b + 1])
-        t_start, t_end = int(t_out.offsets[b]), int(t_out.offsets[b + 1])
+    # Nothing on one side means nothing to intersect. Also guards the clamp below,
+    # which needs at least one teacher key to clamp against.
+    if s_coords.shape[0] == 0 or t_coords.shape[0] == 0:
+        return _empty()
 
-        s_coords = s_out.coordinate_tensor[s_start:s_end]
-        t_coords = t_out.coordinate_tensor[t_start:t_end]
+    # Key strides: W spans x, S spans one image's key space. Both are taken across
+    # student and teacher so the two agree on the encoding.
+    W = int(max(s_coords[:, 0].max().item(), t_coords[:, 0].max().item())) + 1
+    H = int(max(s_coords[:, 1].max().item(), t_coords[:, 1].max().item())) + 1
+    S = H * W
 
-        if s_coords.shape[0] == 0 or t_coords.shape[0] == 0:
-            counts_list.append(0)
-            continue
+    def _keys(coords, offsets):
+        counts = (offsets[1:] - offsets[:-1]).to(device)
+        b_idx = torch.repeat_interleave(torch.arange(B, device=device), counts)
+        return b_idx * S + coords[:, 1].long() * W + coords[:, 0].long(), b_idx
 
-        s_keys = s_coords[:, 1].long() * W + s_coords[:, 0].long()
-        t_keys = t_coords[:, 1].long() * W + t_coords[:, 0].long()
+    s_keys, b_s = _keys(s_coords, s_out.offsets)
+    t_keys, _   = _keys(t_coords, t_out.offsets)
 
-        # Sort teacher keys so we can binary-search student keys into them
-        t_sorted, t_order = t_keys.sort()
+    # Sorting the whole teacher key array keeps t_order pointing at rows of the flat
+    # feature tensor, so matched teacher indices need no per-image offset shift.
+    t_sorted, t_order = t_keys.sort()
+    pos = torch.searchsorted(t_sorted, s_keys).clamp(max=t_sorted.shape[0] - 1)
+    valid = t_sorted[pos] == s_keys
 
-        # For each student key, find its insertion point in the sorted teacher keys
-        pos = torch.searchsorted(t_sorted, s_keys)
-        # Clamp so we can safely index t_sorted; out-of-range means no match
-        pos = pos.clamp(max=t_sorted.shape[0] - 1)
-        # A student key is matched iff t_sorted[pos] equals it exactly
-        valid = t_sorted[pos] == s_keys
+    # Ascending global index == image order, then within-image order: the flat
+    # tensors are batch-major, so this is the order a per-image loop would produce.
+    s_idx = valid.nonzero(as_tuple=False).squeeze(1)
+    if s_idx.numel() == 0:
+        return _empty()
+    t_idx = t_order[pos[s_idx]]
 
-        # s_local: which student voxels (local to this batch item) have a match
-        s_local = valid.nonzero(as_tuple=False).squeeze(1)
-        if s_local.numel() == 0:
-            counts_list.append(0)
-            continue
+    counts = torch.bincount(b_s[s_idx], minlength=B)
 
-        # t_order maps sorted positions back to original teacher ordering;
-        # pos[valid] gives the sorted positions of matched keys
-        t_local = t_order[pos[valid]]
+    s_feats    = s_out.feature_tensor[s_idx]
+    s_bb_feats = s_backbone.feature_tensor[s_idx]  # same coords as s_out
+    t_feats    = t_out.feature_tensor[t_idx]
 
-        # Shift local indices to global positions in the flat feature tensors
-        s_global_idx.append(s_local + s_start)
-        t_global_idx.append(t_local + t_start)
-        counts_list.append(s_local.shape[0])
-
-        # Tag each matched student position as masked or not.
-        if is_masked_list is not None:
-            m_coords = masked_coords_per_batch[b]
-            if m_coords.shape[0] > 0:
-                m_keys = m_coords[:, 1].long() * W + m_coords[:, 0].long()
-                matched_keys = s_keys[s_local]
-                is_masked_b = torch.isin(matched_keys, m_keys)
-            else:
-                is_masked_b = torch.zeros(s_local.shape[0], dtype=torch.bool, device=device)
-            is_masked_list.append(is_masked_b)
-
-    counts = torch.tensor(counts_list, dtype=torch.int64, device=device)
-
-    # Single gather over the concatenated feature tensors — no intermediate
-    # Voxels objects needed.
-    if s_global_idx:
-        s_idx = torch.cat(s_global_idx)
-        t_idx = torch.cat(t_global_idx)
-        s_feats    = s_out.feature_tensor[s_idx]
-        s_bb_feats = s_backbone.feature_tensor[s_idx]  # same coords as s_out
-        t_feats    = t_out.feature_tensor[t_idx]
-    else:
-        D_head = s_out.feature_tensor.shape[1]
-        D_bb   = s_backbone.feature_tensor.shape[1]
-        s_feats    = s_out.feature_tensor.new_zeros(0, D_head)
-        s_bb_feats = s_backbone.feature_tensor.new_zeros(0, D_bb)
-        t_feats    = t_out.feature_tensor.new_zeros(0, D_head)
-
-    is_masked = torch.cat(is_masked_list) if is_masked_list else None
+    # Tag each matched student position as masked or not: same key trick, with the
+    # per-image masked coords concatenated into one array first.
+    is_masked = None
+    if masked_coords_per_batch is not None:
+        m_per_image = list(masked_coords_per_batch)[:B]
+        m_counts = torch.tensor([m.shape[0] for m in m_per_image],
+                                dtype=torch.int64, device=device)
+        if int(m_counts.sum()) > 0:
+            m_coords = torch.cat(m_per_image, dim=0)
+            b_m = torch.repeat_interleave(torch.arange(B, device=device), m_counts)
+            m_keys = b_m * S + m_coords[:, 1].long() * W + m_coords[:, 0].long()
+            m_sorted, _ = m_keys.sort()
+            matched_keys = s_keys[s_idx]
+            mp = torch.searchsorted(m_sorted, matched_keys).clamp(max=m_sorted.shape[0] - 1)
+            is_masked = m_sorted[mp] == matched_keys
+        else:
+            is_masked = torch.zeros(s_idx.shape[0], dtype=torch.bool, device=device)
 
     return s_feats, s_bb_feats, t_feats, counts, is_masked
 
@@ -278,6 +266,7 @@ class DINODuneModel(nn.Module):
         loss_fn,
         use_cropping: bool = False,
         use_masking: bool = True,
+        timer=None,
     ):
         """
         Unified forward pass and backward update.
@@ -306,6 +295,7 @@ class DINODuneModel(nn.Module):
             loss_fn:      PixelDINOLoss instance
             use_cropping: enable activity-aware multi-crop augmentation
             use_masking:  enable random pixel dropout on student views
+            timer:        StageTimer collecting the per-stage GPU breakdown
 
         Returns:
             loss_value:           mean scalar loss across all (student, teacher) pairs
@@ -318,8 +308,10 @@ class DINODuneModel(nn.Module):
         # ── 1. Generate views ──────────────────────────────────────────────
         # view are always treated as a list: 
         # either multiple crops or a single full-image view
+        timer = timer or NULL_TIMER
         if use_cropping:
-            all_views = cropper(xs)
+            with timer.stage("crop"):
+                all_views = cropper(xs)
             n_global  = cropper.cfg.n_global
         else:
             all_views = [xs]
@@ -334,7 +326,7 @@ class DINODuneModel(nn.Module):
         keep_same_index = use_masking and self._student_accepts_masked_coords
 
         # ── 2. Teacher: encode global views, frozen, no gradient ───────────
-        with torch.no_grad():
+        with torch.no_grad(), timer.stage("teach"):
             teacher_encoded = [self.encode_teacher(all_views[g]) for g in range(n_global)]
 
         # ── 3. Student: encode all views (optionally masked), compute loss ─
@@ -346,14 +338,16 @@ class DINODuneModel(nn.Module):
         # for each student view
         for k in range(n_crops):
             if use_masking:
-                view_k_masked, masked_coords_k = masker(all_views[k])
+                with timer.stage("mask"):
+                    view_k_masked, masked_coords_k = masker(all_views[k])
             else:
                 view_k_masked, masked_coords_k = all_views[k], None
 
             # execute the model, returning backbone and head outputs
-            student_backbone_k, student_out_k = self.encode_student(
-                view_k_masked, masked_coords=masked_coords_k,
-            )
+            with timer.stage("stud"):
+                student_backbone_k, student_out_k = self.encode_student(
+                    view_k_masked, masked_coords=masked_coords_k,
+                )
 
             # for each teacher global
             for g in range(n_global):
@@ -371,15 +365,17 @@ class DINODuneModel(nn.Module):
                 # returns features for each matching voxels across views
                 # shape is [N_matched, D] --> D differs for backbone vs head
                 # returing student backbone feature for optional cov/var penalties
-                s_feats, s_bb_feats, t_feats, counts, is_masked = match_and_gather(
-                    student_out_k, student_backbone_k, teacher_out_g,
-                    masked_coords_per_batch=masked_coords_k,
-                )
+                with timer.stage("match"):
+                    s_feats, s_bb_feats, t_feats, counts, is_masked = match_and_gather(
+                        student_out_k, student_backbone_k, teacher_out_g,
+                        masked_coords_per_batch=masked_coords_k,
+                    )
 
                 # compute the loss for these views
-                loss_kg, t_ent, s_ent, kl, cov, var, loss_masked_kg, loss_unmasked_kg = loss_fn(
-                    s_feats, s_bb_feats, t_feats, counts, is_masked=is_masked,
-                )
+                with timer.stage("loss"):
+                    loss_kg, t_ent, s_ent, kl, cov, var, loss_masked_kg, loss_unmasked_kg = loss_fn(
+                        s_feats, s_bb_feats, t_feats, counts, is_masked=is_masked,
+                    )
 
                 # accumulate loss (averaging)
                 total_loss = loss_kg if total_loss is None else total_loss + loss_kg
@@ -406,7 +402,8 @@ class DINODuneModel(nn.Module):
                     sum_loss_unmasked += loss_unmasked_kg
 
         total_loss = total_loss / n_pairs
-        total_loss.backward()
+        with timer.stage("bwd"):
+            total_loss.backward()
 
         avg_t_ent = sum_t_ent / n_metric if n_metric > 0 else None
         avg_s_ent = sum_s_ent / n_metric if n_metric > 0 else None
