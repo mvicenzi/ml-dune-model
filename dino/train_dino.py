@@ -9,11 +9,14 @@ Usage:
 import fire
 import inspect
 import json
+import os
 import resource
 import sys
 import time
 import torch
+import torch.distributed as dist
 import torch.optim as optim
+from torch.nn.parallel import DistributedDataParallel
 from pathlib import Path
 from torch.utils.data import DataLoader
 
@@ -156,8 +159,22 @@ def main(
         packed_path: Path to the packed .npz file
     """
     # ============ Setup ============
-    device = torch.device(device if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(seed)
+    ddp = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    if ddp:
+        dist.init_process_group(backend="nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        rank, world_size, local_rank = 0, 1, 0
+        device = torch.device(device if torch.cuda.is_available() else "cpu")
+    is_main = rank == 0
+
+    # Offset by rank so the crops and masks drawn differ per rank; the shard order does
+    # not follow this (it has its own generator) and stays identical across ranks.
+    torch.manual_seed(seed + rank)
 
     # If a run name is given, nest outputs under debug_dir/run_name/ and output_dir/run_name/
     if run_name:
@@ -323,6 +340,8 @@ def main(
             # num_workers must match the DataLoader below: __len__ is built from it.
             num_workers=num_workers,
             seed=cfg.seed,
+            rank=rank,
+            world_size=world_size,
         )
         train_loader = DataLoader(
             dataset,
@@ -409,6 +428,34 @@ def main(
     print(f"  Total params:      {n_total:,}  (student + teacher EMA)")
     print(f"  Model size:        {n_total * 4 / 1024**2:.1f} MB  (fp32)")
 
+    # Keep handles on the unwrapped modules: state_dict() through a DDP wrapper carries
+    # a "module." prefix on every key, which would make the checkpoints unreadable by
+    # the probe stack and by any single-GPU run.
+    student_core = model.student
+    head_core = model.student_head
+
+    if ddp:
+        # Only the student trains; the teacher is an EMA copy and takes no gradients, so
+        # it is not wrapped. The wrapper is attached to the modules that forward_backward
+        # actually calls -- wrapping DINODuneModel itself would do nothing, since its
+        # entry point is forward_backward rather than forward, and DDP only intercepts
+        # the latter.
+        # find_unused_parameters is not optional here. Measured on two ranks
+        # (tests/test_ddp_gradients.py): with the default False and a parameter that
+        # receives no gradient -- the MAE mask tokens whenever use_masking is off --
+        # DDP leaves that bucket unfinished and performs NO reduction at all, silently.
+        # Each rank then trains on its own gradients while reporting a normal loss.
+        # With it True the gradients match the cross-rank average in every structure
+        # tested, at the cost of one graph traversal per iteration on a 0.6 M-parameter
+        # model.
+        model.student = DistributedDataParallel(
+            model.student, device_ids=[local_rank], find_unused_parameters=True
+        )
+        if model.student_head is not None:
+            model.student_head = DistributedDataParallel(
+                model.student_head, device_ids=[local_rank], find_unused_parameters=True
+            )
+
     # Optimise backbone + head (if present)
     # fetch parmaters from the model (student-only)
     student_params = list(model.student.parameters())
@@ -493,11 +540,11 @@ def main(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ============ Debugging ============
-    debugger = DINODebugger(cfg, enabled=True)
+    debugger = DINODebugger(cfg, enabled=is_main)
 
     # Always-on: the per-epoch stage breakdown is part of the [timing] line, sampled
     # one step in 50 so the synchronize it needs stays off the critical path.
-    stage_timer = StageTimer(enabled=(device.type == "cuda"))
+    stage_timer = StageTimer(enabled=(device.type == "cuda") and is_main)
     debugger.log_config(cfg)
 
     # ============ Training loop ============
@@ -505,6 +552,11 @@ def main(
     first_batch = True # for one-time logging
 
     for epoch in range(1, epochs + 1):
+
+        # Reseed the shard order: every rank must permute the full list identically, so
+        # this is the reader's equivalent of DistributedSampler.set_epoch.
+        if hasattr(dataset, "set_epoch"):
+            dataset.set_epoch(epoch)
 
         # set model to training mode
         model.train()
@@ -567,7 +619,7 @@ def main(
             debugger.log_gpu_memory(iteration)
 
             # gradient norms per backbone module (.grad still populated before next zero_grad)
-            debugger.log_gradient_norms(iteration, model.student)
+            debugger.log_gradient_norms(iteration, student_core)
 
             # representation-quality statistics (variance, covariance, norm)
             # pass head features separately when a head is present (student_out != student_backbone_out)
@@ -587,7 +639,7 @@ def main(
             # free Voxels objects to release GPU memory before the next forward pass
             del student_backbone_out, student_out, teacher_backbone_out, teacher_out
 
-            if (batch_idx + 1) % 50 == 0 or batch_idx == 0:
+            if is_main and ((batch_idx + 1) % 50 == 0 or batch_idx == 0):
                 cov_str = f", cov={cov_penalty:.4f}" if cov_penalty is not None else ""
                 var_str = f", var={var_penalty:.4f}" if var_penalty is not None else ""
                 mem_str = f", gpu={debugger.last_peak_alloc_gib:.2f}GiB"
@@ -607,22 +659,25 @@ def main(
         rss_kids = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024**2
         stages = stage_timer.summary()
         stage_str = f" stage_pct(n={stage_timer.n})={stages}" if stages else ""
-        print(f"[timing] epoch={epoch} wall={wall:.1f}s data_wait={data_wait:.1f}s "
-              f"({100*data_wait/max(wall,1e-9):.1f}%) samples_per_sec={n_samples/max(wall,1e-9):.1f} "
-              f"peak_rss_self={rss_self:.2f}GiB peak_rss_workers={rss_kids:.2f}GiB{stage_str}")
+        if is_main:
+            print(f"[timing] epoch={epoch} wall={wall:.1f}s data_wait={data_wait:.1f}s "
+                  f"({100*data_wait/max(wall,1e-9):.1f}%) samples_per_sec={n_samples/max(wall,1e-9):.1f} "
+                  f"peak_rss_self={rss_self:.2f}GiB peak_rss_workers={rss_kids:.2f}GiB{stage_str}")
         stage_timer.reset()
 
-        # Save model checkpoint
-        if epoch % save_every == 0 or epoch == epochs:
+        # Save model checkpoint. Rank 0 only: every rank holds identical weights (the
+        # gradients are averaged), so the others would rewrite the same bytes over each
+        # other's partial file.
+        if is_main and (epoch % save_every == 0 or epoch == epochs):
             ckpt = {
                 "epoch": epoch,
-                "student": model.student.state_dict(),
+                "student": student_core.state_dict(),
                 "teacher": model.teacher.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "cfg": cfg,
             }
             if model.student_head is not None:
-                ckpt["student_head"] = model.student_head.state_dict()
+                ckpt["student_head"] = head_core.state_dict()
                 ckpt["teacher_head"] = model.teacher_head.state_dict()
             ckpt_path = output_dir / f"checkpoint_epoch{epoch}.pt"
             torch.save(ckpt, ckpt_path)
@@ -630,8 +685,12 @@ def main(
 
     debugger.save_histories()
 
-    print("\nTraining complete!")
-    print(f"Checkpoints saved to: {output_dir}")
+    if is_main:
+        print("\nTraining complete!")
+        print(f"Checkpoints saved to: {output_dir}")
+
+    if ddp:
+        dist.destroy_process_group()
 
 
 # Keys a saved run_config.json carries that are not knobs: `timestamp` is run metadata

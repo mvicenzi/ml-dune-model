@@ -31,7 +31,7 @@ class StageTimer:
     """
 
     # Short names: this goes in the per-epoch [timing] line, which is already long.
-    STAGES = ("crop", "mask", "teach", "stud", "match", "loss", "bwd", "upd")
+    STAGES = ("crop", "mask", "teach", "stud", "match", "loss", "bwd", "sync", "upd")
 
     def __init__(self, every: int = 25, warmup: int = 10, enabled: bool = True):
         self.every = every if enabled else 0

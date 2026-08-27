@@ -1,5 +1,6 @@
 """DINO training model: student + teacher with EMA update."""
 
+import contextlib
 import inspect
 from typing import Optional
 
@@ -333,10 +334,25 @@ class DINODuneModel(nn.Module):
         total_loss = None
         sum_t_ent = sum_s_ent = sum_kl = sum_cov = sum_var = 0.0
         sum_loss_masked = sum_loss_unmasked = 0.0
-        n_metric = n_pairs = n_split = 0
+        n_metric = n_split = 0
+
+        # Decide the (student view, teacher view) pairs before running any of them.
+        # Each student view gets its own backward so that DistributedDataParallel sees
+        # one forward per backward -- its reducer fires per forward, and feeding it
+        # several forwards before a single backward reduces some parameters more than
+        # once (measured: gradients off by more than the ranks differ from each other).
+        # Knowing the schedule up front is what lets the loop mark the final backward,
+        # which is the one DDP must synchronise on.
+        pair_plan = []
+        for k in range(n_crops):
+            gs = [g for g in range(n_global)
+                  if not (k == g and n_crops > 1 and not keep_same_index)]
+            if gs:
+                pair_plan.append((k, gs))
+        n_pairs = sum(len(gs) for _, gs in pair_plan)
 
         # for each student view
-        for k in range(n_crops):
+        for plan_idx, (k, teacher_indices) in enumerate(pair_plan):
             if use_masking:
                 with timer.stage("mask"):
                     view_k_masked, masked_coords_k = masker(all_views[k])
@@ -349,17 +365,9 @@ class DINODuneModel(nn.Module):
                     view_k_masked, masked_coords=masked_coords_k,
                 )
 
-            # for each teacher global
-            for g in range(n_global):
-                # skip same-index pairs only when multiple views exist
-                # (with one view, the single masking pair must not be skipped)
-                # basically: never compare a global view with itself --
-                # unless the student view is masked, which makes it a different
-                # input than the teacher's copy and the pair a masked-prediction
-                # term rather than a self-comparison
-                if k == g and n_crops > 1 and not keep_same_index:
-                    continue
-
+            # for each teacher global this view pairs with
+            view_loss = None
+            for g in teacher_indices:
                 teacher_backbone_g, teacher_out_g = teacher_encoded[g]
 
                 # returns features for each matching voxels across views
@@ -377,9 +385,11 @@ class DINODuneModel(nn.Module):
                         s_feats, s_bb_feats, t_feats, counts, is_masked=is_masked,
                     )
 
-                # accumulate loss (averaging)
-                total_loss = loss_kg if total_loss is None else total_loss + loss_kg
-                n_pairs += 1
+                # accumulate within this view; the backward happens once below, so a
+                # view used by several teacher views still needs only one graph pass
+                view_loss = loss_kg if view_loss is None else view_loss + loss_kg
+                total_loss = (loss_kg.detach() if total_loss is None
+                              else total_loss + loss_kg.detach())
 
                 # accumulate entropy metrics for logging (averaging)
                 if t_ent is not None:
@@ -401,9 +411,20 @@ class DINODuneModel(nn.Module):
                 if loss_unmasked_kg is not None:
                     sum_loss_unmasked += loss_unmasked_kg
 
+            # Backward for this view. Scaling by n_pairs here makes the accumulated
+            # gradient identical to one backward on the mean over all pairs.
+            # Every view but the last runs under no_sync(), so DDP all-reduces once
+            # per step rather than once per view -- the standard accumulation idiom.
+            is_last = plan_idx == len(pair_plan) - 1
+            with timer.stage("bwd"):
+                with contextlib.ExitStack() as stack:
+                    if not is_last:
+                        for module in (self.student, self.student_head):
+                            if hasattr(module, "no_sync"):
+                                stack.enter_context(module.no_sync())
+                    (view_loss / n_pairs).backward()
+
         total_loss = total_loss / n_pairs
-        with timer.stage("bwd"):
-            total_loss.backward()
 
         avg_t_ent = sum_t_ent / n_metric if n_metric > 0 else None
         avg_s_ent = sum_s_ent / n_metric if n_metric > 0 else None

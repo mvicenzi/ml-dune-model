@@ -1,6 +1,7 @@
 """Per-pixel DINO-style loss for self-supervised training."""
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
@@ -271,7 +272,24 @@ class PixelDINOLoss(nn.Module):
         """
         teacher_flat = teacher_out.feature_tensor  # [N_active, D]
 
-        if teacher_flat.shape[0] == 0:
+        # Sum and count rather than mean, so under DDP the centre is the mean over the
+        # whole step and not one per rank -- per-rank centres would drift apart and the
+        # ranks would stop optimising the same objective.
+        #
+        # The empty-batch check happens AFTER the collectives on purpose: returning
+        # early on a locally empty batch would leave the other ranks waiting in an
+        # all-reduce that never comes. Sum and count of an empty [0, D] are well
+        # defined, and `count` is global, so every rank returns together or not at all.
+        distributed = dist.is_available() and dist.is_initialized()
+
+        feat_sum = teacher_flat.sum(dim=0)                       # [D]; zeros if empty
+        count = torch.tensor([teacher_flat.shape[0]],
+                             device=feat_sum.device, dtype=feat_sum.dtype)
+        if distributed:
+            dist.all_reduce(feat_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(count, op=dist.ReduceOp.SUM)
+
+        if count.item() == 0:
             return
 
         # For dino loss: normalize to unit sphere before computing the center,
@@ -280,7 +298,7 @@ class PixelDINOLoss(nn.Module):
         #if self.loss_type == "dino":
         #    teacher_flat = F.normalize(teacher_flat, dim=-1)
 
-        batch_mean = teacher_flat.mean(dim=0)  # [D]
+        batch_mean = feat_sum / count  # [D]
 
         if self.center is None:
             self.center = batch_mean.clone()
