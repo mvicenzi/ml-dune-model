@@ -190,9 +190,13 @@ def main(
                 _builtin_print(f"[rank{rank}]", *args, **kwargs)
         builtins.print = _rank_print
 
-    # Offset by rank so the crops and masks drawn differ per rank; the shard order does
-    # not follow this (it has its own generator) and stays identical across ranks.
-    torch.manual_seed(seed + rank)
+    # Every rank must build the model from the SAME seed: DDP's wrapper broadcast
+    # synchronises only the student, and the teacher starts as a copy of the rank-local
+    # student -- a per-rank seed here would leave each rank distilling against a
+    # differently-initialised teacher for the first epochs (measured: the 2-GPU loss
+    # curve separates from the 1-GPU one far beyond run noise). The per-rank offset for
+    # crop/mask draws is applied after the model and wrappers are built.
+    torch.manual_seed(seed)
 
     # If a run name is given, nest outputs under debug_dir/run_name/ and output_dir/run_name/
     if run_name:
@@ -473,6 +477,23 @@ def main(
             model.student_head = DistributedDataParallel(
                 model.student_head, device_ids=[local_rank], find_unused_parameters=True
             )
+
+        # The teacher is outside every wrapper, so nothing else guarantees the ranks
+        # agree on it. The shared construction seed above should already make it
+        # identical; the broadcast makes that a guarantee rather than an assumption
+        # (any nondeterminism in construction would otherwise diverge the objective
+        # per rank, silently).
+        for module in (model.teacher, model.teacher_head):
+            if module is not None:
+                for t in list(module.parameters()) + list(module.buffers()):
+                    dist.broadcast(t.data, src=0)
+
+        # Crops and masks must differ per rank or every rank would augment
+        # identically; the shard order does not follow this (it has its own
+        # generator) and stays identical across ranks. Applied only now so that
+        # model construction above is rank-independent, and only under DDP so a
+        # single-GPU run keeps its original RNG stream bit-for-bit.
+        torch.manual_seed(seed + rank)
 
     # Optimise backbone + head (if present)
     # fetch parmaters from the model (student-only)
