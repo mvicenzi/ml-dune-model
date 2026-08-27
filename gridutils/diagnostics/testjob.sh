@@ -42,6 +42,17 @@ echo "  cache_dir=${cache_dir}"
 echo "  script=${script}"
 echo ""
 
+# --- NCCL on PCIe-only L40S (multi-GPU tests) --------------------------------
+# sgpu0003/4 have no NVLink and their GPU-to-GPU P2P transport hangs at this
+# driver/NCCL level: the process group initialises and the startup broadcasts
+# succeed, but the first AllReduce never returns and the job sits until the
+# watchdog kills it. Forcing the host shared-memory transport fixes it at no real
+# cost (SHM bandwidth matches PCIe-P2P and our gradients are small). Harmless for
+# single-GPU tests, which never touch NCCL.
+export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+echo "  NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE}  NCCL_IB_DISABLE=${NCCL_IB_DISABLE}"
+
 echo "WarpConNet overrides:"
 export WARPCONVNET_USE_FP16_ACCUM=false
 export WARPCONVNET_BENCHMARK_CACHE_DIR="$wp_cache"
