@@ -6,6 +6,7 @@ Usage:
     python dino/train_dino.py --epochs=2 --batch_size=4 --n_subset=2000 --debug=True
 """
 
+import builtins
 import fire
 import inspect
 import json
@@ -159,6 +160,8 @@ def main(
         packed_path: Path to the packed .npz file
     """
     # ============ Setup ============
+
+    # Detect whether this is a DDP run (WORLD_SIZE > 1) and set up the process group if so.
     ddp = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if ddp:
         dist.init_process_group(backend="nccl")
@@ -170,7 +173,22 @@ def main(
     else:
         rank, world_size, local_rank = 0, 1, 0
         device = torch.device(device if torch.cuda.is_available() else "cpu")
+
+    # rank 0 (first GPU) is the main process that prints to stdout and saves checkpoints;
+    # the others should stay silent.
     is_main = rank == 0
+
+    # In DDP, every rank runs the same code, so any print not gated on is_main lands
+    # world_size times in the shared job log, interleaved mid-line. 
+    # Muting stdout on the non-main ranks at the source covers all of them at once.
+    # print(..., force=True) bypasses the mute, rank-prefixed
+    # Single-GPU runs take the rank-0 path and print exactly as before.
+    if ddp and not is_main:
+        _builtin_print = builtins.print
+        def _rank_print(*args, force=False, **kwargs):
+            if force:
+                _builtin_print(f"[rank{rank}]", *args, **kwargs)
+        builtins.print = _rank_print
 
     # Offset by rank so the crops and masks drawn differ per rank; the shard order does
     # not follow this (it has its own generator) and stays identical across ranks.
@@ -658,7 +676,7 @@ def main(
         rss_self = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2
         rss_kids = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024**2
         stages = stage_timer.summary()
-        stage_str = f" stage_pct(n={stage_timer.n})={stages}" if stages else ""
+        stage_str = f"\n         stage_pct(n={stage_timer.n})={stages}" if stages else ""
         if is_main:
             print(f"[timing] epoch={epoch} wall={wall:.1f}s data_wait={data_wait:.1f}s "
                   f"({100*data_wait/max(wall,1e-9):.1f}%) samples_per_sec={n_samples/max(wall,1e-9):.1f} "
