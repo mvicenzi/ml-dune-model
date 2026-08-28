@@ -2,7 +2,7 @@
 DINO training script for DUNE sparse UNet backbone.
 
 Usage:
-    python dino/train_dino.py --epochs=100 --batch_size=16 --backbone_name=attn_default
+    python dino/train_dino.py --epochs=100 --batch_size=100 --backbone_name=attn_default
     python dino/train_dino.py --epochs=2 --batch_size=4 --n_subset=2000 --debug=True
 """
 
@@ -46,7 +46,7 @@ def main(
     image_w: int = 1050,
     min_lr: float = 1e-6,
     epochs: int = 100,
-    batch_size: int = 50,
+    batch_size: int = 100,
     lr: float = 1e-4,
     use_cropping: bool = True,
     use_masking: bool = True,
