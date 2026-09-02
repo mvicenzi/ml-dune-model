@@ -1,7 +1,9 @@
 #!/bin/bash
 #
-# DINO training script.  
+# DINO training script.
 # Runs on the Condor worker; called by submit.sh.
+# Single-node; with more than one assigned GPU it launches one rank per GPU
+# under torchrun, otherwise it runs the interpreter directly.
 #
 # Args (positional):
 #   $1 codedir  -- path to ml-dune-model repo root
@@ -32,8 +34,12 @@ mkdir -p "$wp_cache_gpfs" "$data_cache"
 echo "Copying WarpConvNet benchmark cache to local scratch..."
 cp -r "$wp_cache_gpfs" "$wp_cache"
 
+# One rank per GPU Condor assigned to this slot (comma-separated list; works
+# for both index and GPU-UUID forms).
+ngpus=$(awk -F, '{print NF}' <<< "${CUDA_VISIBLE_DEVICES}")
+
 echo "Running $CLUSTER_ID.$JOB_ID on $(hostname)"
-echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} (ngpus=${ngpus})"
 echo "  _CONDOR_SCRATCH_DIR=${_CONDOR_SCRATCH_DIR}"
 echo ""
 
@@ -44,6 +50,18 @@ echo "  pyenv=${pyenv}"
 echo "  config=${config}"
 echo "  outdir=${outdir}"
 echo "  cache_dir=${cache_dir}"
+echo ""
+
+# --- NCCL on PCIe-only L40S ---------------------------------------------------
+# sgpu0003/4 have no NVLink and their GPU-to-GPU P2P transport hangs at this
+# driver/NCCL level: the process group initialises and the startup broadcasts
+# succeed, but the first AllReduce never returns and the job sits until the
+# watchdog kills it. Forcing the host shared-memory transport fixes it at no real
+# cost (SHM bandwidth matches PCIe-P2P and our gradients are small). Harmless on
+# a single GPU, where no collective is issued.
+export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+echo "  NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE}  NCCL_IB_DISABLE=${NCCL_IB_DISABLE}"
 echo ""
 
 echo "WarpConNet overrides:"
@@ -98,10 +116,19 @@ stop_sync_loop() { kill "$sync_loop_pid" 2>/dev/null || true; }
 trap 'stop_sync_loop; sync_back' EXIT              # flush scratch -> GPFS on any normal/error exit
 trap 'stop_sync_loop; sync_back; exit 143' SIGTERM # on scheduler kill: flush, then exit 128+15 (SIGTERM)
 
-echo "Executing train_dino.py ..."
+# torchrun --standalone rendezvouses on a free localhost port, so concurrent
+# jobs on the same worker cannot collide on a fixed master port.
+if [ "$ngpus" -gt 1 ]; then
+  echo "Executing train_dino.py under torchrun (${ngpus} ranks) ..."
+  launcher=(torchrun --standalone --nnodes=1 --nproc_per_node="$ngpus")
+else
+  echo "Executing train_dino.py ..."
+  launcher=(python -u)
+fi
 
 PYTHONPATH="$codedir${PYTHONPATH:+:$PYTHONPATH}" \
-    python -u -m dino.train_dino from_config \
+PYTHONUNBUFFERED=1 \
+    "${launcher[@]}" -m dino.train_dino from_config \
         --config_path="$config" \
         --output_dir="$scratch_ckpt" \
         --debug_dir="$scratch_dbg" \

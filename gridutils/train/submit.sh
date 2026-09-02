@@ -105,13 +105,7 @@ fi
 # the repo on the shared filesystem -- do not edit it while jobs that use it
 # are queued or running (bash reads scripts incrementally as they execute).
 
-# Multi-GPU requests go through the torchrun launcher (one rank per GPU);
-# single-GPU keeps the plain script.
-if [ "${REQUEST_GPUS}" -gt 1 ]; then
-  jobscript="${REPODIR}/gridutils/train/trainjob_ddp.sh"
-else
-  jobscript="${REPODIR}/gridutils/train/trainjob.sh"
-fi
+jobscript="${REPODIR}/gridutils/train/trainjob.sh"
 
 subfile="${out_dir}/${run_name}.sub"
 cat > "$subfile" <<EOF

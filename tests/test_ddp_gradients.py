@@ -196,6 +196,15 @@ def _run(rank):
         ("no mask + find_unused",
          _case(rank, device, "single view, no mask, find_unused=True", False, False,
                find_unused=True)),
+        # The production combination. Every case above either runs one view, where
+        # forward_backward's no_sync() path never engages because the only view is the
+        # last one, or runs find_unused_parameters=False, which training never uses.
+        # Multi-view plus find_unused=True is the one that exercises the per-view
+        # backward under no_sync with the reducer's unused-parameter scan, and it is
+        # the combination train_dino.py actually configures.
+        ("three views + find_unused",
+         _case(rank, device, "three views, masked, find_unused=True", True, True,
+               find_unused=True)),
     ]
 
     if rank == 0:
