@@ -101,15 +101,17 @@ if [ "$SMOKE" -eq 1 ]; then
   echo "Smoke run: epochs=${SMOKE_EPOCHS} n_subset=${SMOKE_NSUBSET} (config: ${smoke_config})"
 fi
 
-# NB: with should_transfer_files=NO Condor executes trainjob.sh IN PLACE from
+# NB: with should_transfer_files=NO Condor executes the job script IN PLACE from
 # the repo on the shared filesystem -- do not edit it while jobs that use it
 # are queued or running (bash reads scripts incrementally as they execute).
+
+jobscript="${REPODIR}/gridutils/train/trainjob.sh"
 
 subfile="${out_dir}/${run_name}.sub"
 cat > "$subfile" <<EOF
 universe                = vanilla
 notification            = never
-executable              = ${REPODIR}/gridutils/train/trainjob.sh
+executable              = ${jobscript}
 arguments               = ${REPODIR} ${PYENV} ${config} ${out_dir} ${CACHE_DIR} ${run_name}
 environment             = "CLUSTER_ID=\$(ClusterId) JOB_ID=\$(ProcId)"
 +JobBatchName           = "dino-${run_name}"

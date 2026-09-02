@@ -44,6 +44,45 @@ REQUEST_CPUS="${REQUEST_CPUS:-4}"
 GPU_REQUIREMENTS="${GPU_REQUIREMENTS:-(GPUs_DeviceName == \"NVIDIA L40S\") && (GPUs_Capability == 8.9)}"
 ```
 
+## Multi-GPU (DDP)
+
+Set `REQUEST_GPUS` to the number of ranks you want; nothing else about the submission
+changes.
+
+```bash
+REQUEST_GPUS=6 REQUEST_CPUS=24 REQUEST_MEMORY=192000 \
+  ./submit.sh path/to/run_config.json
+```
+
+`trainjob.sh` counts the GPUs Condor actually granted the slot (the comma-separated
+`CUDA_VISIBLE_DEVICES`) and launches one rank per GPU under `torchrun --standalone` when
+that count is above 1, or runs the interpreter directly when it is 1. Single node only.
+Only rank 0 writes checkpoints, debug histories and the `[timing]` lines.
+
+Three things the submitter does **not** do for you:
+
+- **`batch_size` in the config is per rank.** N ranks at `batch_size: B` train at an
+  effective batch of `N x B`. To hold the effective batch fixed while adding ranks,
+  divide `batch_size` by N.
+- **`lr` is not adjusted.** Raising the effective batch without scaling the learning rate
+  puts the run in a different optimisation regime, so it is no longer comparable to runs
+  at the old one.
+- **`REQUEST_CPUS` and `REQUEST_MEMORY` do not scale with `REQUEST_GPUS`.** Every rank
+  spawns its own `num_workers` dataloader workers, so raise both yourself.
+
+With the sharded reader, shards are partitioned over `world_size x num_workers` readers
+and every reader gets the same (ceiling) number of shards, so the padding waste grows
+with the rank count — prefer fewer `num_workers` per rank at high `REQUEST_GPUS`. If
+`world_size x num_workers` exceeds the number of full shards the container holds, the
+dataset raises at startup (`N full shards cannot feed M readers`); lower `num_workers`
+or use fewer ranks.
+
+`NCCL_P2P_DISABLE` and `NCCL_IB_DISABLE` are exported by `trainjob.sh`. The L40S nodes
+have no NVLink and their GPU-to-GPU P2P transport hangs — the process group initialises
+and the startup broadcasts succeed, but the first AllReduce never returns and the job
+sits until the watchdog kills it. Both are set to `1` unless already present in the
+environment.
+
 ## Training configuration
 
 An example training configuration is provided in [config.json](config.json).
@@ -54,7 +93,7 @@ Copy [config.json](config.json) and edit. Key fields:
 - `run_name` — **must be unique**; defines the output directory under `CONDOR_OUT`.
 - `datadir`, `apa`, `view`, `image_h`, `image_w`, `n_subset` — dataset selection.
 - `use_sharded`/`sharded_dir`, `use_packed`/`packed_path` — pre-built container selection (see [../datagen/](../datagen/)).
-- `batch_size`, `num_workers` — dataloader.
+- `batch_size`, `num_workers` — dataloader. `batch_size` is **per rank**; see [Multi-GPU (DDP)](#multi-gpu-ddp).
 - `backbone_name`, `feature_dim`, `proj_head_*`, `encoding_range` — model.
 - `augmentation_mode`, `crop_*`, `mask_ratio` — augmentation pipeline.
 - `epochs`, `lr`, `min_lr`, `weight_decay*`, `warmup_epochs`, `momentum_*` — schedule.

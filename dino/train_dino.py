@@ -2,18 +2,22 @@
 DINO training script for DUNE sparse UNet backbone.
 
 Usage:
-    python dino/train_dino.py --epochs=100 --batch_size=16 --backbone_name=attn_default
+    python dino/train_dino.py --epochs=100 --batch_size=100 --backbone_name=attn_default
     python dino/train_dino.py --epochs=2 --batch_size=4 --n_subset=2000 --debug=True
 """
 
+import builtins
 import fire
 import inspect
 import json
+import os
 import resource
 import sys
 import time
 import torch
+import torch.distributed as dist
 import torch.optim as optim
+from torch.nn.parallel import DistributedDataParallel
 from pathlib import Path
 from torch.utils.data import DataLoader
 
@@ -28,7 +32,7 @@ from .cropping import CropConfig, SparseCropper
 from .loss import PixelDINOLoss
 from .scheduler import CosineScheduler
 from .model import DINODuneModel
-from .debug import DINODebugger
+from .debug import DINODebugger, StageTimer
 
 
 def main(
@@ -42,7 +46,7 @@ def main(
     image_w: int = 1050,
     min_lr: float = 1e-6,
     epochs: int = 100,
-    batch_size: int = 50,
+    batch_size: int = 100,
     lr: float = 1e-4,
     use_cropping: bool = True,
     use_masking: bool = True,
@@ -90,7 +94,8 @@ def main(
     debug_every: int = 100,
     debug_dir: str = "./dino_debug",
     run_name: str = "",
-    num_workers: int = 4,
+    num_workers: int = 5,
+    seed: int = 42,
     use_sharded: bool = False,
     sharded_dir: str = "",
     buffer_size: int = 3000,
@@ -147,6 +152,7 @@ def main(
         debug_dir: Base directory for debug outputs
         run_name: Optional label; outputs go to debug_dir/run_name/ if set
         num_workers: Number of dataloader workers
+        seed: RNG seed for torch, the loader shuffles and the DDP shard order
         use_sharded: Stream from pre-sharded HDF5 (loader/create_shards.py)
         sharded_dir: Directory with shard_*.h5 + metadata.json
         buffer_size: Shuffle-buffer size for the sharded reader
@@ -154,8 +160,43 @@ def main(
         packed_path: Path to the packed .npz file
     """
     # ============ Setup ============
-    device = torch.device(device if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(42)
+
+    # Detect whether this is a DDP run (WORLD_SIZE > 1) and set up the process group if so.
+    ddp = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    if ddp:
+        dist.init_process_group(backend="nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        rank, world_size, local_rank = 0, 1, 0
+        device = torch.device(device if torch.cuda.is_available() else "cpu")
+
+    # rank 0 (first GPU) is the main process that prints to stdout and saves checkpoints;
+    # the others should stay silent.
+    is_main = rank == 0
+
+    # In DDP, every rank runs the same code, so any print not gated on is_main lands
+    # world_size times in the shared job log, interleaved mid-line. 
+    # Muting stdout on the non-main ranks at the source covers all of them at once.
+    # print(..., force=True) bypasses the mute, rank-prefixed
+    # Single-GPU runs take the rank-0 path and print exactly as before.
+    if ddp and not is_main:
+        _builtin_print = builtins.print
+        def _rank_print(*args, force=False, **kwargs):
+            if force:
+                _builtin_print(f"[rank{rank}]", *args, **kwargs)
+        builtins.print = _rank_print
+
+    # Every rank must build the model from the SAME seed: DDP's wrapper broadcast
+    # synchronises only the student, and the teacher starts as a copy of the rank-local
+    # student -- a per-rank seed here would leave each rank distilling against a
+    # differently-initialised teacher for the first epochs (measured: the 2-GPU loss
+    # curve separates from the 1-GPU one far beyond run noise). The per-rank offset for
+    # crop/mask draws is applied after the model and wrappers are built.
+    torch.manual_seed(seed)
 
     # If a run name is given, nest outputs under debug_dir/run_name/ and output_dir/run_name/
     if run_name:
@@ -227,6 +268,7 @@ def main(
         debug_dir=debug_dir,
         run_name=run_name,
         num_workers=num_workers,
+        seed=seed,
         use_sharded=use_sharded,
         sharded_dir=sharded_dir,
         buffer_size=buffer_size,
@@ -251,8 +293,29 @@ def main(
     print(f"  lr             = {cfg.lr}")
     print(f"  batch_size     = {cfg.batch_size}")
     print(f"  warmup_epochs  = {cfg.warmup_epochs}")
+    print(f"  seed           = {cfg.seed}")
     print(f"  momentum_start = {cfg.momentum_start}")
     print(f"  momentum_end   = {cfg.momentum_end}")
+
+    # Validated here rather than at load time so the summary below cannot print a
+    # container the run is not going to use.
+    if cfg.use_sharded and cfg.use_packed:
+        raise ValueError("use_sharded and use_packed are mutually exclusive")
+    if cfg.use_sharded:
+        source, path = "sharded", cfg.sharded_dir
+    elif cfg.use_packed:
+        source, path = "packed", cfg.packed_path
+    else:
+        source, path = "raw", cfg.datadir
+
+    print("Dataset:")
+    print(f"  source         = {source}")
+    print(f"  path           = {path}")
+    print(f"  apa / view     = {cfg.apa} / {cfg.view}")
+    print(f"  image_h x w    = {cfg.image_h} x {cfg.image_w}")
+    print(f"  n_subset       = {cfg.n_subset}")
+    print(f"  num_workers    = {cfg.num_workers}")
+    print(f"  buffer_size    = {cfg.buffer_size}")
 
     print("Augmentation:")
     print(f"  use_cropping           = {cfg.use_cropping}")
@@ -288,20 +351,19 @@ def main(
     print(f"  var_gamma           = {cfg.var_gamma}")
 
     # ============ Data ============
-    if cfg.use_sharded and cfg.use_packed:
-        raise ValueError("use_sharded and use_packed are mutually exclusive")
-
     if cfg.use_sharded:
         from loader.apa_sparse_sharded_dataset import APASparseShardedDataset
         print(f"\nLoading sharded dataset: {cfg.sharded_dir}")
-        print(f"  batch_size  = {batch_size}")
-        print(f"  buffer_size = {cfg.buffer_size}")
-        print(f"  n_subset    = {cfg.n_subset}")
         dataset = APASparseShardedDataset(
             root_dir=cfg.sharded_dir,
             batch_size=batch_size,
             buffer_size=cfg.buffer_size,
             n_subset=cfg.n_subset,
+            # num_workers must match the DataLoader below: __len__ is built from it.
+            num_workers=num_workers,
+            seed=cfg.seed,
+            rank=rank,
+            world_size=world_size,
         )
         train_loader = DataLoader(
             dataset,
@@ -316,11 +378,9 @@ def main(
     elif cfg.use_packed:
         from loader.apa_packed_dataset import APAPackedDataset
         print(f"\nLoading packed dataset: {cfg.packed_path}")
-        print(f"  batch_size = {batch_size}")
-        print(f"  n_subset   = {cfg.n_subset}")
         dataset = APAPackedDataset(cfg.packed_path)
         if cfg.n_subset > 0:
-            rng = torch.Generator().manual_seed(42)
+            rng = torch.Generator().manual_seed(cfg.seed)
             subset_indices = torch.randperm(len(dataset), generator=rng)[: cfg.n_subset]
             dataset = Subset(dataset, subset_indices)
         train_loader = DataLoader(
@@ -336,11 +396,10 @@ def main(
             drop_last=True,
             # Dedicated generator: the shuffle sequence is reproducible and
             # independent of upstream RNG consumption.
-            generator=torch.Generator().manual_seed(42),
+            generator=torch.Generator().manual_seed(cfg.seed),
         )
     else:
         print("\nLoading dataset:", cfg.datadir)
-        print(f"  n_subset = {cfg.n_subset}")
         dataset = APASparseMetaDataset(
             datadir=cfg.datadir,
             apa=cfg.apa,
@@ -349,8 +408,7 @@ def main(
             cache_dir=cfg.cache_dir,
         )
         if cfg.n_subset > 0:
-            print(f"Using subset: {cfg.n_subset} samples")
-            rng = torch.Generator().manual_seed(42)
+            rng = torch.Generator().manual_seed(cfg.seed)
             subset_indices = torch.randperm(len(dataset), generator=rng)[: cfg.n_subset]
             dataset = Subset(dataset, subset_indices)
         train_loader = DataLoader(
@@ -362,7 +420,7 @@ def main(
             collate_fn=voxels_meta_collate_fn,
             # Dedicated generator: shuffle order is a pure function of the
             # seed, independent of upstream RNG consumption (see packed branch).
-            generator=torch.Generator().manual_seed(42),
+            generator=torch.Generator().manual_seed(cfg.seed),
         )
 
     print(f"Dataset size: {len(dataset)}")
@@ -391,6 +449,51 @@ def main(
     print(f"  Trainable params:  {n_backbone + n_head:,}  (student only)")
     print(f"  Total params:      {n_total:,}  (student + teacher EMA)")
     print(f"  Model size:        {n_total * 4 / 1024**2:.1f} MB  (fp32)")
+
+    # Keep handles on the unwrapped modules: state_dict() through a DDP wrapper carries
+    # a "module." prefix on every key, which would make the checkpoints unreadable by
+    # the probe stack and by any single-GPU run.
+    student_core = model.student
+    head_core = model.student_head
+
+    if ddp:
+        # Only the student trains; the teacher is an EMA copy and takes no gradients, so
+        # it is not wrapped. The wrapper is attached to the modules that forward_backward
+        # actually calls -- wrapping DINODuneModel itself would do nothing, since its
+        # entry point is forward_backward rather than forward, and DDP only intercepts
+        # the latter.
+        # find_unused_parameters is not optional here. Measured on two ranks
+        # (tests/test_ddp_gradients.py): with the default False and a parameter that
+        # receives no gradient -- the MAE mask tokens whenever use_masking is off --
+        # DDP leaves that bucket unfinished and performs NO reduction at all, silently.
+        # Each rank then trains on its own gradients while reporting a normal loss.
+        # With it True the gradients match the cross-rank average in every structure
+        # tested, at the cost of one graph traversal per iteration on a 0.6 M-parameter
+        # model.
+        model.student = DistributedDataParallel(
+            model.student, device_ids=[local_rank], find_unused_parameters=True
+        )
+        if model.student_head is not None:
+            model.student_head = DistributedDataParallel(
+                model.student_head, device_ids=[local_rank], find_unused_parameters=True
+            )
+
+        # The teacher is outside every wrapper, so nothing else guarantees the ranks
+        # agree on it. The shared construction seed above should already make it
+        # identical; the broadcast makes that a guarantee rather than an assumption
+        # (any nondeterminism in construction would otherwise diverge the objective
+        # per rank, silently).
+        for module in (model.teacher, model.teacher_head):
+            if module is not None:
+                for t in list(module.parameters()) + list(module.buffers()):
+                    dist.broadcast(t.data, src=0)
+
+        # Crops and masks must differ per rank or every rank would augment
+        # identically; the shard order does not follow this (it has its own
+        # generator) and stays identical across ranks. Applied only now so that
+        # model construction above is rank-independent, and only under DDP so a
+        # single-GPU run keeps its original RNG stream bit-for-bit.
+        torch.manual_seed(seed + rank)
 
     # Optimise backbone + head (if present)
     # fetch parmaters from the model (student-only)
@@ -476,7 +579,11 @@ def main(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ============ Debugging ============
-    debugger = DINODebugger(cfg, enabled=True)
+    debugger = DINODebugger(cfg, enabled=is_main)
+
+    # Always-on: the per-epoch stage breakdown is part of the [timing] line, sampled
+    # one step in 50 so the synchronize it needs stays off the critical path.
+    stage_timer = StageTimer(enabled=(device.type == "cuda") and is_main)
     debugger.log_config(cfg)
 
     # ============ Training loop ============
@@ -484,6 +591,11 @@ def main(
     first_batch = True # for one-time logging
 
     for epoch in range(1, epochs + 1):
+
+        # Reseed the shard order: every rank must permute the full list identically, so
+        # this is the reader's equivalent of DistributedSampler.set_epoch.
+        if hasattr(dataset, "set_epoch"):
+            dataset.set_epoch(epoch)
 
         # set model to training mode
         model.train()
@@ -516,6 +628,7 @@ def main(
                 param_group["weight_decay"] = wd_val
 
             # Forward + backward
+            stage_timer.step(iteration)
             optimizer.zero_grad()
 
             # execute forward/backward pass, returning loss and other metrics
@@ -523,16 +636,18 @@ def main(
              kl, cov_penalty, var_penalty,
              loss_masked, loss_unmasked,
              student_backbone_out, teacher_backbone_out,
-             student_out, teacher_out) = model.forward_backward(xs, cropper, masker, loss_fn, use_cropping, use_masking)
+             student_out, teacher_out) = model.forward_backward(xs, cropper, masker, loss_fn, use_cropping, use_masking, stage_timer)
             
-            # "three steps forward, two steps back"
-            optimizer.step()
+            with stage_timer.stage("upd"):
+                # "three steps forward, two steps back"
+                optimizer.step()
 
-            # EMA teacher update
-            model.update_teacher(mom_val)
+                # EMA teacher update
+                model.update_teacher(mom_val)
 
-            # centering: update teacher center for next iteration
-            loss_fn.update_center(teacher_out)
+                # centering: update teacher center for next iteration
+                loss_fn.update_center(teacher_out)
+            stage_timer.flush()
             debugger.log_center_stats(iteration, loss_fn)
 
             # scalar logging: the (teacher_entropy, student_entropy, kl) trio already
@@ -543,7 +658,7 @@ def main(
             debugger.log_gpu_memory(iteration)
 
             # gradient norms per backbone module (.grad still populated before next zero_grad)
-            debugger.log_gradient_norms(iteration, model.student)
+            debugger.log_gradient_norms(iteration, student_core)
 
             # representation-quality statistics (variance, covariance, norm)
             # pass head features separately when a head is present (student_out != student_backbone_out)
@@ -563,7 +678,7 @@ def main(
             # free Voxels objects to release GPU memory before the next forward pass
             del student_backbone_out, student_out, teacher_backbone_out, teacher_out
 
-            if (batch_idx + 1) % 50 == 0 or batch_idx == 0:
+            if is_main and ((batch_idx + 1) % 50 == 0 or batch_idx == 0):
                 cov_str = f", cov={cov_penalty:.4f}" if cov_penalty is not None else ""
                 var_str = f", var={var_penalty:.4f}" if var_penalty is not None else ""
                 mem_str = f", gpu={debugger.last_peak_alloc_gib:.2f}GiB"
@@ -581,21 +696,27 @@ def main(
         n_samples = epoch_len * batch_size
         rss_self = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2
         rss_kids = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024**2
-        print(f"[timing] epoch={epoch} wall={wall:.1f}s data_wait={data_wait:.1f}s "
-              f"({100*data_wait/max(wall,1e-9):.1f}%) samples_per_sec={n_samples/max(wall,1e-9):.1f} "
-              f"peak_rss_self={rss_self:.2f}GiB peak_rss_workers={rss_kids:.2f}GiB")
+        stages = stage_timer.summary()
+        stage_str = f"\n         stage_pct(n={stage_timer.n})={stages}" if stages else ""
+        if is_main:
+            print(f"[timing] epoch={epoch} wall={wall:.1f}s data_wait={data_wait:.1f}s "
+                  f"({100*data_wait/max(wall,1e-9):.1f}%) samples_per_sec={n_samples/max(wall,1e-9):.1f} "
+                  f"peak_rss_self={rss_self:.2f}GiB peak_rss_workers={rss_kids:.2f}GiB{stage_str}")
+        stage_timer.reset()
 
-        # Save model checkpoint
-        if epoch % save_every == 0 or epoch == epochs:
+        # Save model checkpoint. Rank 0 only: every rank holds identical weights (the
+        # gradients are averaged), so the others would rewrite the same bytes over each
+        # other's partial file.
+        if is_main and (epoch % save_every == 0 or epoch == epochs):
             ckpt = {
                 "epoch": epoch,
-                "student": model.student.state_dict(),
+                "student": student_core.state_dict(),
                 "teacher": model.teacher.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "cfg": cfg,
             }
             if model.student_head is not None:
-                ckpt["student_head"] = model.student_head.state_dict()
+                ckpt["student_head"] = head_core.state_dict()
                 ckpt["teacher_head"] = model.teacher_head.state_dict()
             ckpt_path = output_dir / f"checkpoint_epoch{epoch}.pt"
             torch.save(ckpt, ckpt_path)
@@ -603,8 +724,12 @@ def main(
 
     debugger.save_histories()
 
-    print("\nTraining complete!")
-    print(f"Checkpoints saved to: {output_dir}")
+    if is_main:
+        print("\nTraining complete!")
+        print(f"Checkpoints saved to: {output_dir}")
+
+    if ddp:
+        dist.destroy_process_group()
 
 
 # Keys a saved run_config.json carries that are not knobs: `timestamp` is run metadata

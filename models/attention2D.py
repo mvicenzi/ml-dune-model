@@ -176,7 +176,9 @@ class SpatialFeatureAttention2D(Attention):
             if mask is not None:
                 assert mask.device == attn.device
                 attn_bias = torch.zeros(mask.shape, dtype = attn.dtype, device = attn.device)
-                attn_bias.masked_fill_(mask.logical_not(), float("-1e9"))
+                # dtype-aware sentinel: -1e9 is outside fp16 range, so a literal
+                # cannot be written under half precision
+                attn_bias.masked_fill_(mask.logical_not(), torch.finfo(attn.dtype).min)
                 attn = attn + attn_bias
 
             attn = attn.softmax(dim=-1)
