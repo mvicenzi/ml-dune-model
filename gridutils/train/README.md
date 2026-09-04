@@ -59,15 +59,15 @@ REQUEST_GPUS=6 REQUEST_CPUS=24 REQUEST_MEMORY=192000 \
 that count is above 1, or runs the interpreter directly when it is 1. Single node only.
 Only rank 0 writes checkpoints, debug histories and the `[timing]` lines.
 
-Three things the submitter does **not** do for you:
+Three things the submitter does not do for you:
 
-- **`batch_size` in the config is per rank.** N ranks at `batch_size: B` train at an
+- `batch_size` in the config is per rank. N ranks at `batch_size: B` train at an
   effective batch of `N x B`. To hold the effective batch fixed while adding ranks,
   divide `batch_size` by N.
-- **`lr` is not adjusted.** Raising the effective batch without scaling the learning rate
+- `lr` is not adjusted. Raising the effective batch without scaling the learning rate
   puts the run in a different optimisation regime, so it is no longer comparable to runs
   at the old one.
-- **`REQUEST_CPUS` and `REQUEST_MEMORY` do not scale with `REQUEST_GPUS`.** Every rank
+- `REQUEST_CPUS` and `REQUEST_MEMORY` do not scale with `REQUEST_GPUS`. Every rank
   spawns its own `num_workers` dataloader workers, so raise both yourself.
 
 With the sharded reader, shards are partitioned over `world_size x num_workers` readers
@@ -78,7 +78,7 @@ dataset raises at startup (`N full shards cannot feed M readers`); lower `num_wo
 or use fewer ranks.
 
 `NCCL_P2P_DISABLE` and `NCCL_IB_DISABLE` are exported by `trainjob.sh`. The L40S nodes
-have no NVLink and their GPU-to-GPU P2P transport hangs — the process group initialises
+have no NVLink and their GPU-to-GPU P2P transport hangs: the process group initialises
 and the startup broadcasts succeed, but the first AllReduce never returns and the job
 sits until the watchdog kills it. Both are set to `1` unless already present in the
 environment.
@@ -95,9 +95,19 @@ Copy [config.json](config.json) and edit. Key fields:
 - `use_sharded`/`sharded_dir`, `use_packed`/`packed_path` — pre-built container selection (see [../datagen/](../datagen/)).
 - `batch_size`, `num_workers` — dataloader. `batch_size` is **per rank**; see [Multi-GPU (DDP)](#multi-gpu-ddp).
 - `backbone_name`, `feature_dim`, `proj_head_*`, `encoding_range` — model.
-- `augmentation_mode`, `crop_*`, `mask_ratio` — augmentation pipeline.
+- `augmentation_mode`, `crop_*`, `mask_type`, `mask_ratio`, `mask_region_*` — augmentation
+  pipeline. `mask_type` is `region` (whole cells of a fixed grid, the default), `block`
+  (windows around active voxels) or `pixel` (per-voxel dropout). Under `region` the masked
+  fraction comes from `mask_region_wipe_max`, not `mask_ratio`.
+- `objective`, `lambda_charge`, `lambda_occ`, `occ_max_neg`, `occ_neg_per_pos`,
+  `occ_grow_iters` — training objective. The last three are `mae` only, and which of them
+  applies depends on `mask_type`: `region` enumerates its occupancy candidates and needs a
+  cap on them (`occ_max_neg` / `occ_neg_per_pos`, measured with
+  [../diagnostics/measure_occ_candidates.sub](../diagnostics/measure_occ_candidates.sub)),
+  while the other mask types grow candidates and take `occ_grow_iters` instead. Setting a
+  key that does not apply is rejected at submit rather than ignored.
 - `epochs`, `lr`, `min_lr`, `weight_decay*`, `warmup_epochs`, `momentum_*` — schedule.
-- `loss_type`, `teacher_temp`, `student_temp`, `use_centering`, `use_cov_penalty`, `use_var_penalty` — loss.
+- `teacher_temp`, `student_temp`, `use_centering`, `use_cov_penalty`, `use_var_penalty` — loss.
 - `save_every`, `debug`, `debug_every` — checkpointing / debug dumps.
 
 The other `config_*.json` files in this directory are the configurations of past campaigns, kept for reference.

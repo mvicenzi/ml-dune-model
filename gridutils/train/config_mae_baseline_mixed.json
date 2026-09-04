@@ -1,5 +1,5 @@
 {
-  "run_name": "my_unique_run_name",
+  "run_name": "mae_baseline_mixed_b100",
   "datadir": "/gpfs01/lbne/users/bnayak/cffm-data/prod-jay-100k-truth-2026-06-11",
   "apa": 0,
   "view": "W",
@@ -48,7 +48,7 @@
   "momentum_start": 0.999,
   "momentum_end": 0.9999,
   "lr": 0.0001,
-  "min_lr": 0.000001,
+  "min_lr": 1e-06,
   "weight_decay": 0.04,
   "weight_decay_end": 0.1,
   "warmup_epochs": 10,

@@ -1,0 +1,13 @@
+universe                = vanilla
+notification            = never
+executable              = /lbne/u/mvicenzi/ml-dune-model/gridutils/diagnostics/testjob.sh
+arguments               = /lbne/u/mvicenzi/ml-dune-model /gpfs01/lbne/users/fm/mvicenzi/uvenv /gpfs01/lbne/users/fm/mvicenzi/CONDOR_OUT tests/test_objective_validation.py
+environment             = "CLUSTER_ID=$(ClusterId) JOB_ID=$(ProcId)"
+output                  = /gpfs01/lbne/users/fm/mvicenzi/CONDOR_OUT/tests/$(ClusterId).$(ProcId).out
+error                   = /gpfs01/lbne/users/fm/mvicenzi/CONDOR_OUT/tests/$(ClusterId).$(ProcId).err
+log                     = /gpfs01/lbne/users/fm/mvicenzi/CONDOR_OUT/tests/$(ClusterId).$(ProcId).log
+getenv                  = False
+request_memory          = 8000
+request_cpus            = 1
+should_transfer_files   = NO
+queue

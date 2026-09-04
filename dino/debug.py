@@ -108,6 +108,8 @@ class DINODebugger:
     - teacher_entropy: [float|null, ...]                 per-batch H(P_t)       (dino only, else null)
     - student_entropy: [float|null, ...]                 per-batch H(P_s)       (dino only, else null)
     - kl:              [float|null, ...]                 per-batch KL(P_t||P_s) (dino only, else null)
+    - loss_charge:     [float|null, ...]                 per-batch charge term  (mae only, else null)
+    - loss_occ:        [float|null, ...]                 per-batch occupancy term (mae only, else null)
     - cov_penalty:              [float|null, ...]  per-batch raw covariance penalty (if enabled, else null)
     - var_penalty:              [float|null, ...]  per-batch raw variance penalty (if enabled, else null)
     - stats:  {iter: [...], s_var: [...], ...}  feature statistics
@@ -124,6 +126,9 @@ class DINODebugger:
         self.logger = None
         self.loss_history = [] if self.enabled else None
         self.loss_masked_history = [] if self.enabled else None
+        # per-term reconstruction losses; null on objectives that do not reconstruct
+        self.loss_charge_history = [] if self.enabled else None
+        self.loss_occ_history = [] if self.enabled else None
         self.loss_unmasked_history = [] if self.enabled else None
         self.teacher_entropy_history = [] if self.enabled else None
         self.student_entropy_history = [] if self.enabled else None
@@ -179,7 +184,7 @@ class DINODebugger:
         if self.logger is not None:
             self.logger.info(
                 f"Config: backbone={cfg.backbone_name}, mask_ratio={cfg.mask_ratio}, "
-                f"loss_type={cfg.loss_type}, lr={cfg.lr}, epochs={cfg.epochs}"
+                f"lr={cfg.lr}, epochs={cfg.epochs}"
             )
         config_dict = {
             "timestamp": datetime.now().isoformat(),
@@ -189,14 +194,15 @@ class DINODebugger:
         with open(self.debug_dir / "run_config.json", "w") as f:
             json.dump(config_dict, f, indent=2)
 
-    def log_shapes(self, x: Tensor, s_feats: Tensor, t_feats: Tensor):
-        """Log tensor shapes on first batch."""
+    def log_shapes(self, x: Tensor, s_feats: Tensor, t_feats: Tensor | None):
+        """Log tensor shapes on first batch. t_feats is None without a teacher."""
         if not self.enabled or self.logger is None:
             return
+        t_str = tuple(t_feats.shape) if t_feats is not None else "none"
         self.logger.info(
             f"Shapes: x={tuple(x.shape)}, "
             f"s_feats={tuple(s_feats.shape)}, "
-            f"t_feats={tuple(t_feats.shape)}"
+            f"t_feats={t_str}"
         )
 
     # ------------------------------------------------------------------
@@ -208,48 +214,49 @@ class DINODebugger:
         epoch: int,
         batch_idx: int,
         iteration: int,
-        loss: float,
+        stats,
         n_valid: int,
         lr: float,
         momentum: float,
-        teacher_entropy: float | None = None,
-        student_entropy: float | None = None,
-        kl: float | None = None,
-        cov_penalty: float | None = None,
-        var_penalty: float | None = None,
-        loss_masked: float | None = None,
-        loss_unmasked: float | None = None,
     ):
-        """Log per-batch scalar information (every batch)."""
+        """Log per-batch scalar information (every batch).
+
+        `stats` is a dino.model.ForwardStats. It is taken as a plain object rather
+        than imported for typing because dino.model already imports this module.
+        """
         if not self.enabled or self.logger is None:
             return
         extra = ""
-        if teacher_entropy is not None and kl is not None:
-            extra = f" teacher_entropy={teacher_entropy:.6f} student_entropy={student_entropy:.6f} kl={kl:.6f}"
-        if cov_penalty is not None:
-            extra += f" cov_penalty={cov_penalty:.6f}"
-        if var_penalty is not None:
-            extra += f" var_penalty={var_penalty:.6f}"
+        if stats.t_ent is not None and stats.kl is not None:
+            extra = f" teacher_entropy={stats.t_ent:.6f} student_entropy={stats.s_ent:.6f} kl={stats.kl:.6f}"
+        if stats.cov is not None:
+            extra += f" cov_penalty={stats.cov:.6f}"
+        if stats.var is not None:
+            extra += f" var_penalty={stats.var:.6f}"
         self.logger.info(
             f"[epoch {epoch:3d} batch {batch_idx:4d} iter {iteration:6d}] "
-            f"loss={loss:.6f} n_valid={n_valid} lr={lr:.2e} momentum={momentum:.6f}{extra}"
+            f"loss={stats.loss:.6f} n_valid={n_valid} lr={lr:.2e} momentum={momentum:.6f}{extra}"
         )
         if self.loss_history is not None:
-            self.loss_history.append(loss)
+            self.loss_history.append(stats.loss)
         if self.loss_masked_history is not None:
-            self.loss_masked_history.append(loss_masked)
+            self.loss_masked_history.append(stats.loss_masked)
+        if self.loss_charge_history is not None:
+            self.loss_charge_history.append(stats.loss_charge)
+        if self.loss_occ_history is not None:
+            self.loss_occ_history.append(stats.loss_occ)
         if self.loss_unmasked_history is not None:
-            self.loss_unmasked_history.append(loss_unmasked)
+            self.loss_unmasked_history.append(stats.loss_unmasked)
         if self.teacher_entropy_history is not None:
-            self.teacher_entropy_history.append(teacher_entropy)
+            self.teacher_entropy_history.append(stats.t_ent)
         if self.student_entropy_history is not None:
-            self.student_entropy_history.append(student_entropy)
+            self.student_entropy_history.append(stats.s_ent)
         if self.kl_history is not None:
-            self.kl_history.append(kl)
+            self.kl_history.append(stats.kl)
         if self.cov_penalty_history is not None:
-            self.cov_penalty_history.append(cov_penalty)
+            self.cov_penalty_history.append(stats.cov)
         if self.var_penalty_history is not None:
-            self.var_penalty_history.append(var_penalty)
+            self.var_penalty_history.append(stats.var)
 
     def save_histories(self):
         """
@@ -271,6 +278,8 @@ class DINODebugger:
         data = {
             "loss":             self.loss_history             or [],
             "loss_masked":      self.loss_masked_history      or [],
+            "loss_charge":      self.loss_charge_history      or [],
+            "loss_occ":         self.loss_occ_history         or [],
             "loss_unmasked":    self.loss_unmasked_history    or [],
             "teacher_entropy":  self.teacher_entropy_history  or [],
             "student_entropy":  self.student_entropy_history  or [],
@@ -292,14 +301,17 @@ class DINODebugger:
         self,
         iteration: int,
         s_feats: Tensor,                  # [N_student, D_backbone] raw backbone features
-        t_feats: Tensor,                  # [N_teacher, D_backbone] raw backbone features
+        t_feats: Tensor | None,           # same for the teacher; None when there is no teacher
         s_head_feats: Tensor | None = None,  # [N_student, D_head] head output (if head present)
         t_head_feats: Tensor | None = None,  # [N_teacher, D_head] head output (if head present)
     ):
         """
         Compute and log representation-quality statistics.
 
-        s_feats / t_feats are the raw 64-dim backbone feature tensors.
+        s_feats / t_feats are the raw 64-dim backbone feature tensors. An objective
+        without a teacher passes t_feats=None; the teacher columns are then recorded as
+        NaN, the same way the head columns already are when no head is present, so the
+        history keeps one row per logged iteration either way.
         s_head_feats / t_head_feats are the optional projection head outputs (e.g. 128-dim).
 
         Runs every `debug_every` iterations. Covariance matrices for both backbone and
@@ -312,7 +324,7 @@ class DINODebugger:
 
         with torch.no_grad():
             s_flat = s_feats.detach().float()  # [N_student, D]
-            t_flat = t_feats.detach().float()  # [N_teacher, D]
+            t_flat = t_feats.detach().float() if t_feats is not None else None
 
             s_head_flat = s_head_feats.detach().float() if s_head_feats is not None else None
             t_head_flat = t_head_feats.detach().float() if t_head_feats is not None else None
@@ -321,19 +333,19 @@ class DINODebugger:
                 return
 
             s_cov_mat = torch.cov(s_flat.T)   # [D, D]
-            t_cov_mat = torch.cov(t_flat.T)
+            t_cov_mat = torch.cov(t_flat.T) if t_flat is not None else None
 
             s_norms = s_flat.norm(dim=-1)
-            t_norms = t_flat.norm(dim=-1)
+            t_norms = t_flat.norm(dim=-1) if t_flat is not None else None
 
             s_head_cov   = torch.cov(s_head_flat.T) if s_head_flat is not None else None
             t_head_cov   = torch.cov(t_head_flat.T) if t_head_flat is not None else None
             s_head_norms = s_head_flat.norm(dim=-1)  if s_head_flat is not None else None
             t_head_norms = t_head_flat.norm(dim=-1)  if t_head_flat is not None else None
 
+        t_norm_str = f" t_norm={t_norms.mean():.4f}" if t_norms is not None else ""
         self.logger.info(
-            f"[iter {iteration:6d}] FEAT_STATS: "
-            f"s_norm={s_norms.mean():.4f} t_norm={t_norms.mean():.4f}"
+            f"[iter {iteration:6d}] FEAT_STATS: s_norm={s_norms.mean():.4f}{t_norm_str}"
         )
 
         h = self.stats_history
@@ -341,9 +353,9 @@ class DINODebugger:
         h["s_norm_min"].append(s_norms.min().item())
         h["s_norm_max"].append(s_norms.max().item())
         h["s_norm_median"].append(s_norms.median().item())
-        h["t_norm_min"].append(t_norms.min().item())
-        h["t_norm_max"].append(t_norms.max().item())
-        h["t_norm_median"].append(t_norms.median().item())
+        h["t_norm_min"].append(t_norms.min().item()       if t_norms is not None else float("nan"))
+        h["t_norm_max"].append(t_norms.max().item()       if t_norms is not None else float("nan"))
+        h["t_norm_median"].append(t_norms.median().item() if t_norms is not None else float("nan"))
         h["s_head_norm_min"].append(s_head_norms.min().item()    if s_head_norms is not None else float("nan"))
         h["s_head_norm_max"].append(s_head_norms.max().item()    if s_head_norms is not None else float("nan"))
         h["s_head_norm_median"].append(s_head_norms.median().item() if s_head_norms is not None else float("nan"))
@@ -351,7 +363,7 @@ class DINODebugger:
         h["t_head_norm_max"].append(t_head_norms.max().item()    if t_head_norms is not None else float("nan"))
         h["t_head_norm_median"].append(t_head_norms.median().item() if t_head_norms is not None else float("nan"))
         h["s_cov_mat"].append(s_cov_mat.cpu().tolist())
-        h["t_cov_mat"].append(t_cov_mat.cpu().tolist())
+        h["t_cov_mat"].append(t_cov_mat.cpu().tolist() if t_cov_mat is not None else [])
         h["s_head_cov_mat"].append(s_head_cov.cpu().tolist() if s_head_cov is not None else [])
         h["t_head_cov_mat"].append(t_head_cov.cpu().tolist() if t_head_cov is not None else [])
 

@@ -119,11 +119,17 @@ def _load_backbone(ckpt: dict, key: str, device: torch.device):
     """
     cfg = ckpt["cfg"]
     backbone_cls = BACKBONE_REGISTRY[cfg.backbone_name]
-    kwargs = backbone_kwargs(
-        backbone_cls,
+    arch_flags = dict(
         encoding_range=cfg.encoding_range,
         encoding_dim=_encoding_dim(ckpt[key], cfg),
     )
+    # An mae checkpoint carries the reconstruction heads' weights, so the rebuild has to
+    # build them or the strict load below rejects it. Read from the checkpoint dict, not
+    # from cfg: cfg is unpickled, and a field absent from an older pickle silently
+    # resolves to whatever the current class default is.
+    if ckpt.get("objective") == "mae":
+        arch_flags["use_recon_heads"] = True
+    kwargs = backbone_kwargs(backbone_cls, **arch_flags)
     model = backbone_cls(**kwargs).to(device)
     model.load_state_dict(ckpt[key])          # strict: mismatches must be loud
     model.eval()
@@ -435,6 +441,14 @@ def main(
             num_workers=num_workers,
             pin_memory=True,
             collate_fn=voxels_meta_collate_fn,
+        )
+
+    if source not in ckpt:
+        available = ", ".join(k for k in ("student", "teacher") if k in ckpt)
+        raise SystemExit(
+            f"checkpoint has no '{source}' branch (it has: {available or 'neither'}). "
+            f"objective={ckpt.get('objective', 'unknown')!r} checkpoints trained without a "
+            f"teacher are student-only; extract with --source=student."
         )
 
     print(f"\nLoading {source} backbone ...")

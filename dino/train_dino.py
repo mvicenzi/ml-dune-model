@@ -2,7 +2,7 @@
 DINO training script for DUNE sparse UNet backbone.
 
 Usage:
-    python dino/train_dino.py --epochs=100 --batch_size=100 --backbone_name=attn_default
+    python dino/train_dino.py --epochs=100 --batch_size=100 --backbone_name=attn_mae
     python dino/train_dino.py --epochs=2 --batch_size=4 --n_subset=2000 --debug=True
 """
 
@@ -10,6 +10,7 @@ import builtins
 import fire
 import inspect
 import json
+from dataclasses import fields
 import os
 import resource
 import sys
@@ -24,10 +25,11 @@ from torch.utils.data import DataLoader
 from loader.apa_sparse_meta_dataset import APASparseMetaDataset
 from loader.collate import voxels_meta_collate_fn
 from loader.splits import Subset
+from models import BACKBONE_REGISTRY
 
-from .config import DINOConfig
+from .config import DINOConfig, objective_injects, occ_read_stride, validate_config
 from .transforms import FeatureLogTransform
-from .masking import SparseVoxelMasker, SparseBlockMasker
+from .masking import SparseVoxelMasker, SparseBlockMasker, SparseRegionMasker
 from .cropping import CropConfig, SparseCropper
 from .loss import PixelDINOLoss
 from .scheduler import CosineScheduler
@@ -36,7 +38,7 @@ from .debug import DINODebugger, StageTimer
 
 
 def main(
-    backbone_name: str = "attn_default",
+    backbone_name: str = "attn_mae",
     encoding_range: float = 125.0,
     encoding_dim: int = 32,
     feature_dim: int = 64,
@@ -50,10 +52,16 @@ def main(
     lr: float = 1e-4,
     use_cropping: bool = True,
     use_masking: bool = True,
-    mask_type: str = "pixel",
+    mask_type: str = "region",
     mask_ratio: float = 0.5,
     mask_block_win_ch: int = 5,
     mask_block_win_tick: int = 5,
+    mask_region_cell_w: int = 70,
+    mask_region_cell_h: int = 100,
+    mask_region_flavor: str = "wipe",
+    mask_region_wipe_max: float = 0.75,
+    mask_region_r1: float = 0.5,
+    mask_region_r2: float = 0.75,
     crop_n_global: int = 2,
     crop_n_local: int = 4,
     crop_global_scale: tuple = (0.4, 1.0),
@@ -62,7 +70,12 @@ def main(
     crop_blur_sigma_px: float = 10.0,
     crop_heatmap_power: float = 1.0,
     crop_min_active_pixels: int = 10,
-    loss_type: str = "dino",
+    objective: str = "hybrid",
+    lambda_charge: float = 0.1,
+    lambda_occ: float = 1.0,
+    occ_grow_iters: int = 1,
+    occ_max_neg: int = 0,
+    occ_neg_per_pos: float = 0.0,
     center_momentum: float = 0.9,
     use_centering: bool = True,
     teacher_temp: float = 0.07,
@@ -106,7 +119,7 @@ def main(
     DINO training loop for DUNE detector.
 
     Args:
-        backbone_name: Model architecture ("attn_default", "base", etc.)
+        backbone_name: Model architecture ("attn_mae", "attn_default", "base", etc.)
         epochs: Number of training epochs
         batch_size: Batch size per GPU
         lr: Base learning rate
@@ -121,10 +134,15 @@ def main(
         crop_blur_sigma_px: Gaussian blur sigma for activity heatmap (px)
         crop_heatmap_power: Exponent applied to heatmap before sampling
         crop_min_active_pixels: Minimum active voxels required inside a crop
-        loss_type: "cosine", "mse", or "dino"
+        objective: "dino" (cross-entropy on surviving pixels only), "hybrid" (also on the
+            re-injected masked pixels; today's behaviour) or "mae" (charge + occupancy
+            reconstruction, no teacher)
+        lambda_charge: mae only — weight on the charge reconstruction term
+        lambda_occ: mae only — weight on the occupancy term
+        occ_grow_iters: mae only — 3x3 dilations when growing occupancy candidates
         center_momentum: EMA decay for the teacher center buffer
         use_centering: subtract running center from teacher features before loss
-        teacher_temp: teacher softmax temperature (only used for "dino")
+        teacher_temp: teacher softmax temperature
         student_temp: student softmax temperature (only used for "dino")
         use_proj_head: attach DINO MLP projection head between backbone and loss
         proj_head_hidden_dim: inner MLP width of the projection head
@@ -224,6 +242,12 @@ def main(
         mask_ratio=mask_ratio,
         mask_block_win_ch=mask_block_win_ch,
         mask_block_win_tick=mask_block_win_tick,
+        mask_region_cell_w=mask_region_cell_w,
+        mask_region_cell_h=mask_region_cell_h,
+        mask_region_flavor=mask_region_flavor,
+        mask_region_wipe_max=mask_region_wipe_max,
+        mask_region_r1=mask_region_r1,
+        mask_region_r2=mask_region_r2,
         crop_n_global=crop_n_global,
         crop_n_local=crop_n_local,
         crop_global_scale=crop_global_scale,
@@ -236,7 +260,6 @@ def main(
         proj_head_hidden_dim=proj_head_hidden_dim,
         proj_head_output_dim=proj_head_output_dim,
         proj_head_n_layers=proj_head_n_layers,
-        loss_type=loss_type,
         normalize_features=normalize_features,
         center_momentum=center_momentum,
         use_centering=use_centering,
@@ -274,9 +297,33 @@ def main(
         buffer_size=buffer_size,
         use_packed=use_packed,
         packed_path=packed_path,
+        objective=objective,
+        lambda_charge=lambda_charge,
+        lambda_occ=lambda_occ,
+        occ_grow_iters=occ_grow_iters,
+        occ_max_neg=occ_max_neg,
+        occ_neg_per_pos=occ_neg_per_pos,
     )
 
     print(f"Device: {device}")
+
+    # Validated here, before anything is built, so a run that cannot work fails at submit
+    # rather than several minutes in. Same placement rationale as the dataset check below.
+    validate_config(cfg)
+
+    print("Objective:")
+    print(f"  objective      = {cfg.objective}")
+    print(f"  injects        = {objective_injects(cfg.objective)}")
+    if cfg.objective == "mae":
+        print(f"  lambda_charge  = {cfg.lambda_charge}")
+        print(f"  lambda_occ     = {cfg.lambda_occ}")
+        enumerated = cfg.mask_type == "region"
+        print(f"  occ candidates = {'enumerated by the masker' if enumerated else 'grown from the bottleneck'}")
+        if enumerated:
+            print(f"  occ_max_neg     = {cfg.occ_max_neg or 'unset'}")
+            print(f"  occ_neg_per_pos = {cfg.occ_neg_per_pos or 'unset'}")
+        else:
+            print(f"  occ_grow_iters  = {cfg.occ_grow_iters}")
 
     print("Model:")
     print(f"  backbone_name        = {cfg.backbone_name}")
@@ -322,8 +369,18 @@ def main(
     print(f"  use_masking            = {cfg.use_masking}")
     print(f"  mask_type              = {cfg.mask_type}")
     print(f"  mask_ratio             = {cfg.mask_ratio}")
-    print(f"  mask_block_win_ch      = {cfg.mask_block_win_ch}")
-    print(f"  mask_block_win_tick    = {cfg.mask_block_win_tick}")
+    if cfg.mask_type == "region":
+        print(f"  mask_region_cell       = {cfg.mask_region_cell_w} x {cfg.mask_region_cell_h}"
+              f"  ({cfg.image_w // cfg.mask_region_cell_w} x "
+              f"{cfg.image_h // cfg.mask_region_cell_h} grid)")
+        print(f"  mask_region_flavor     = {cfg.mask_region_flavor}")
+        if cfg.mask_region_flavor == "wipe":
+            print(f"  mask_region_wipe_max   = {cfg.mask_region_wipe_max}")
+        else:
+            print(f"  mask_region_r1 / r2    = {cfg.mask_region_r1} / {cfg.mask_region_r2}")
+    else:
+        print(f"  mask_block_win_ch      = {cfg.mask_block_win_ch}")
+        print(f"  mask_block_win_tick    = {cfg.mask_block_win_tick}")
     print(f"  crop_n_global          = {cfg.crop_n_global}")
     print(f"  crop_n_local           = {cfg.crop_n_local}")
     print(f"  crop_global_scale      = {cfg.crop_global_scale}")
@@ -339,7 +396,6 @@ def main(
     print(f"  feat_max_val      = {cfg.feat_max_val}")
 
     print("Loss:")
-    print(f"  type                = {cfg.loss_type}")
     print(f"  center_momentum     = {cfg.center_momentum}")
     print(f"  use_centering       = {cfg.use_centering}")
     print(f"  teacher_temp        = {cfg.teacher_temp}")
@@ -438,6 +494,7 @@ def main(
         proj_head_hidden_dim=proj_head_hidden_dim,
         proj_head_output_dim=proj_head_output_dim,
         proj_head_n_layers=proj_head_n_layers,
+        objective=cfg.objective,
     ).to(device)
 
     n_backbone = sum(p.numel() for p in model.student.parameters())
@@ -512,14 +569,36 @@ def main(
     #define masker
     masker = None
     if use_masking:
-        if mask_type == "block":
+        # only mae needs the removed charge values; collecting them otherwise is dead work
+        want_feats = cfg.objective == "mae"
+        if mask_type == "region":
+            masker = SparseRegionMasker(
+                image_w=cfg.image_w,
+                image_h=cfg.image_h,
+                cell_w=mask_region_cell_w,
+                cell_h=mask_region_cell_h,
+                flavor=mask_region_flavor,
+                wipe_max=mask_region_wipe_max,
+                r1=mask_region_r1,
+                r2=mask_region_r2,
+                return_masked_feats=want_feats,
+                # only mae scores occupancy, so only mae pays for enumerating candidates
+                build_candidates=want_feats,
+                # the scale the occupancy head reads at, from the backbone that defines it
+                cand_stride=occ_read_stride(cfg.backbone_name) or 1,
+                max_neg=cfg.occ_max_neg or None,
+                neg_per_pos=cfg.occ_neg_per_pos or None,
+            )
+        elif mask_type == "block":
             masker = SparseBlockMasker(
                 mask_ratio=mask_ratio,
                 win_ch=mask_block_win_ch,
                 win_tick=mask_block_win_tick,
+                return_masked_feats=want_feats,
             )
         else:
-            masker = SparseVoxelMasker(mask_ratio=mask_ratio)
+            masker = SparseVoxelMasker(mask_ratio=mask_ratio,
+                                       return_masked_feats=want_feats)
 
     #define cropper
     cropper = None
@@ -540,7 +619,6 @@ def main(
 
     # define loss function
     loss_fn = PixelDINOLoss(
-        loss_type=cfg.loss_type,
         normalize_features=cfg.normalize_features,
         center_momentum=cfg.center_momentum,
         use_centering=cfg.use_centering,
@@ -632,58 +710,61 @@ def main(
             optimizer.zero_grad()
 
             # execute forward/backward pass, returning loss and other metrics
-            (loss_val, teacher_entropy, student_entropy,
-             kl, cov_penalty, var_penalty,
-             loss_masked, loss_unmasked,
-             student_backbone_out, teacher_backbone_out,
-             student_out, teacher_out) = model.forward_backward(xs, cropper, masker, loss_fn, use_cropping, use_masking, stage_timer)
-            
+            stats = model.forward_backward(xs, cropper, masker, loss_fn, use_cropping, use_masking,
+                                           stage_timer, objective=cfg.objective,
+                                           lambda_charge=cfg.lambda_charge,
+                                           lambda_occ=cfg.lambda_occ,
+                                           occ_grow_iters=cfg.occ_grow_iters)
+
             with stage_timer.stage("upd"):
                 # "three steps forward, two steps back"
                 optimizer.step()
 
-                # EMA teacher update
-                model.update_teacher(mom_val)
-
-                # centering: update teacher center for next iteration
-                loss_fn.update_center(teacher_out)
+                # EMA teacher update and centering, both teacher-side. mae has no
+                # teacher, so both are skipped -- gated on the objective rather than on
+                # whether stats.t_out happens to be None, because update_center performs
+                # collective operations and a rank-dependent skip would hang the group.
+                if cfg.objective != "mae":
+                    model.update_teacher(mom_val)
+                    loss_fn.update_center(stats.t_out)
             stage_timer.flush()
             debugger.log_center_stats(iteration, loss_fn)
 
-            # scalar logging: the (teacher_entropy, student_entropy, kl) trio already
-            # reflects whatever goes into the loss (head output if a head is present,
-            # raw backbone otherwise), so no separate backbone-entropy diagnostic is needed.
-            n_valid = student_out.feature_tensor.shape[0]
-            debugger.log_batch(epoch, batch_idx, iteration, loss_val, n_valid, lr_val, mom_val, teacher_entropy, student_entropy, kl, cov_penalty, var_penalty, loss_masked, loss_unmasked)
+            # scalar logging: the (t_ent, s_ent, kl) trio already reflects whatever goes
+            # into the loss (head output if a head is present, raw backbone otherwise),
+            # so no separate backbone-entropy diagnostic is needed.
+            n_valid = stats.s_out.feature_tensor.shape[0]
+            debugger.log_batch(epoch, batch_idx, iteration, stats, n_valid, lr_val, mom_val)
             debugger.log_gpu_memory(iteration)
 
             # gradient norms per backbone module (.grad still populated before next zero_grad)
             debugger.log_gradient_norms(iteration, student_core)
 
             # representation-quality statistics (variance, covariance, norm)
-            # pass head features separately when a head is present (student_out != student_backbone_out)
-            s_head_feats = student_out.feature_tensor if model.student_head is not None else None
-            t_head_feats = teacher_out.feature_tensor if model.teacher_head is not None else None
-            debugger.log_feature_stats(iteration, student_backbone_out.feature_tensor, teacher_backbone_out.feature_tensor,
+            # pass head features separately when a head is present (s_out != s_backbone)
+            s_head_feats = stats.s_out.feature_tensor if model.student_head is not None else None
+            t_head_feats = stats.t_out.feature_tensor if model.teacher_head is not None else None
+            t_bb_feats = stats.t_backbone.feature_tensor if stats.t_backbone is not None else None
+            debugger.log_feature_stats(iteration, stats.s_backbone.feature_tensor, t_bb_feats,
                                         s_head_feats, t_head_feats)
 
             # first batch: log tensor shapes
             if first_batch:
-                debugger.log_shapes(xs.feature_tensor, student_backbone_out.feature_tensor, teacher_backbone_out.feature_tensor)
+                debugger.log_shapes(xs.feature_tensor, stats.s_backbone.feature_tensor, t_bb_feats)
                 first_batch = False
 
             # periodically persist histories to disk
             debugger.maybe_save_histories(iteration)
 
-            # free Voxels objects to release GPU memory before the next forward pass
-            del student_backbone_out, student_out, teacher_backbone_out, teacher_out
-
             if is_main and ((batch_idx + 1) % 50 == 0 or batch_idx == 0):
-                cov_str = f", cov={cov_penalty:.4f}" if cov_penalty is not None else ""
-                var_str = f", var={var_penalty:.4f}" if var_penalty is not None else ""
+                cov_str = f", cov={stats.cov:.4f}" if stats.cov is not None else ""
+                var_str = f", var={stats.var:.4f}" if stats.var is not None else ""
                 mem_str = f", gpu={debugger.last_peak_alloc_gib:.2f}GiB"
-                print(f"[{epoch}/{epochs}] iter {iteration}: loss={loss_val:.6f}, "
+                print(f"[{epoch}/{epochs}] iter {iteration}: loss={stats.loss:.6f}, "
                       f"lr={lr_val:.2e}, mom={mom_val:.6f}{cov_str}{var_str}{mem_str}")
+
+            # drop the stats object to release its Voxels before the next forward pass
+            del stats
 
             t_fetch = time.perf_counter()
 
@@ -710,11 +791,13 @@ def main(
         if is_main and (epoch % save_every == 0 or epoch == epochs):
             ckpt = {
                 "epoch": epoch,
+                "objective": cfg.objective,
                 "student": student_core.state_dict(),
-                "teacher": model.teacher.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "cfg": cfg,
             }
+            if model.teacher is not None:
+                ckpt["teacher"] = model.teacher.state_dict()
             if model.student_head is not None:
                 ckpt["student_head"] = head_core.state_dict()
                 ckpt["teacher_head"] = model.teacher_head.state_dict()

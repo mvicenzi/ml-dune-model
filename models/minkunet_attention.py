@@ -137,12 +137,24 @@ class MinkUNetSparseAttentionMAE(MinkUNetSparseAttention):
     Same state_dict shape on student and teacher -> EMA update works unchanged.
     Teacher's copy of mask_token is EMA-updated but never read; harmless.
     """
-    def __init__(self, **kw):
+    # The decoder resolution the occupancy head reads at. occupancy_head_coarse sits on
+    # the half-resolution decoder output, so occupancy candidates are injected and scored
+    # in those units: one question per 2x2 block of full-resolution pixels. Moving the
+    # head changes this; nothing else does.
+    OCC_READ_STRIDE = 2
+
+    def __init__(self, use_recon_heads: bool = False, **kw):
         """
         Args:
+            use_recon_heads: build the charge and occupancy heads (objective="mae").
+                Construction is gated, not just the calls: a head that exists but is
+                never called still receives zero gradients under DDP and is then decayed
+                by the optimizer, which would make checkpoints depend on the number of
+                ranks a run happened to use.
             **kw: Passed through to MinkUNetSparseAttention.__init__.
         """
         super().__init__(**kw)
+        self.use_recon_heads = use_recon_heads
 
         # Channel counts come from the base class layer definitions:
         #   out_p1   = conv0  = ConvBlock2D(1, 32, ...)
@@ -155,6 +167,18 @@ class MinkUNetSparseAttentionMAE(MinkUNetSparseAttention):
         print("[MAE] MAE backbone: skip-level mask tokens initialized")
         print(f"  mask_token_full: dim={self.mask_token_full.shape[0]}  (injected at full-res skip)")
         print(f"  mask_token_half: dim={self.mask_token_half.shape[0]}  (injected at half-res skip)")
+
+        # Built last so that when they are absent every other parameter draws from the
+        # same point in the RNG stream, and a default run is unchanged by their existence.
+        if use_recon_heads:
+            # charge reads the full-res decoder output; occupancy reads half-res. The 3x3
+            # block before the occupancy head is load-bearing: an injected position holds
+            # nothing but the constant mask token, so without neighbour mixing the head
+            # would have no input to distinguish one candidate from another.
+            self.charge_head = SparseConv2d(64, 1, kernel_size=1, bias=True)
+            self.occ_coarse_block = ResidualSparseBlock2D(64, 64, kernel_size=3)
+            self.occupancy_head_coarse = SparseConv2d(64, 1, kernel_size=1, bias=True)
+            print("  recon heads: charge (full-res) + occupancy (half-res)")
 
     def _augment_skip_with_masked(self,
         skip: Voxels,
@@ -238,11 +262,19 @@ class MinkUNetSparseAttentionMAE(MinkUNetSparseAttention):
         B = len(skip.offsets) - 1
         coord_dim = skip.coordinate_tensor.shape[1]
 
-        # we want to create a unique key for each (x,y) pair
-        # W must exceed the max x-coord so that y*W+x is a unique.
-        W = 1
+        # Each (x, y) pair is encoded as a single integer y*W + x, so W must exceed the
+        # largest x in BOTH the skip and the projected masked coords. Sizing it from the
+        # skip alone is wrong whenever a masked coord lands further right than anything
+        # left in the skip: its key wraps into the next row's range, where it can equal a
+        # real skip key, and the coord is then discarded as a duplicate it is not.
+        # int64 throughout: the skip and the masked coords need not share a dtype.
+        x_maxes = []
         if skip.coordinate_tensor.shape[0] > 0:
-            W = int(skip.coordinate_tensor[:, 0].max().item()) + 2 
+            x_maxes.append(skip.coordinate_tensor[:, 0].max().to(torch.int64))
+        x_maxes += [torch.div(mc[:, 0].max(), stride, rounding_mode="floor").to(torch.int64)
+                    for mc in masked_coords_per_batch if mc.shape[0] > 0]
+        # one sync for the whole batch rather than one per tensor
+        W = int(torch.stack(x_maxes).max().item()) + 2 if x_maxes else 1 
 
         result: list[Tensor] = []
         # for each image in the bacth
@@ -278,17 +310,79 @@ class MinkUNetSparseAttentionMAE(MinkUNetSparseAttention):
             result.append(mc_low)
         return result
 
+    @staticmethod
+    def _grow_from_bottleneck(bott: Voxels, iters: int = 1) -> list:
+        """Grow half-resolution occupancy candidates from the surviving structure.
+
+        The bottleneck sits two downsamples down (stride 4), and it was computed from the
+        masked input, so its coordinates are where charge SURVIVED. Doubling them lands at
+        the half-resolution scale, and a 3x3 halo around each turns that into a candidate
+        set that hugs real structure: the empties in it sit right at the edge of a track,
+        which are the informative ones, and there are far fewer of them than enumerating a
+        region would give.
+
+        This is the coordinate set a generative transposed stride-2 kernel-3 convolution
+        would emit. warpconvnet has that operation but only for 3D data -- its coordinate
+        expansion asserts 4-column coordinates and never pads 2D up -- so it is done here
+        in plain torch instead.
+
+        `iters` repeats the 3x3 dilation at the final scale, reaching (2*iters - 1) cells
+        into a hole; one pass only ever supervises the rim. Each pass deduplicates first,
+        because naive repetition would produce 9^iters copies of most coordinates.
+
+        Returns one deduplicated [N, 2] tensor per image.
+        """
+        B = len(bott.offsets) - 1
+        coords = bott.coordinate_tensor
+        off = torch.tensor([[dx, dy] for dx in (-1, 0, 1) for dy in (-1, 0, 1)],
+                           device=coords.device, dtype=coords.dtype)
+        grown = []
+        for b in range(B):
+            c = coords[int(bott.offsets[b]):int(bott.offsets[b + 1])]
+            if c.shape[0] == 0:
+                grown.append(coords.new_zeros(0, coords.shape[1]))
+                continue
+            g = torch.unique(c * 2, dim=0)                       # quarter-res -> half-res
+            for _ in range(max(1, int(iters))):
+                g = (g[:, None, :] + off[None, :, :]).reshape(-1, 2).clamp_(min=0)
+                g = torch.unique(g, dim=0)
+            grown.append(g)
+        return grown
+
     def forward(
         self,
         xs: Voxels,
         masked_coords: list[Tensor] | None = None,
+        return_recon: bool = False,
+        occ_grow_iters: int = 1,
+        occ_coords: list[Tensor] | None = None,
     ) -> Voxels:
         """
         Args:
-            xs:            Input Voxels (kept voxels only for the student;
-                           full input for the teacher).
-            masked_coords: List of B tensors [N_masked_b, 2] at full resolution.
-                           Pass None (or omit) to run the unmodified base decoder.
+            xs:             Input Voxels (kept voxels only for the student;
+                            full input for the teacher).
+            masked_coords:  List of B tensors [N_masked_b, 2] at full resolution.
+                            Pass None (or omit) to run the unmodified base decoder.
+            return_recon:   also produce the charge and occupancy predictions
+                            (objective="mae"). Everything is computed inside this
+                            forward rather than by calling the heads from outside, so
+                            that DistributedDataParallel sees every parameter it is
+                            expected to reduce.
+            occ_grow_iters: how far the occupancy candidate set reaches into a hole.
+                            Ignored when occ_coords is supplied.
+            occ_coords:     the occupancy candidates to score, already in half-resolution
+                            units, when the caller can enumerate them. A masker that
+                            removes whole cells of a known grid knows exactly which
+                            pixels it emptied and labels them exactly; one that removes
+                            scattered pixels does not, and passes None so the set is
+                            grown here from the surviving structure instead.
+
+        Returns:
+            Voxels, or with return_recon a tuple (final, charge, occupancy, occ_coords):
+            `charge` is one value per full-resolution output position, `occupancy` one
+            logit per half-resolution position, and `occ_coords` names the positions that
+            were injected -- which is what the loss scores, since a surviving position
+            answers "was there charge here?" trivially.
         """
         # ===== ENCODER (identical to base) =====
         out = self.conv0(xs)
@@ -304,20 +398,41 @@ class MinkUNetSparseAttentionMAE(MinkUNetSparseAttention):
 
         # ===== DECODER =====
         # student is provided with masked_coords; teacher is not (None)
+        occ_vox = None
+        occ_coords = None
         if masked_coords is not None:
             # -- Stage 1: 125 -> 250, inject at half-res skip --
-            # need to track the masked coordinates at the half-res skip level,
-            # which means replicating the downsampling process...
-            # then add the masked coordinates with maks_token features to the skip
-            masked_half = self._project_masked_to_skip(masked_coords, out_b1p2, stride=2)
-            skip_b1p2_aug = self._augment_skip_with_masked(out_b1p2, masked_half, self.mask_token_half)
+            # Which coordinates go in here differs by objective. Reconstruction needs
+            # candidates that include genuine empties, or the occupancy question has only
+            # one answer, so it grows them from the surviving structure instead of using
+            # the removed pixels (which were all active by definition).
+            if return_recon:
+                # already at half resolution either way, so dedupe against the skip
+                # without further downsampling (stride=1)
+                cands = (occ_coords if occ_coords is not None
+                         else self._grow_from_bottleneck(out, iters=occ_grow_iters))
+                inject_half = self._project_masked_to_skip(cands, out_b1p2, stride=1)
+            else:
+                # need to track the masked coordinates at the half-res skip level,
+                # which means replicating the downsampling process...
+                # then add the masked coordinates with mask_token features to the skip
+                inject_half = self._project_masked_to_skip(masked_coords, out_b1p2, stride=2)
+            skip_b1p2_aug = self._augment_skip_with_masked(out_b1p2, inject_half, self.mask_token_half)
 
             out = self.convtr5(out, skip_b1p2_aug) # Upsample, guided by augmented skip geometry
             out = cat(out, skip_b1p2_aug)
             out = self.block6(out)
 
+            if return_recon:
+                occ_vox = self.occupancy_head_coarse(self.occ_coarse_block(out))
+                occ_coords = inject_half
+
             # -- Stage 2: 250->500, inject at full-res skip --
-            # add the masked coordinates with mask_token features to the skip
+            # Only the removed pixels go in at full resolution: the charge head can only
+            # be asked for a value where a value existed. This is also what keeps the
+            # grown empties away from it -- an injection at half resolution changes the
+            # features the next upsample gathers, never the coordinates it emits, because
+            # the transposed convolution takes its output geometry from this skip.
             skip_p1_aug = self._augment_skip_with_masked(out_p1, masked_coords, self.mask_token_full)
 
             out = self.convtr7(out, skip_p1_aug) # Upsample, guided by augmented skip geometry
@@ -332,7 +447,10 @@ class MinkUNetSparseAttentionMAE(MinkUNetSparseAttention):
             out = cat(out, out_p1)
             out = self.block8(out)
 
-        return self.final(out)
+        final = self.final(out)
+        if return_recon:
+            return final, self.charge_head(final), occ_vox, occ_coords
+        return final
 
 
 # ---------------------------------------------------------------------------

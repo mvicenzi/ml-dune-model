@@ -21,17 +21,13 @@ class PixelDINOLoss(nn.Module):
     where the student actually computed features (unmasked active pixels), not at
     structural zeros from sparse→dense conversion.
 
-    Three loss modes:
-    - "cosine": 1 - cosine_similarity (works well with normalized features)
-    - "mse":    mean squared error (for unnormalized features)
-    - "dino":   cross-entropy between softmax(teacher/tau_t) and log_softmax(student/tau_s);
-                treats the D-dim feature vector as logits, creating per-dimension competition
-                that prevents dimensional collapse
+    The loss is the cross-entropy between softmax(teacher/tau_t) and
+    log_softmax(student/tau_s): the D-dim feature vector is treated as logits, which
+    creates per-dimension competition and so prevents dimensional collapse.
     """
 
     def __init__(
         self,
-        loss_type: str = "dino",
         center_momentum: float = 0.9,
         use_centering: bool = True,
         teacher_temp: float = 1.0,
@@ -45,12 +41,11 @@ class PixelDINOLoss(nn.Module):
     ):
         """
         Args:
-            loss_type:           "cosine", "mse", or "dino"
             center_momentum:     EMA decay for the teacher center buffer (default 0.9)
             use_centering:       if True, subtract running center from teacher features before
                                  computing the loss; the center buffer is always updated regardless
-            teacher_temp:        softmax temperature for teacher logits (only used for "dino")
-            student_temp:        softmax temperature for student logits (only used for "dino")
+            teacher_temp:        softmax temperature for teacher logits
+            student_temp:        softmax temperature for student logits
             normalize_features:  if True, L2-normalise student and teacher features before the
                                  loss; set to False when a projection head is used (the head's
                                  internal L2 norm already normalises the features)
@@ -63,8 +58,6 @@ class PixelDINOLoss(nn.Module):
             var_gamma:           target minimum std per feature dimension (default 1.0)
         """
         super().__init__()
-        assert loss_type in ("cosine", "mse", "dino"), f"Unknown loss_type: {loss_type}"
-        self.loss_type = loss_type
         self.center_momentum = center_momentum
         self.use_centering = use_centering
         self.teacher_temp = teacher_temp
@@ -137,37 +130,25 @@ class PixelDINOLoss(nn.Module):
         if self.use_centering:
             t = t - self.center
 
-        # For dino loss: L2-normalize to unit sphere so scale-invariant.
+        # L2-normalize to the unit sphere so the loss is scale-invariant.
         # normalize_features=False skips this when a projection head is used
         # (the head's internal L2 norm already puts features on the sphere).
-        if self.loss_type == "dino" and self.normalize_features:
+        if self.normalize_features:
             s = F.normalize(s, dim=-1)
             t = F.normalize(t, dim=-1)
 
-        # teacher_entropy_px, student_entropy_px, and kl_px are only set in the dino
-        # branch; initialize to None so they have a defined value for the other loss types.
-        teacher_entropy_px = None
-        student_entropy_px = None
-        kl_px = None
+        # Per-pixel cross-entropy H(P_t, P_s) = H(P_t) + KL(P_t || P_s).
+        # Both student and teacher are treated as raw logits over D dimensions.
+        t_prob = F.softmax(t / self.teacher_temp, dim=-1)      # [N_valid, D]
+        s_logp = F.log_softmax(s / self.student_temp, dim=-1)  # [N_valid, D]
+        t_logp = F.log_softmax(t / self.teacher_temp, dim=-1)  # [N_valid, D]
+        loss = -(t_prob * s_logp).sum(dim=-1)                  # H(P_t, P_s) [N_valid]
 
-        # Compute per-pixel loss [N_valid]
-        if self.loss_type == "cosine":
-            loss = 1.0 - F.cosine_similarity(s, t, dim=-1)
-        elif self.loss_type == "mse":
-            loss = F.mse_loss(s, t, reduction="none").mean(dim=-1)
-        else:  # dino
-            # Cross-entropy H(P_t, P_s) = H(P_t) + KL(P_t || P_s).
-            # Both student and teacher are treated as raw logits over D dimensions.
-            t_prob = F.softmax(t / self.teacher_temp, dim=-1)      # [N_valid, D]
-            s_logp = F.log_softmax(s / self.student_temp, dim=-1)  # [N_valid, D]
-            t_logp = F.log_softmax(t / self.teacher_temp, dim=-1)  # [N_valid, D]
-            loss = -(t_prob * s_logp).sum(dim=-1)                  # H(P_t, P_s) [N_valid]
-
-            # decompose loss into teacher entropy and KL divergence for diagnostics:
-            s_prob = F.softmax(s / self.student_temp, dim=-1)      # [N_valid, D]
-            teacher_entropy_px = -(t_prob * t_logp).sum(dim=-1)    # H(P_t)      [N_valid]
-            student_entropy_px = -(s_prob * s_logp).sum(dim=-1)    # H(P_s)      [N_valid]
-            kl_px = loss - teacher_entropy_px                      # KL(P_t|P_s)[N_valid]
+        # decompose loss into teacher entropy and KL divergence for diagnostics:
+        s_prob = F.softmax(s / self.student_temp, dim=-1)      # [N_valid, D]
+        teacher_entropy_px = -(t_prob * t_logp).sum(dim=-1)    # H(P_t)      [N_valid]
+        student_entropy_px = -(s_prob * s_logp).sum(dim=-1)    # H(P_s)      [N_valid]
+        kl_px = loss - teacher_entropy_px                      # KL(P_t|P_s)[N_valid]
 
         # Optional covariance decorrelation penalty on raw backbone features (64-dim).
         # Computed before the projection head and before L2-normalization so the
@@ -194,14 +175,9 @@ class PixelDINOLoss(nn.Module):
         cov_penalty_item = cov_penalty.item() if cov_penalty is not None else None
         var_penalty_item = var_penalty.item() if var_penalty is not None else None
 
-        if teacher_entropy_px is not None:
-            t_ent = self._img_mean(teacher_entropy_px, batch_idx, B, device).item()
-            s_ent = self._img_mean(student_entropy_px, batch_idx, B, device).item()
-            kl    = self._img_mean(kl_px,              batch_idx, B, device).item()
-        else:
-            t_ent = None
-            s_ent = None
-            kl    = None
+        t_ent = self._img_mean(teacher_entropy_px, batch_idx, B, device).item()
+        s_ent = self._img_mean(student_entropy_px, batch_idx, B, device).item()
+        kl    = self._img_mean(kl_px,              batch_idx, B, device).item()
 
         # Split loss into masked / unmasked positions — diagnostics only, no effect on training.
         loss_masked_item = loss_unmasked_item = None
@@ -292,15 +268,78 @@ class PixelDINOLoss(nn.Module):
         if count.item() == 0:
             return
 
-        # For dino loss: normalize to unit sphere before computing the center,
-        # consistent with the normalization applied in forward()
-        ### TEMPORARY: only for legacy norm before centering
-        #if self.loss_type == "dino":
-        #    teacher_flat = F.normalize(teacher_flat, dim=-1)
-
         batch_mean = feat_sum / count  # [D]
 
         if self.center is None:
             self.center = batch_mean.clone()
         else:
             self.center = self.center_momentum * self.center + (1.0 - self.center_momentum) * batch_mean
+
+
+# ---------------------------------------------------------------------------
+# Reconstruction losses (objective="mae")
+#
+# The mae objective has no teacher: both terms are supervised directly by the input.
+# Charge asks "what value was here?" at the pixels masking removed; occupancy asks
+# "was anything here?" over a candidate set that deliberately contains empties too,
+# because a question whose answer is always yes teaches nothing.
+# ---------------------------------------------------------------------------
+
+def two_stage_mean(per_voxel: Tensor, counts: Tensor) -> Tensor:
+    """Mean within each image, then mean over images -- the reduction PixelDINOLoss uses.
+
+    Per-image normalisation first is what makes the loss weights comparable across
+    batches whose images differ wildly in how much charge they hold; a flat mean would
+    let the busiest image set the scale.
+
+    `per_voxel` must be grouped by image, matching `counts`. Images contributing nothing
+    are dropped from the outer mean rather than averaged in as zeros. Returns a scalar
+    that is still attached to the graph even when everything is empty, so the term can
+    always be summed into the total without breaking backward.
+    """
+    if per_voxel.numel() == 0:
+        return per_voxel.sum()
+    B = counts.shape[0]
+    device = per_voxel.device
+    batch_idx = torch.repeat_interleave(
+        torch.arange(B, device=device), counts.to(device))
+    per_img = torch.zeros(B, device=device, dtype=per_voxel.dtype)
+    per_img.scatter_add_(0, batch_idx, per_voxel)
+    counts_f = counts.to(device=device, dtype=per_voxel.dtype)
+    per_img = per_img / counts_f.clamp(min=1.0)
+    valid = counts_f > 0
+    if not bool(valid.any()):
+        return per_voxel.sum() * 0.0
+    return per_img[valid].mean()
+
+
+def charge_loss(pred: Tensor, target: Tensor, counts: Tensor) -> Tensor:
+    """L1 on the charge that masking removed, normalised per image.
+
+    Both sides are already in the normalizer's log space -- FeatureLogTransform runs
+    before masking -- so a plain L1 here is an L1 on log-charge, and no further
+    transform belongs in this function.
+    """
+    if pred.numel() == 0:
+        return pred.sum()
+    return two_stage_mean((pred - target).abs(), counts)
+
+
+def occupancy_loss(logits: Tensor, target: Tensor, counts: Tensor,
+                   alpha: float = 0.25, gamma: float = 2.0) -> Tensor:
+    """Focal binary cross-entropy over occupancy candidates, normalised per image.
+
+    The candidate set is mostly empty, so a plain BCE converges to "predict empty
+    everywhere" and stays there. Focal loss handles that inside the term: `gamma`
+    discounts examples the model already gets right, `alpha` reweights the positive
+    class. Defaults are the standard ones and are deliberately not exposed yet -- the
+    grown candidate set measures a few percent positive, which is close to what these
+    values were designed for.
+    """
+    if logits.numel() == 0:
+        return logits.sum()
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    p = torch.sigmoid(logits)
+    p_t = p * target + (1.0 - p) * (1.0 - target)          # probability of the true class
+    alpha_t = alpha * target + (1.0 - alpha) * (1.0 - target)
+    return two_stage_mean(alpha_t * (1.0 - p_t).pow(gamma) * bce, counts)
